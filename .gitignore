@@ -6,6 +6,6 @@ obj/
 *.suo
 *.userprefs
 dist/
-report/
-sample-report/
-dist-report/
+/report/
+/sample-report/
+/dist-report/
