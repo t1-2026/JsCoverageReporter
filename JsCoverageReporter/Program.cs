@@ -7,11 +7,22 @@ using System.Text.Json;
 
 string? configPath = null;
 string outputDir = "./report";
+bool configSet = false, outputSet = false;
 
 for (int i = 0; i + 1 < args.Length; i++)
 {
-    if (args[i] == "--config") configPath = args[i + 1];
-    if (args[i] == "--output") outputDir  = args[i + 1];
+    if (args[i] == "--config")
+    {
+        if (configSet) Console.Error.WriteLine("[Warning] --config specified more than once; using last value.");
+        configPath = args[i + 1];
+        configSet = true;
+    }
+    if (args[i] == "--output")
+    {
+        if (outputSet) Console.Error.WriteLine("[Warning] --output specified more than once; using last value.");
+        outputDir = args[i + 1];
+        outputSet = true;
+    }
 }
 
 if (configPath is null)
@@ -53,8 +64,8 @@ try
     await using var collector = new CoverageCollector(page);
     await collector.StartAsync();
 
-    await page.GotoAsync(scenario.Url);
-    await ActionRunner.RunAsync(page, scenario.Actions);
+    await page.GotoAsync(scenario.Url, new PageGotoOptions { Timeout = scenario.TimeoutMs });
+    await ActionRunner.RunAsync(page, scenario.Actions, scenario.TimeoutMs);
 
     Console.WriteLine("Collecting coverage...");
     var coverages = await collector.StopAsync(scenario.ScriptFilter);
