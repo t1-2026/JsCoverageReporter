@@ -26,8 +26,9 @@ internal class HtmlReportGenerator
         foreach (var range in allRanges)
         {
             int val = range.Count > 0 ? 1 : 0;
+            int start = Math.Max(range.StartOffset, 0);
             int end = Math.Min(range.EndOffset, source.Length);
-            for (int i = range.StartOffset; i < end; i++)
+            for (int i = start; i < end; i++)
                 map[i] = val;
         }
 
@@ -65,7 +66,14 @@ internal class HtmlReportGenerator
                     sb.Append($"<span class=\"{cls}\">");
                 }
 
-                sb.Append(HtmlEncode(rawLine[i].ToString()));
+                sb.Append(rawLine[i] switch
+                {
+                    '&' => "&amp;",
+                    '<' => "&lt;",
+                    '>' => "&gt;",
+                    '"' => "&quot;",
+                    var c => c.ToString(),
+                });
 
                 if (coverage == 1) coveredCount++;
                 else if (coverage == 0) uncoveredCount++;
