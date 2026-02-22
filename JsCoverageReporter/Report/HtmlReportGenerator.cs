@@ -9,6 +9,11 @@ internal record LineData(string Html, LineCoverageStatus Status);
 
 internal class HtmlReportGenerator
 {
+    /// <summary>
+    /// Builds a per-character coverage map from V8 range data.
+    /// Values: -1 = out of scope, 0 = not executed, 1 = executed.
+    /// Processes ranges largest-first so inner branch ranges override the outer function range.
+    /// </summary>
     internal static int[] BuildCoverageMap(string source, IEnumerable<FunctionCoverage> functions)
     {
         var map = new int[source.Length];
@@ -83,7 +88,7 @@ internal class HtmlReportGenerator
         return result;
     }
 
-    public void Generate(IReadOnlyList<ScriptCoverage> coverages, string outputDir)
+    internal void Generate(IReadOnlyList<ScriptCoverage> coverages, string outputDir)
     {
         Directory.CreateDirectory(outputDir);
         var scriptsDir = Path.Combine(outputDir, "scripts");
