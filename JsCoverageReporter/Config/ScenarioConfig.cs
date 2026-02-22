@@ -16,6 +16,9 @@ internal class ScenarioConfig
     [JsonPropertyName("scriptFilter")]
     public string? ScriptFilter { get; set; }
 
+    [JsonPropertyName("timeoutMs")]
+    public int? TimeoutMs { get; set; }
+
     [JsonPropertyName("actions")]
     public List<ScenarioAction> Actions { get; set; } = [];
 }

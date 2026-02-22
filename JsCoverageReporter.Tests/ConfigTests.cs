@@ -41,4 +41,20 @@ public class ConfigTests
         Assert.Equal("https://example.com/p2", config.Actions[2].Url);
         Assert.Equal(500,       config.Actions[5].Milliseconds);
     }
+
+    [Fact]
+    public void Deserialize_TimeoutMs_WhenSet()
+    {
+        var json = """{"url": "https://example.com", "timeoutMs": 10000}""";
+        var config = JsonSerializer.Deserialize<ScenarioConfig>(json, ScenarioConfig.JsonOptions)!;
+        Assert.Equal(10000, config.TimeoutMs);
+    }
+
+    [Fact]
+    public void Deserialize_TimeoutMs_NullWhenNotSet()
+    {
+        var json = """{"url": "https://example.com"}""";
+        var config = JsonSerializer.Deserialize<ScenarioConfig>(json, ScenarioConfig.JsonOptions)!;
+        Assert.Null(config.TimeoutMs);
+    }
 }
