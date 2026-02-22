@@ -5,10 +5,7 @@ namespace JsCoverageReporter.Config;
 
 internal class ScenarioConfig
 {
-    public static readonly JsonSerializerOptions JsonOptions = new()
-    {
-        PropertyNameCaseInsensitive = true,
-    };
+    public static readonly JsonSerializerOptions JsonOptions = new();
 
     [JsonPropertyName("url")]
     public string Url { get; set; } = "";
