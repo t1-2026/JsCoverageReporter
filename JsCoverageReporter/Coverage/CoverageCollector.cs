@@ -67,7 +67,7 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
             }
             catch (PlaywrightException)
             {
-                Console.Error.WriteLine($"[Warning] Could not retrieve source for '{url}' — skipped.");
+                Console.Error.WriteLine($"[Warning] Could not retrieve source for '{url}' — skipping.");
                 continue;
             }
 
