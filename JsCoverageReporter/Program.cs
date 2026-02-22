@@ -61,7 +61,7 @@ try
     Console.WriteLine($"  {coverages.Count} script(s) captured.");
 
     new HtmlReportGenerator().Generate(coverages, outputDir);
-    Console.WriteLine($"Report: {Path.GetFullPath(Path.Combine(outputDir, "index.html"))}");
+    Console.WriteLine($"Report: {Path.Combine(outputDir, "index.html")}");
     return 0;
 }
 catch (Exception ex)

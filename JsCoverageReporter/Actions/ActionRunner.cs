@@ -31,6 +31,10 @@ internal static class ActionRunner
                     if (action.Selector is null) { Console.Error.WriteLine("[Warning] 'hover' action missing 'selector' — skipping."); break; }
                     await page.HoverAsync(action.Selector);
                     break;
+                case "press":
+                    if (action.Selector is null) { Console.Error.WriteLine("[Warning] 'press' action missing 'selector' — skipping."); break; }
+                    await page.PressAsync(action.Selector, action.Value ?? "Enter");
+                    break;
                 case "wait":
                     await Task.Delay(action.Milliseconds ?? 0);
                     break;
