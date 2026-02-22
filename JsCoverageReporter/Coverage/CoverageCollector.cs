@@ -52,7 +52,7 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
             if (string.IsNullOrEmpty(url))
                 continue;
 
-            if (!string.IsNullOrEmpty(scriptFilter) && !url.Contains(scriptFilter))
+            if (!string.IsNullOrEmpty(scriptFilter) && !url.Contains(scriptFilter, StringComparison.OrdinalIgnoreCase))
                 continue;
 
             string source = "";
@@ -67,6 +67,7 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
             }
             catch (PlaywrightException)
             {
+                Console.Error.WriteLine($"[Warning] Could not retrieve source for '{url}' — skipped.");
                 continue;
             }
 
@@ -100,6 +101,7 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
             scripts.Add(new ScriptCoverage(url, source, functions));
         }
 
+        await _cdp.SendAsync("Debugger.disable");
         return scripts;
     }
 
