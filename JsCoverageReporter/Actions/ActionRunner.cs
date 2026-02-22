@@ -12,19 +12,24 @@ internal static class ActionRunner
             switch (action.Type)
             {
                 case "click":
-                    await page.ClickAsync(action.Selector!);
+                    if (action.Selector is null) { Console.Error.WriteLine("[Warning] 'click' action missing 'selector' — skipping."); break; }
+                    await page.ClickAsync(action.Selector);
                     break;
                 case "fill":
-                    await page.FillAsync(action.Selector!, action.Value ?? "");
+                    if (action.Selector is null) { Console.Error.WriteLine("[Warning] 'fill' action missing 'selector' — skipping."); break; }
+                    await page.FillAsync(action.Selector, action.Value ?? "");
                     break;
                 case "navigate":
-                    await page.GotoAsync(action.Url!);
+                    if (action.Url is null) { Console.Error.WriteLine("[Warning] 'navigate' action missing 'url' — skipping."); break; }
+                    await page.GotoAsync(action.Url);
                     break;
                 case "waitForSelector":
-                    await page.WaitForSelectorAsync(action.Selector!);
+                    if (action.Selector is null) { Console.Error.WriteLine("[Warning] 'waitForSelector' action missing 'selector' — skipping."); break; }
+                    await page.WaitForSelectorAsync(action.Selector);
                     break;
                 case "hover":
-                    await page.HoverAsync(action.Selector!);
+                    if (action.Selector is null) { Console.Error.WriteLine("[Warning] 'hover' action missing 'selector' — skipping."); break; }
+                    await page.HoverAsync(action.Selector);
                     break;
                 case "wait":
                     await Task.Delay(action.Milliseconds ?? 0);

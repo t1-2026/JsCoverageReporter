@@ -1,9 +1,8 @@
-using System.Text.Json;
 using Microsoft.Playwright;
 
 namespace JsCoverageReporter.Coverage;
 
-internal class CoverageCollector(IPage page)
+internal class CoverageCollector(IPage page) : IAsyncDisposable
 {
     private ICDPSession? _cdp;
 
@@ -11,11 +10,12 @@ internal class CoverageCollector(IPage page)
     {
         _cdp = await page.Context.NewCDPSessionAsync(page);
         await _cdp.SendAsync("Profiler.enable");
+        await _cdp.SendAsync("Debugger.enable");
         await _cdp.SendAsync("Profiler.startPreciseCoverage", new Dictionary<string, object>
         {
             ["callCount"] = true,
             ["detailed"] = true,
-            ["allowTriggeredUpdates"] = false,
+            ["allowTriggeredUpdates"] = true,
         });
     }
 
@@ -24,9 +24,16 @@ internal class CoverageCollector(IPage page)
         if (_cdp is null)
             return [];
 
-        var result = await _cdp.SendAsync("Profiler.takePreciseCoverage");
-        await _cdp.SendAsync("Profiler.stopPreciseCoverage");
-        await _cdp.SendAsync("Profiler.disable");
+        System.Text.Json.JsonElement? result = null;
+        try
+        {
+            result = await _cdp.SendAsync("Profiler.takePreciseCoverage");
+        }
+        finally
+        {
+            await _cdp.SendAsync("Profiler.stopPreciseCoverage");
+            await _cdp.SendAsync("Profiler.disable");
+        }
 
         if (result is null)
             return [];
@@ -42,15 +49,12 @@ internal class CoverageCollector(IPage page)
             var url = entry.TryGetProperty("url", out var urlProp) ? urlProp.GetString() ?? "" : "";
             var scriptId = entry.TryGetProperty("scriptId", out var sidProp) ? sidProp.GetString() ?? "" : "";
 
-            // Apply URL filter
-            if (!string.IsNullOrEmpty(scriptFilter) && !url.Contains(scriptFilter))
-                continue;
-
-            // Skip scripts without a URL (anonymous/inline)
             if (string.IsNullOrEmpty(url))
                 continue;
 
-            // Retrieve source via Debugger domain
+            if (!string.IsNullOrEmpty(scriptFilter) && !url.Contains(scriptFilter))
+                continue;
+
             string source = "";
             try
             {
@@ -61,9 +65,8 @@ internal class CoverageCollector(IPage page)
                 if (srcResult.HasValue && srcResult.Value.TryGetProperty("scriptSource", out var srcProp))
                     source = srcProp.GetString() ?? "";
             }
-            catch
+            catch (PlaywrightException)
             {
-                // Source unavailable — skip this entry
                 continue;
             }
 
@@ -98,5 +101,11 @@ internal class CoverageCollector(IPage page)
         }
 
         return scripts;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_cdp is not null)
+            await _cdp.DisposeAsync();
     }
 }
