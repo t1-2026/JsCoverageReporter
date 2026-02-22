@@ -33,25 +33,39 @@ catch (Exception ex)
     return 1;
 }
 
+if (string.IsNullOrEmpty(scenario.Url))
+{
+    Console.Error.WriteLine("Error: config 'url' field is required.");
+    return 1;
+}
+
 Console.WriteLine($"Opening: {scenario.Url}");
 
-using var playwright = await Playwright.CreateAsync();
-await using var browser = await playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
+try
 {
-    Headless = true,
-});
-var page = await browser.NewPageAsync();
+    using var playwright = await Playwright.CreateAsync();
+    await using var browser = await playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
+    {
+        Headless = true,
+    });
+    var page = await browser.NewPageAsync();
 
-await using var collector = new CoverageCollector(page);
-await collector.StartAsync();
+    await using var collector = new CoverageCollector(page);
+    await collector.StartAsync();
 
-await page.GotoAsync(scenario.Url);
-await ActionRunner.RunAsync(page, scenario.Actions);
+    await page.GotoAsync(scenario.Url);
+    await ActionRunner.RunAsync(page, scenario.Actions);
 
-Console.WriteLine("Collecting coverage...");
-var coverages = await collector.StopAsync(scenario.ScriptFilter);
-Console.WriteLine($"  {coverages.Count} script(s) captured.");
+    Console.WriteLine("Collecting coverage...");
+    var coverages = await collector.StopAsync(scenario.ScriptFilter);
+    Console.WriteLine($"  {coverages.Count} script(s) captured.");
 
-new HtmlReportGenerator().Generate(coverages, outputDir);
-Console.WriteLine($"Report: {Path.GetFullPath(Path.Combine(outputDir, "index.html"))}");
-return 0;
+    new HtmlReportGenerator().Generate(coverages, outputDir);
+    Console.WriteLine($"Report: {Path.GetFullPath(Path.Combine(outputDir, "index.html"))}");
+    return 0;
+}
+catch (Exception ex)
+{
+    Console.Error.WriteLine($"Error: {ex.Message}");
+    return 1;
+}
