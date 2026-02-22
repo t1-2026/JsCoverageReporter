@@ -5,3 +5,7 @@ obj/
 .vscode/
 *.suo
 *.userprefs
+dist/
+report/
+sample-report/
+dist-report/
