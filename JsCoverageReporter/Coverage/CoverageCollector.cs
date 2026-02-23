@@ -1,4 +1,4 @@
-﻿using Microsoft.Playwright;
+using Microsoft.Playwright;
 
 namespace JsCoverageReporter.Coverage;
 
@@ -52,9 +52,11 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
             if (string.IsNullOrEmpty(url))
                 continue;
 
+            // scriptFilters が指定されている場合、いずれかのフィルタ文字列を URL に含むスクリプトのみ収集する
             if (scriptFilters.Count > 0 && !scriptFilters.Any(f => url.Contains(f, StringComparison.OrdinalIgnoreCase)))
                 continue;
 
+            // scriptExcludes に一致する URL のスクリプトは除外する
             if (scriptExcludes.Any(e => url.Contains(e, StringComparison.OrdinalIgnoreCase)))
                 continue;
 
@@ -101,6 +103,7 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
                 }
             }
 
+            // タブ番号は現時点では単一ページのため 0 固定（Task 3 の複数ページ対応で正式な値に置き換わる）
             scripts.Add(new ScriptCoverage(new PageInfo(0, page.Url), url, source, functions));
         }
 
