@@ -1,4 +1,4 @@
-using Microsoft.Playwright;
+﻿using Microsoft.Playwright;
 
 namespace JsCoverageReporter.Coverage;
 
@@ -19,7 +19,7 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
         });
     }
 
-    public async Task<IReadOnlyList<ScriptCoverage>> StopAsync(string? scriptFilter)
+    public async Task<IReadOnlyList<ScriptCoverage>> StopAsync(List<string> scriptFilters, List<string> scriptExcludes)
     {
         if (_cdp is null)
             return [];
@@ -52,7 +52,10 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
             if (string.IsNullOrEmpty(url))
                 continue;
 
-            if (!string.IsNullOrEmpty(scriptFilter) && !url.Contains(scriptFilter, StringComparison.OrdinalIgnoreCase))
+            if (scriptFilters.Count > 0 && !scriptFilters.Any(f => url.Contains(f, StringComparison.OrdinalIgnoreCase)))
+                continue;
+
+            if (scriptExcludes.Any(e => url.Contains(e, StringComparison.OrdinalIgnoreCase)))
                 continue;
 
             string source = "";
@@ -98,7 +101,7 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
                 }
             }
 
-            scripts.Add(new ScriptCoverage(url, source, functions));
+            scripts.Add(new ScriptCoverage(new PageInfo(0, page.Url), url, source, functions));
         }
 
         await _cdp.SendAsync("Debugger.disable");
