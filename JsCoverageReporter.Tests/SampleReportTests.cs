@@ -406,10 +406,10 @@ public class SampleReportTests
         // index.html（一覧ページ）が生成されていることを確認する
         Assert.True(File.Exists(Path.Combine(outputDir, "index.html")));
 
-        // 各スクリプトの詳細ページが生成されていることを確認する
-        Assert.True(File.Exists(Path.Combine(outputDir, "scripts", "script-0.html")));
-        Assert.True(File.Exists(Path.Combine(outputDir, "scripts", "script-1.html")));
-        Assert.True(File.Exists(Path.Combine(outputDir, "scripts", "script-2.html")));
-        Assert.True(File.Exists(Path.Combine(outputDir, "scripts", "script-3.html")));
+        // 各スクリプトの詳細ページが生成されていることを確認する（全スクリプトが tab0 なので -tab0 がつく）
+        Assert.True(File.Exists(Path.Combine(outputDir, "scripts", "script-0-tab0.html")));
+        Assert.True(File.Exists(Path.Combine(outputDir, "scripts", "script-1-tab0.html")));
+        Assert.True(File.Exists(Path.Combine(outputDir, "scripts", "script-2-tab0.html")));
+        Assert.True(File.Exists(Path.Combine(outputDir, "scripts", "script-3-tab0.html")));
     }
 }
