@@ -350,6 +350,11 @@ internal class HtmlReportGenerator
                 i++;
                 while (i < len && source[i] != '`') { if (source[i] == '\\') { i++; } i++; }
             }
+            else if (c == '/' && IsRegexStart(source, i))
+            {
+                // 正規表現リテラルをスキップして括弧のカウントがずれないようにする
+                i = SkipRegexLiteral(source, i) - 1;
+            }
             i++;
         }
 

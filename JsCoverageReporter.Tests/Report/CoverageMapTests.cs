@@ -430,4 +430,27 @@ public class CoverageMapTests
         var map = HtmlReportGenerator.BuildCoverageMap(source, []);
         Assert.All(map, v => Assert.Equal(0, v));
     }
+
+    /// <summary>
+    /// 正規表現リテラル内の ) がパラメータ括弧の終わりと誤認識されないことを確認する。
+    /// 未実行の関数のパラメータに正規表現が含まれる場合でも、関数本体が赤くなるべき。
+    /// </summary>
+    [Fact]
+    public void BuildMap_FunctionParamWithRegexContainingParen_CorrectlyMarked()
+    {
+        // 正規表現リテラル内の ) がパラメータ括弧の終わりと誤認識されないことを確認する
+        // 未実行の関数のパラメータに正規表現が含まれる場合でも、関数本体が赤くなるべき
+        const string source = "function f(x = /a)b/) { return x; }";
+        //                     0         1         2         3
+        //                     0123456789012345678901234567890123456
+        // 文字列長: 35
+        // { は index 22、} は index 34
+
+        // カバレッジデータなし → V8 未コンパイル → 全文字が未実行(0)になるべき
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // 関数本体の { } 内は 0（未実行・赤）でなければならない
+        Assert.Equal(0, map[22]); // {
+        Assert.Equal(0, map[34]); // }
+    }
 }
