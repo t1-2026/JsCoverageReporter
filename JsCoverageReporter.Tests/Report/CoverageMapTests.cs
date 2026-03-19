@@ -454,6 +454,34 @@ public class CoverageMapTests
         Assert.Equal(0, map[34]); // }
     }
 
+    /// <summary>
+    /// 未実行の async function において async キーワードも赤くマークされることを確認する。
+    /// カバレッジデータなし（V8 が未コンパイル）の状態で MarkUncalledFunctionBodiesAsUncovered が
+    /// function キーワードとともに async キーワードも 0（未実行・赤）にマークするか検証する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_AsyncUncalledFunction_AsyncKeywordAlsoMarkedAsUncovered()
+    {
+        // カバレッジデータなし → V8 が async function f を未コンパイルのまま残した状態を模倣する
+        const string source = "async function f() { return 1; }";
+        //                     0         1         2         3
+        //                     01234567890123456789012345678901
+        // async: 0-4, ' ': 5, function: 6-13, ' ': 14, f: 15, (: 16, ): 17, ' ': 18, {: 19, ..., }: 31
+        // 文字列長: 32
+
+        // カバレッジデータを渡さない → MarkUncalledFunctionBodiesAsUncovered が補正対象にする
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // async（index 0–4）も未実行（0）でなければならない
+        Assert.Equal(0, map[0]); // 'a'
+        Assert.Equal(0, map[4]); // 'c'
+        // function キーワードの先頭も 0
+        Assert.Equal(0, map[6]); // 'f' of function
+        // 関数本体も 0
+        Assert.Equal(0, map[19]); // {
+        Assert.Equal(0, map[31]); // }
+    }
+
     [Fact]
     public void BuildMap_FunctionKeywordInRegexLiteral_RemainsNeutral()
     {

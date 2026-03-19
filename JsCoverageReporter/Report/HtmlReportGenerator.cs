@@ -209,6 +209,48 @@ internal class HtmlReportGenerator
                 {
                     // このオフセットは V8 がカバレッジデータに含めなかった関数と判断する
                     int funcStart = i;
+
+                    // async function の場合、async キーワードも未実行（赤）としてマークする
+                    // function キーワードの直前を逆方向に走査して async を探す
+                    int scanBack = funcStart - 1;
+                    // function キーワードの前の空白をスキップする
+                    while (scanBack >= 0 && char.IsWhiteSpace(source[scanBack]))
+                    {
+                        scanBack--;
+                    }
+                    // 5文字以上あり、その位置の5文字が "async" であるか確認する
+                    if (scanBack >= 4)
+                    {
+                        string candidate = source.Substring(scanBack - 4, 5);
+                        if (candidate == "async")
+                        {
+                            // async の前がidentifier文字でないことを確認する（notasync などを除外）
+                            bool isStandaloneAsync;
+                            if (scanBack - 5 < 0)
+                            {
+                                // ファイル先頭なので前に文字がない → standalone async
+                                isStandaloneAsync = true;
+                            }
+                            else
+                            {
+                                // 直前の文字が識別子文字でなければ standalone async
+                                isStandaloneAsync = !IsIdentifierChar(source[scanBack - 5]);
+                            }
+                            if (isStandaloneAsync)
+                            {
+                                // async キーワードの開始位置（scanBack - 4）から5文字を 0 にマークする
+                                int asyncStart = scanBack - 4;
+                                for (int a = asyncStart; a <= scanBack; a++)
+                                {
+                                    if (map[a] == -1)
+                                    {
+                                        map[a] = 0;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     int j = i + 8; // "function" の次の文字へ進む
 
                     // ジェネレータ関数の * をスキップする
