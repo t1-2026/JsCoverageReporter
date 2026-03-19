@@ -99,8 +99,332 @@ internal class HtmlReportGenerator
             }
         }
 
+        // V8 の遅延コンパイルにより未実行関数がカバレッジデータに含まれなかった場合の補正を行う
+        MarkUncalledFunctionBodiesAsUncovered(source, map);
+
         // 各文字のカバレッジ値が格納された配列を返す
         return map;
+    }
+
+    /// <summary>
+    /// V8 の遅延コンパイルにより未実行関数がカバレッジデータに含まれなかった場合の補正処理。
+    /// ソースコードを走査して function キーワードで始まる関数宣言を検出し、
+    /// カバレッジ対象外（-1）のままになっている関数本体全体を未実行（0）としてマークする。
+    /// 文字列・コメント・テンプレートリテラルの中に現れる function は正しく無視する。
+    /// </summary>
+    /// <param name="source">スクリプトのソースコード全文</param>
+    /// <param name="map">BuildCoverageMap で作成したカバレッジマップ（内容を書き換える）</param>
+    internal static void MarkUncalledFunctionBodiesAsUncovered(string source, int[] map)
+    {
+        int len = source.Length;
+        int i = 0;
+
+        // ソースコード全体を1文字ずつ走査する
+        while (i < len)
+        {
+            char c = source[i];
+
+            // 単一引用符の文字列をスキップする（中の function は無視する）
+            if (c == '\'')
+            {
+                i++;
+                while (i < len && source[i] != '\'')
+                {
+                    // バックスラッシュによるエスケープシーケンスの次の文字を読み飛ばす
+                    if (source[i] == '\\') { i++; }
+                    i++;
+                }
+                i++; // 閉じ引用符をスキップする
+                continue;
+            }
+
+            // 二重引用符の文字列をスキップする（中の function は無視する）
+            if (c == '"')
+            {
+                i++;
+                while (i < len && source[i] != '"')
+                {
+                    // バックスラッシュによるエスケープシーケンスの次の文字を読み飛ばす
+                    if (source[i] == '\\') { i++; }
+                    i++;
+                }
+                i++; // 閉じ引用符をスキップする
+                continue;
+            }
+
+            // テンプレートリテラルをスキップする（${ } の中はネスト深さで処理する）
+            if (c == '`')
+            {
+                i++;
+                int depth = 0;
+                while (i < len)
+                {
+                    char t = source[i];
+                    // バックスラッシュによるエスケープをスキップする
+                    if (t == '\\') { i += 2; continue; }
+                    // テンプレートリテラルの終端（${ の外側のみ）
+                    if (t == '`' && depth == 0) { i++; break; }
+                    // ${ でネストが1段深くなる
+                    if (t == '$' && i + 1 < len && source[i + 1] == '{') { depth++; i += 2; continue; }
+                    // } でネストが1段浅くなる
+                    if (t == '}' && depth > 0) { depth--; }
+                    i++;
+                }
+                continue;
+            }
+
+            // 行コメント // をスキップする（改行まで読み飛ばす）
+            if (c == '/' && i + 1 < len && source[i + 1] == '/')
+            {
+                while (i < len && source[i] != '\n') { i++; }
+                continue;
+            }
+
+            // ブロックコメント /* */ をスキップする
+            if (c == '/' && i + 1 < len && source[i + 1] == '*')
+            {
+                i += 2;
+                while (i + 1 < len && !(source[i] == '*' && source[i + 1] == '/')) { i++; }
+                i += 2; // */ の2文字をスキップする
+                continue;
+            }
+
+            // function キーワードの検出を試みる（'f' 以外の文字は確実にスキップする）
+            if (c == 'f' && i + 8 <= len && source.Substring(i, 8) == "function")
+            {
+                // function の前が識別子文字でないことを確認する（別の単語の一部を誤検出しない）
+                bool prevOk = i == 0 || !IsIdentifierChar(source[i - 1]);
+                // function の直後が識別子文字でないことを確認する（例: functionCall を除外する）
+                bool nextOk = i + 8 >= len || !IsIdentifierChar(source[i + 8]);
+
+                if (prevOk && nextOk && map[i] == -1)
+                {
+                    // このオフセットは V8 がカバレッジデータに含めなかった関数と判断する
+                    int funcStart = i;
+                    int j = i + 8; // "function" の次の文字へ進む
+
+                    // ジェネレータ関数の * をスキップする
+                    if (j < len && source[j] == '*') { j++; }
+                    // 空白をスキップする
+                    while (j < len && char.IsWhiteSpace(source[j])) { j++; }
+                    // 関数名（識別子）をスキップする（無名関数の場合はスキップなし）
+                    while (j < len && IsIdentifierChar(source[j])) { j++; }
+                    // 空白をスキップする
+                    while (j < len && char.IsWhiteSpace(source[j])) { j++; }
+
+                    // パラメータリスト ( ... ) をスキップする
+                    if (j < len && source[j] == '(')
+                    {
+                        j = SkipBalancedParens(source, j);
+                    }
+
+                    // 空白をスキップする
+                    while (j < len && char.IsWhiteSpace(source[j])) { j++; }
+
+                    // 関数本体 { ... } の終端位置を探す
+                    if (j < len && source[j] == '{')
+                    {
+                        int funcEnd = FindMatchingBrace(source, j);
+                        if (funcEnd > 0)
+                        {
+                            // 関数本体内でカバレッジ対象外(-1)の部分を未実行(0)としてマークする
+                            for (int k = funcStart; k < funcEnd; k++)
+                            {
+                                if (map[k] == -1)
+                                {
+                                    map[k] = 0;
+                                }
+                            }
+                            // 関数本体をスキップして次の走査位置へ進む
+                            i = funcEnd;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            i++;
+        }
+    }
+
+    /// <summary>
+    /// 文字が JavaScript の識別子として有効な文字かどうかを判定する。
+    /// function キーワードの前後チェックおよび関数名のスキップに使う。
+    /// </summary>
+    /// <param name="c">判定対象の文字</param>
+    /// <returns>識別子文字なら true</returns>
+    private static bool IsIdentifierChar(char c)
+    {
+        if (char.IsLetterOrDigit(c)) { return true; }
+        if (c == '_') { return true; }
+        if (c == '$') { return true; }
+        return false;
+    }
+
+    /// <summary>
+    /// ソースコードの位置 pos にある '/' が正規表現リテラルの開始かどうかを判定する。
+    /// 直前の非空白文字が識別子末尾・数字・) ] でなければ正規表現と判断する（簡易ヒューリスティック）。
+    /// </summary>
+    /// <param name="source">ソースコード全文</param>
+    /// <param name="pos">'/' のインデックス</param>
+    /// <returns>正規表現リテラルの開始なら true、除算演算子なら false</returns>
+    private static bool IsRegexStart(string source, int pos)
+    {
+        // pos の直前の非空白文字を探す
+        int i = pos - 1;
+        while (i >= 0 && char.IsWhiteSpace(source[i])) { i--; }
+        // ファイル先頭または文の先頭なら正規表現
+        if (i < 0) { return true; }
+        char prev = source[i];
+        // 識別子末尾・数字・閉じ括弧の後は除算演算子
+        if (IsIdentifierChar(prev) || prev == ')' || prev == ']') { return false; }
+        // 演算子・区切り文字の後は正規表現
+        return true;
+    }
+
+    /// <summary>
+    /// '/' から始まる正規表現リテラル /pattern/flags をスキップして直後の位置を返す。
+    /// 文字クラス [] の中では '/' をエスケープなしに使える点を考慮する。
+    /// </summary>
+    /// <param name="source">ソースコード全文</param>
+    /// <param name="start">'/' のインデックス（正規表現の開始 /）</param>
+    /// <returns>フラグ（g/i/m/s/u/y）を含む全体をスキップした直後の位置</returns>
+    private static int SkipRegexLiteral(string source, int start)
+    {
+        int i = start + 1; // 開始の '/' の次から走査する
+        int len = source.Length;
+        // [] の中かどうかを追跡する（文字クラス内では '/' が終端にならない）
+        bool inCharClass = false;
+        while (i < len)
+        {
+            char c = source[i];
+            // バックスラッシュエスケープの次の文字を読み飛ばす
+            if (c == '\\') { i += 2; continue; }
+            // 文字クラスの開始・終了を追跡する
+            if (c == '[') { inCharClass = true; }
+            else if (c == ']') { inCharClass = false; }
+            // 文字クラス外の '/' が正規表現の終端
+            else if (c == '/' && !inCharClass) { i++; break; }
+            // 改行が来たら正規表現は終了（JS の正規表現は改行をまたがない）
+            else if (c == '\n') { break; }
+            i++;
+        }
+        // フラグ部分（g, i, m, s, u, y など識別子文字）をスキップする
+        while (i < len && IsIdentifierChar(source[i])) { i++; }
+        return i;
+    }
+
+    /// <summary>
+    /// 開き括弧 '(' の位置から対応する閉じ括弧 ')' の直後の位置を返す。
+    /// 括弧の中にある文字列・ネストした括弧を考慮する。
+    /// </summary>
+    /// <param name="source">ソースコード全文</param>
+    /// <param name="start">開き括弧 '(' のインデックス</param>
+    /// <returns>対応する閉じ括弧 ')' の直後のインデックス</returns>
+    private static int SkipBalancedParens(string source, int start)
+    {
+        int i = start + 1; // '(' の次の文字から開始する
+        int depth = 1;
+        int len = source.Length;
+
+        while (i < len && depth > 0)
+        {
+            char c = source[i];
+            if (c == '(') { depth++; }
+            else if (c == ')') { depth--; }
+            else if (c == '\'')
+            {
+                // 単一引用符の文字列をスキップする
+                i++;
+                while (i < len && source[i] != '\'') { if (source[i] == '\\') { i++; } i++; }
+            }
+            else if (c == '"')
+            {
+                // 二重引用符の文字列をスキップする
+                i++;
+                while (i < len && source[i] != '"') { if (source[i] == '\\') { i++; } i++; }
+            }
+            else if (c == '`')
+            {
+                // テンプレートリテラルをスキップする（簡易版）
+                i++;
+                while (i < len && source[i] != '`') { if (source[i] == '\\') { i++; } i++; }
+            }
+            i++;
+        }
+
+        // depth が 0 になった時点で i は ')' の次の位置を指している
+        return i;
+    }
+
+    /// <summary>
+    /// 開き波括弧 '{' の位置から対応する閉じ波括弧 '}' の直後の位置を返す。
+    /// 波括弧の中にある文字列・コメント・ネストした波括弧を考慮する。
+    /// </summary>
+    /// <param name="source">ソースコード全文</param>
+    /// <param name="start">開き波括弧 '{' のインデックス</param>
+    /// <returns>対応する閉じ波括弧 '}' の直後のインデックス。見つからない場合は -1</returns>
+    private static int FindMatchingBrace(string source, int start)
+    {
+        int i = start + 1; // '{' の次の文字から開始する
+        int depth = 1;
+        int len = source.Length;
+
+        while (i < len)
+        {
+            char c = source[i];
+            if (c == '{') { depth++; }
+            else if (c == '}')
+            {
+                depth--;
+                // 対応する '}' が見つかった場合はその直後の位置を返す
+                if (depth == 0) { return i + 1; }
+            }
+            else if (c == '\'')
+            {
+                // 単一引用符の文字列をスキップする
+                i++;
+                while (i < len && source[i] != '\'') { if (source[i] == '\\') { i++; } i++; }
+            }
+            else if (c == '"')
+            {
+                // 二重引用符の文字列をスキップする
+                i++;
+                while (i < len && source[i] != '"') { if (source[i] == '\\') { i++; } i++; }
+            }
+            else if (c == '`')
+            {
+                // テンプレートリテラルをスキップする（簡易版）
+                i++;
+                while (i < len && source[i] != '`') { if (source[i] == '\\') { i++; } i++; }
+            }
+            else if (c == '/')
+            {
+                if (i + 1 < len && source[i + 1] == '/')
+                {
+                    // 行コメントをスキップする（改行まで読み飛ばす）
+                    while (i < len && source[i] != '\n') { i++; }
+                    continue;
+                }
+                else if (i + 1 < len && source[i + 1] == '*')
+                {
+                    // ブロックコメントをスキップする
+                    i += 2;
+                    while (i + 1 < len && !(source[i] == '*' && source[i + 1] == '/')) { i++; }
+                    i++; // '*' をスキップする（直後の '/' は外側の i++ で処理される）
+                }
+                else if (IsRegexStart(source, i))
+                {
+                    // 正規表現リテラルをスキップする（/regex/ 内の } が深さカウントを狂わせないようにする）
+                    i = SkipRegexLiteral(source, i);
+                    continue; // SkipRegexLiteral が終端の次の位置を返すので i++ をスキップする
+                }
+            }
+            i++;
+        }
+
+        // 対応する '}' が見つからなかった場合（構文エラーのソース）
+        return -1;
     }
 
     /// <summary>
