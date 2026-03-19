@@ -549,6 +549,14 @@ internal class HtmlReportGenerator
             // 行内の各文字を順番に処理する
             for (int i = 0; i < rawLine.Length; i++)
             {
+                // \r（CRLF 改行の CR 部分）と \0（ヌル文字）はカバレッジカウントに含めない
+                char chSkip = rawLine[i];
+                if (chSkip == '\r' || chSkip == '\0')
+                {
+                    // offset は進めない（後で offset += rawLine.Length + 1 でまとめて加算する）
+                    continue;
+                }
+
                 // この文字のソースコード全体でのインデックス
                 int idx = offset + i;
 

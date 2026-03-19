@@ -579,4 +579,62 @@ public class HtmlOutputTests
         Assert.Contains("(tab 2)", html);
     }
 
+    // -----------------------------------------------------------------------
+    // BuildLines — \r / \0 をカバレッジカウントから除外するテスト
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// \r\n 改行のとき、\r の coverage 値が行のステータス判定に影響しないことを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildLines_CrCoveredButCodeUncovered_StatusIsUncovered()
+    {
+        // \r\n 改行のとき、\r の coverage が 0 でも行の判定に影響しないことを確認する
+        // ソース: "x\r\n" — x=index0, \r=index1, \n=index2
+        const string source = "x\r\n";
+
+        // x（index 0）は未実行（0）、\r（index 1）は covered（1）とする
+        // BuildLines が \r をスキップしなければ \r の count=1 が covered に加算され Partial になる
+        var functions = new List<FunctionCoverage>
+        {
+            new FunctionCoverage("", new List<CoverageRange>
+            {
+                // x だけを count=0 にする（\r は count=1 の範囲に含まれると想定）
+                new CoverageRange(0, 1, 0),
+                new CoverageRange(1, 2, 1),
+            }),
+        };
+        var map = HtmlReportGenerator.BuildCoverageMap(source, functions);
+        var lines = HtmlReportGenerator.BuildLines(source, map);
+
+        // \r をスキップすれば、行の実コードは x のみ → count=0 → Uncovered
+        Assert.Equal(LineCoverageStatus.Uncovered, lines[0].Status);
+    }
+
+    /// <summary>
+    /// \0（ヌル文字）はカバレッジカウントに含まれないことを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildLines_NulCharUncovered_NotCountedInCoverage()
+    {
+        // \0（ヌル文字）はカバレッジカウントに含まれないことを確認する
+        // ソース: "x\0" — x=index0, \0=index1
+        const string source = "x\0";
+
+        // x は covered（1）、\0 は uncovered（0）
+        var functions = new List<FunctionCoverage>
+        {
+            new FunctionCoverage("", new List<CoverageRange>
+            {
+                new CoverageRange(0, 1, 1),
+                new CoverageRange(1, 2, 0),
+            }),
+        };
+        var map = HtmlReportGenerator.BuildCoverageMap(source, functions);
+        var lines = HtmlReportGenerator.BuildLines(source, map);
+
+        // \0 をスキップすれば、行の実コードは x のみ → count=1 → Covered
+        Assert.Equal(LineCoverageStatus.Covered, lines[0].Status);
+    }
+
 }
