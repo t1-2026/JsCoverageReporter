@@ -197,6 +197,45 @@ internal class HtmlReportGenerator
                 continue;
             }
 
+            // アロー関数 => の検出（ブロック本体 {} を持つ場合のみ）
+            if (c == '=' && i + 1 < len && source[i + 1] == '>')
+            {
+                // => の開始位置を記録する
+                int arrowStart = i;
+
+                // => の後の空白をスキップする
+                int afterArrow = i + 2;
+                while (afterArrow < len && char.IsWhiteSpace(source[afterArrow]))
+                {
+                    afterArrow++;
+                }
+
+                // 次の文字が { でなければブロック本体ではないのでスキップする（例: x => x + 1）
+                if (afterArrow < len && source[afterArrow] == '{')
+                {
+                    // このアロー関数がカバレッジデータにない（未実行）場合のみ処理する
+                    if (map[arrowStart] == -1)
+                    {
+                        // 対応する } を探す
+                        int braceEnd = FindMatchingBrace(source, afterArrow);
+                        if (braceEnd > afterArrow)
+                        {
+                            // => から } までを未実行（0）にマークする
+                            for (int m = arrowStart; m <= braceEnd; m++)
+                            {
+                                if (map[m] == -1)
+                                {
+                                    map[m] = 0;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // => の 2 文字目（>）をスキップして次の文字へ進む
+                i++;
+            }
+
             // function キーワードの検出を試みる（'f' 以外の文字は確実にスキップする）
             if (c == 'f' && i + 8 <= len && source.Substring(i, 8) == "function")
             {

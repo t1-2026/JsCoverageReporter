@@ -504,4 +504,78 @@ public class CoverageMapTests
         // index 23 は '/'（正規表現の終わり）
         Assert.Equal(-1, map[23]);
     }
+
+    // -----------------------------------------------------------------------
+    // アロー関数の未実行検出テスト
+    // ブロック本体 {} を持つアロー関数の補正処理を検証する
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// 未実行のアロー関数（ブロック本体）がカバレッジデータにない場合、
+    /// => からブロック本体 {} 全体が未実行(0)としてマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledArrowFunctionWithBlock_MarkedAsUncovered()
+    {
+        // 未実行のアロー関数（ブロック本体）が赤くマークされることを確認する
+        const string source = "const f = () => { return 1; };";
+        //                     0         1         2
+        //                     012345678901234567890123456789
+
+        // カバレッジデータなし（全体 -1 ニュートラル）
+        var functions = new List<FunctionCoverage>();
+        var map = HtmlReportGenerator.BuildCoverageMap(source, functions);
+
+        // => は index 13–14、{ は index 16、} は index 28
+        Assert.Equal(0, map[13]); // '=' of =>
+        Assert.Equal(0, map[16]); // {
+        Assert.Equal(0, map[28]); // }
+    }
+
+    /// <summary>
+    /// 実行済みのアロー関数（ブロック本体）はカバレッジデータがあるため、
+    /// 未実行(0)としてマークされないことを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_CalledArrowFunctionWithBlock_NotMarkedAsUncovered()
+    {
+        // 実行済みのアロー関数（ブロック本体）は赤くならないことを確認する
+        const string source = "const f = () => { return 1; };";
+
+        // 関数全体を実行済み（count=1）にする
+        var functions = new List<FunctionCoverage>
+        {
+            new FunctionCoverage("f", new List<CoverageRange>
+            {
+                new CoverageRange(0, source.Length, 1),
+            }),
+        };
+        var map = HtmlReportGenerator.BuildCoverageMap(source, functions);
+
+        // 実行済みなので { } 内は 1（緑）のまま
+        Assert.Equal(1, map[16]); // {
+        Assert.Equal(1, map[28]); // }
+    }
+
+    /// <summary>
+    /// アロー関数でもブロック本体でない場合（式本体）は検出の対象外であることを確認する。
+    /// 式本体の場合は V8 CDP が範囲データを提供するため、ここでの処理は不要。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledArrowFunctionWithExpression_NotMarkedAsUncovered()
+    {
+        // アロー関数でもブロック本体でない場合（式本体）は検出しない
+        // 式本体の場合は V8 CDP が範囲データを提供するため、ここでの処理は不要
+        const string source = "const f = x => x + 1;";
+        //                     0         1         2
+        //                     012345678901234567890
+
+        // カバレッジデータなし（全体 -1 ニュートラル）
+        var functions = new List<FunctionCoverage>();
+        var map = HtmlReportGenerator.BuildCoverageMap(source, functions);
+
+        // 式本体なので => の位置（index 13）は -1（ニュートラル）のまま
+        // （ブロックではないので MarkUncalledFunctionBodiesAsUncovered に影響されない）
+        Assert.Equal(-1, map[13]); // '=' of =>
+    }
 }
