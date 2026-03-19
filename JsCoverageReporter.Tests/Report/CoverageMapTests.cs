@@ -453,4 +453,27 @@ public class CoverageMapTests
         Assert.Equal(0, map[22]); // {
         Assert.Equal(0, map[34]); // }
     }
+
+    [Fact]
+    public void BuildMap_FunctionKeywordInRegexLiteral_RemainsNeutral()
+    {
+        // 正規表現リテラル内の "function" が関数として誤検出されないことを確認する
+        // 正規表現内の function キーワードは -1（ニュートラル）のままであるべき
+        // 正規表現 /function() {}/ は見かけ上の関数宣言に見えるが、あくまで正規表現パターン
+        const string source = "var re = /function() {}/;";
+        //                     0         1         2
+        //                     0123456789012345678901234
+
+        // カバレッジデータなし（全体が -1 ニュートラル）の状態でマップを構築する
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // 正規表現内の "function" は検出されてはいけないため、すべて -1 のまま
+        // 修正前は /function() {}/ 内の {} が関数本体と誤認識され、0（未実行）になってしまう
+        // index 10 は 'f'（function の先頭）
+        Assert.Equal(-1, map[10]);
+        // index 22 は '}'（正規表現内の閉じ波括弧）
+        Assert.Equal(-1, map[22]);
+        // index 23 は '/'（正規表現の終わり）
+        Assert.Equal(-1, map[23]);
+    }
 }

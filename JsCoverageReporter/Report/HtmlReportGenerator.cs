@@ -189,6 +189,14 @@ internal class HtmlReportGenerator
                 continue;
             }
 
+            // 正規表現リテラルをスキップして function キーワードを誤検出しないようにする
+            if (c == '/' && IsRegexStart(source, i))
+            {
+                // 正規表現リテラル全体をスキップして直後の位置へ進む
+                i = SkipRegexLiteral(source, i);
+                continue;
+            }
+
             // function キーワードの検出を試みる（'f' 以外の文字は確実にスキップする）
             if (c == 'f' && i + 8 <= len && source.Substring(i, 8) == "function")
             {
