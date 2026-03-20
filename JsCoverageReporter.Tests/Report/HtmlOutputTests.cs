@@ -707,4 +707,74 @@ public class HtmlOutputTests
         Assert.DoesNotContain("<evil>", scriptPage);
     }
 
+    // -----------------------------------------------------------------------
+    // BuildLines — 境界値・エッジケースのテスト
+    // 空ソース・末尾改行・ニュートラル行・複数行オフセット検証
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// ソースコードが改行（\n）で終わる場合、末尾の空行が除外されることを確認する。
+    /// "abc\n" を Split('\n') すると ["abc", ""] となるが、末尾の空要素は除外される。
+    /// </summary>
+    [Fact]
+    public void BuildLines_SourceEndingWithNewline_TrailingEmptyLineExcluded()
+    {
+        // "abc\n" は Split('\n') で ["abc", ""] → 末尾の空要素を除いて 1 行
+        var lines = HtmlReportGenerator.BuildLines("abc\n", [1, 1, 1, -1]);
+        // 末尾の空行が除外されて1行だけ返されるべき
+        Assert.Single(lines);
+    }
+
+    /// <summary>
+    /// 全文字が -1（カバレッジ対象外）の行は Neutral ステータスになることを確認する。
+    /// 空白や上位スコープのコメント行などが対象。
+    /// </summary>
+    [Fact]
+    public void BuildLines_AllNeutralChars_StatusIsNeutral()
+    {
+        // 全文字が -1（ニュートラル）の行は Neutral になるべき
+        var lines = HtmlReportGenerator.BuildLines("   ", [-1, -1, -1]);
+        Assert.Single(lines);
+        Assert.Equal(LineCoverageStatus.Neutral, lines[0].Status);
+    }
+
+    /// <summary>
+    /// 3行のソースを渡したとき、各行のオフセット計算が正しく行われることを確認する。
+    /// "a\nb\nc" では a=idx0, b=idx2, c=idx4 となり、行ごとに正しい map 値が参照される。
+    /// </summary>
+    [Fact]
+    public void BuildLines_ThreeLineSource_CorrectStatusPerLine()
+    {
+        // "a\nb\nc": a=idx0(covered), \n=split, b=idx2(uncovered), \n=split, c=idx4(covered)
+        const string source = "a\nb\nc";
+        var map = new int[] { 1, -1, 0, -1, 1 };
+        var lines = HtmlReportGenerator.BuildLines(source, map);
+
+        // 3行が正しく生成されているか確認する
+        Assert.Equal(3, lines.Count);
+        // 1行目: a(idx=0, map=1) → Covered
+        Assert.Equal(LineCoverageStatus.Covered,   lines[0].Status);
+        // 2行目: b(idx=2, map=0) → Uncovered（オフセット計算が正しければ idx=2 が参照される）
+        Assert.Equal(LineCoverageStatus.Uncovered, lines[1].Status);
+        // 3行目: c(idx=4, map=1) → Covered
+        Assert.Equal(LineCoverageStatus.Covered,   lines[2].Status);
+    }
+
+    // -----------------------------------------------------------------------
+    // HtmlEncode のエッジケーステスト
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// "&lt;" のように既にエンコードされた文字列を HtmlEncode に渡した場合、
+    /// &amp; → &amp;amp; に変換されるが &lt; の部分は二重変換されないことを確認する。
+    /// （& を最初に変換する実装になっているため）
+    /// </summary>
+    [Fact]
+    public void HtmlEncode_AlreadyEncodedString_AmpersandNotDoubleEncoded()
+    {
+        // "&lt;" を渡すと: & → &amp; → "&amp;lt;" となる
+        // &amp; の & が再び変換されて "&amp;amp;lt;" にはならないはず
+        Assert.Equal("&amp;lt;", HtmlReportGenerator.HtmlEncode("&lt;"));
+    }
+
 }

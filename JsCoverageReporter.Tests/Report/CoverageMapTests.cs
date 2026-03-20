@@ -701,4 +701,141 @@ public class CoverageMapTests
         // index 9 は 'f'（function の先頭）
         Assert.Equal(-1, map[9]);
     }
+
+    // -----------------------------------------------------------------------
+    // ジェネレータ関数・async メソッド・ネスト関数の検出テスト
+    // 新観点: function* / async method / 外側呼出し済み+内側未呼出し
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// ジェネレータ関数 function* が未実行の場合、function キーワードと同様に
+    /// 全体が未実行(0)としてマークされることを確認する。
+    /// スキャナーは * をスキップしてから関数名・パラメータ・本体を検出する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledGeneratorFunction_AllMarkedAsUncovered()
+    {
+        // function* ジェネレータ関数。カバレッジデータなしなら全体が 0 になるべき
+        const string source = "function* gen() { yield 1; }";
+        //                     0         1         2
+        //                     0123456789012345678901234567
+        // function: 0-7, *: 8, ' ': 9, gen: 10-12, (: 13, ): 14, ' ': 15, {: 16, }: 27
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // function キーワードの先頭も 0（未実行）
+        Assert.Equal(0, map[0]);  // 'f' of function*
+        // 本体の { } も 0（未実行）
+        Assert.Equal(0, map[16]); // {
+        Assert.Equal(0, map[27]); // }
+    }
+
+    /// <summary>
+    /// 外側関数が実行済みで内側関数が V8 未コンパイルの場合の既知の制限を確認する。
+    /// 外側の coverage range が内側をカバーするため、MarkUncalledFunctionBodiesAsUncovered は
+    /// 内側の map 値が -1 でないと判断して補正できない。内側は 1（緑）のまま残る。
+    /// </summary>
+    [Fact]
+    public void BuildMap_OuterCalledInnerLazyCompiled_InnerBodyCoveredByOuterRange()
+    {
+        // 外側の range だけが CDP データに含まれ、内側は V8 が未コンパイルで含まれない想定
+        const string source = "function outer() { function inner() { return 1; } return 2; }";
+        //                     0         1         2         3         4         5         6
+        //                     0123456789012345678901234567890123456789012345678901234567890
+        // outer { : 17, inner function: 19, inner {: 36, inner }: 48, outer }: 60
+
+        var functions = new List<FunctionCoverage>
+        {
+            // 外側のみ実行済み（内側は V8 未コンパイルとして CDP データに含まれない）
+            new FunctionCoverage("outer", new List<CoverageRange>
+            {
+                new CoverageRange(0, source.Length, 1),
+            }),
+        };
+        var map = HtmlReportGenerator.BuildCoverageMap(source, functions);
+
+        // 外側の本体は 1（緑）
+        Assert.Equal(1, map[17]); // { of outer
+
+        // 既知の制限: inner の { は外側の count=1 で覆われるため 1 のまま
+        // MarkUncalledFunctionBodiesAsUncovered は map[funcStart] == -1 のみ処理するので
+        // inner の未実行は検出できない（false negative）
+        Assert.Equal(1, map[36]); // { of inner — 外側 range に含まれるため 1 のまま
+    }
+
+    /// <summary>
+    /// 未実行の async メソッド短縮構文（async greet() {}）で、
+    /// メソッド本体が正しく 0（未実行）としてマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledAsyncMethodShorthand_BodyMarkedAsUncovered()
+    {
+        // async メソッド short hand: async キーワードに続くメソッド名が未実行の場合
+        const string source = "const obj = { async greet() { return 1; } };";
+        //                     0         1         2         3         4
+        //                     01234567890123456789012345678901234567890123
+        // async: 14-18, ' ': 19, greet: 20-24, (: 25, ): 26, ' ': 27, {: 28, }: 40
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // greet の本体（{ } 内）は 0（未実行）になるべき
+        Assert.Equal(0, map[20]); // 'g' of greet
+        Assert.Equal(0, map[28]); // {
+        Assert.Equal(0, map[40]); // }
+    }
+
+    /// <summary>
+    /// 未実行の async メソッド短縮構文では async キーワードも 0 になるべきだが、
+    /// 現在の実装では async キーワードが -1（ニュートラル）のまま残る既知のギャップ。
+    /// （async function の場合は修正済みだが、async method shorthand は未対応）
+    /// </summary>
+    [Fact(Skip = "gap: async keyword before method shorthand is not marked uncovered (async function case is fixed but async method shorthand is not)")]
+    public void BuildMap_UncalledAsyncMethodShorthand_AsyncKeywordAlsoMarked()
+    {
+        const string source = "const obj = { async greet() { return 1; } };";
+        // async: 14-18, greet: 20-24, {: 28, }: 40
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // async キーワードも 0（未実行・赤）になるべき — 現状は -1 のまま
+        Assert.Equal(0, map[14]); // 'a' of async
+    }
+
+    /// <summary>
+    /// アロー関数のマーク範囲に関するオフバイワンバグの確認テスト。
+    /// FindMatchingBrace は } の次のインデックスを返すが、
+    /// アロー関数のマーク処理で "m &lt;= braceEnd" としているため
+    /// } の直後の文字（; など）も誤って 0（赤）にマークされる。
+    /// </summary>
+    [Fact(Skip = "bug: arrow function marking uses m <= braceEnd but FindMatchingBrace returns index AFTER '}'," +
+                 " so the character after '}' is incorrectly marked as uncovered (off-by-one)")]
+    public void BuildMap_UncalledArrowFunction_CharAfterClosingBraceRemainsNeutral()
+    {
+        const string source = "const f = () => { return 1; };";
+        //                     0         1         2
+        //                     012345678901234567890123456789
+        // => at 13, { at 16, } at 28, ; at 29
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // } 自体は 0（未実行）でなければならない
+        Assert.Equal(0, map[28]); // }
+
+        // } の直後の ; は arrow function の外側 → -1（ニュートラル）であるべき
+        // 現在の実装は m <= braceEnd（= 29）でループするため map[29] = 0 になってしまう
+        Assert.Equal(-1, map[29]); // ';' after '}'
+    }
+
+    /// <summary>
+    /// count が 1 より大きい実行回数も「実行済み（1）」として扱われることを確認する。
+    /// 実行回数の多寡は問わず、1回以上なら covered とみなす。
+    /// </summary>
+    [Fact]
+    public void BuildMap_HighCountRange_TreatedAsCovered()
+    {
+        // count=100 でも「実行済み」として map 値が 1 になるべき
+        var functions = new[] { new FunctionCoverage("f", [new CoverageRange(0, 3, 100)]) };
+        var map = HtmlReportGenerator.BuildCoverageMap("abc", functions);
+        Assert.Equal([1, 1, 1], map);
+    }
 }
