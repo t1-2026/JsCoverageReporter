@@ -777,4 +777,62 @@ public class HtmlOutputTests
         Assert.Equal("&amp;lt;", HtmlReportGenerator.HtmlEncode("&lt;"));
     }
 
+    // -----------------------------------------------------------------------
+    // BuildLines — map の長さが source と異なる場合のテスト
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// map 配列の長さがソースより短い場合、map 範囲外の文字は -1（ニュートラル）として
+    /// 扱われることを確認する。
+    /// CDP データが不完全な場合や、ソースが後から変更された場合の安全処理。
+    /// </summary>
+    [Fact]
+    public void BuildLines_MapShorterThanSource_ExtraCharsAreNeutral()
+    {
+        // "hello"（5文字）に対して map は 2 要素だけ（残り 3 文字は map 範囲外）
+        var source = "hello";
+        var map = new int[] { 1, 0 }; // h=covered, e=uncovered, l/l/o=範囲外
+        var lines = HtmlReportGenerator.BuildLines(source, map);
+
+        // 1行だけ生成されているか確認する
+        Assert.Single(lines);
+
+        // covered(h) と uncovered(e) が両方あるため Partial になるはず
+        // （l/l/o は -1 → 計数されない）
+        Assert.Equal(LineCoverageStatus.Partial, lines[0].Status);
+    }
+
+    /// <summary>
+    /// 1文字だけのソースコードを渡した場合でも、
+    /// 1行のデータが正しく生成されることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildLines_SingleCharSource_ProducesOneLine()
+    {
+        // 1文字のソース・1要素のマップ
+        var lines = HtmlReportGenerator.BuildLines("x", [1]);
+
+        // 1行だけ生成されているか確認する
+        Assert.Single(lines);
+        // 1文字が covered なので行全体が Covered になるべき
+        Assert.Equal(LineCoverageStatus.Covered, lines[0].Status);
+        // "x" がそのまま HTML に含まれているか確認する
+        Assert.Contains("x", lines[0].Html);
+    }
+
+    /// <summary>
+    /// map 配列が空（長さ 0）の場合、全文字が -1 として扱われ
+    /// 行は Neutral ステータスになることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildLines_EmptyMapWithSource_AllCharsNeutral()
+    {
+        // ソースはあるが map が空（範囲外アクセスを避ける必要がある）
+        var lines = HtmlReportGenerator.BuildLines("abc", []);
+
+        // 1行生成される
+        Assert.Single(lines);
+        // map 範囲外の文字はすべて -1（ニュートラル）→ 行ステータスは Neutral
+        Assert.Equal(LineCoverageStatus.Neutral, lines[0].Status);
+    }
 }

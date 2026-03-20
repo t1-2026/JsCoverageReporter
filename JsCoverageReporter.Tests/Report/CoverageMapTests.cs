@@ -838,4 +838,24 @@ public class CoverageMapTests
         var map = HtmlReportGenerator.BuildCoverageMap("abc", functions);
         Assert.Equal([1, 1, 1], map);
     }
+
+    // -----------------------------------------------------------------------
+    // CoverageRange 境界値テスト（既存テストが未カバーの観点のみ）
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// EndOffset &lt; StartOffset という逆順レンジでも例外が発生せず、
+    /// クランプ処理により何もマークされないことを確認する。
+    /// start=5, end=Math.Min(2, sourceLen) → start &gt;= end のためループ不実行。
+    /// </summary>
+    [Fact]
+    public void BuildMap_InvertedRange_NoExceptionAndNoEffect()
+    {
+        // EndOffset(2) < StartOffset(5) の逆順レンジ
+        var functions = new[] { new FunctionCoverage("f", [new CoverageRange(5, 2, 1)]) };
+        var map = HtmlReportGenerator.BuildCoverageMap("hello", functions);
+
+        // クランプ後に start(5) >= end(2) になるためループが回らず全文字 -1 のまま
+        Assert.Equal([-1, -1, -1, -1, -1], map);
+    }
 }
