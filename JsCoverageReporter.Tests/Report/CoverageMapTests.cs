@@ -653,4 +653,52 @@ public class CoverageMapTests
         Assert.Equal(-1, map[10]); // {
         Assert.Equal(-1, map[19]); // }
     }
+
+    // -----------------------------------------------------------------------
+    // Task 8: 検証テスト — コメント・テンプレートリテラル内の function キーワード
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// ブロックコメント内の "function" キーワードが関数として誤検出されないことを確認する。
+    /// MarkUncalledFunctionBodiesAsUncovered はブロックコメントをスキップするため、
+    /// コメント内の function は補正対象にならず -1（ニュートラル）のままになるべき。
+    /// </summary>
+    [Fact]
+    public void BuildMap_FunctionKeywordInBlockComment_RemainsNeutral()
+    {
+        // ブロックコメント内の "function" が関数として誤検出されないことを確認する
+        const string source = "/* function foo() {} */ var x = 1;";
+        //                     0         1         2         3
+        //                     01234567890123456789012345678901234
+
+        // カバレッジデータなし（全体 -1 ニュートラル）
+        var functions = new List<FunctionCoverage>();
+        var map = HtmlReportGenerator.BuildCoverageMap(source, functions);
+
+        // ブロックコメント内の "function" は検出されてはいけない
+        // index 3 は 'f'（function の先頭）
+        Assert.Equal(-1, map[3]);
+    }
+
+    /// <summary>
+    /// テンプレートリテラル内の "function" キーワードが関数として誤検出されないことを確認する。
+    /// MarkUncalledFunctionBodiesAsUncovered はテンプレートリテラルをスキップするため、
+    /// バッククォート内の function は補正対象にならず -1（ニュートラル）のままになるべき。
+    /// </summary>
+    [Fact]
+    public void BuildMap_FunctionKeywordInTemplateLiteral_RemainsNeutral()
+    {
+        // テンプレートリテラル内の "function" が関数として誤検出されないことを確認する
+        const string source = "var s = `function foo() {}`;";
+        //                     0         1         2
+        //                     0123456789012345678901234567
+
+        // カバレッジデータなし（全体 -1 ニュートラル）
+        var functions = new List<FunctionCoverage>();
+        var map = HtmlReportGenerator.BuildCoverageMap(source, functions);
+
+        // テンプレートリテラル内の "function" は検出されてはいけない
+        // index 9 は 'f'（function の先頭）
+        Assert.Equal(-1, map[9]);
+    }
 }

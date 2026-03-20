@@ -637,4 +637,74 @@ public class HtmlOutputTests
         Assert.Equal(LineCoverageStatus.Covered, lines[0].Status);
     }
 
+    // -----------------------------------------------------------------------
+    // Task 8: XSS 防止のテスト
+    // ソースコード・URL・ファイル名に含まれる特殊文字が HTML エンコードされることを確認する
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// ソースコード内の &lt;script&gt; タグが HTML エンコードされて出力されることを確認する（XSS 防止）。
+    /// BuildLines が各文字を HtmlEncode するため、ソース内の HTML タグはエスケープされるべき。
+    /// </summary>
+    [Fact]
+    public void BuildScriptPage_ScriptTagInSource_IsHtmlEncoded()
+    {
+        // ソースコード内の <script> タグが HTML エンコードされて出力されることを確認する（XSS 防止）
+        const string source = "var x = \"<script>alert(1)</script>\";";
+        var functions = new List<FunctionCoverage>();
+        var map = HtmlReportGenerator.BuildCoverageMap(source, functions);
+        var lines = HtmlReportGenerator.BuildLines(source, map);
+
+        // BuildScriptPage を呼び出して HTML 出力を確認する
+        // ページ情報（タブ0）を指定する
+        var pageInfo = new PageInfo(0, "http://example.com/test.js");
+        var scriptPage = HtmlReportGenerator.BuildScriptPage(pageInfo, "test.js", lines);
+
+        // <script> タグが &lt;script&gt; にエンコードされているべき
+        Assert.Contains("&lt;script&gt;", scriptPage);
+        Assert.DoesNotContain("<script>alert(1)</script>", scriptPage);
+    }
+
+    /// <summary>
+    /// URL 内の &lt; &gt; が HTML エンコードされて出力されることを確認する（XSS 防止）。
+    /// BuildIndexPage は URL を HtmlEncode するため、URL 内の HTML タグはエスケープされるべき。
+    /// </summary>
+    [Fact]
+    public void BuildIndexPage_XssInUrl_IsHtmlEncoded()
+    {
+        // URL 内の < > が HTML エンコードされて出力されることを確認する（XSS 防止）
+        const string url = "http://example.com/<script>alert(1)</script>";
+        var rows = new List<(string pageUrl, string url, int covered, int partial, int total, string filename)>
+        {
+            ("http://example.com", url, 10, 0, 10, "test.html")
+        };
+        var scriptPage = HtmlReportGenerator.BuildIndexPage(rows);
+
+        // URL の < > が &lt; &gt; にエンコードされているべき
+        Assert.Contains("&lt;script&gt;", scriptPage);
+        Assert.DoesNotContain("<script>", scriptPage);
+    }
+
+    /// <summary>
+    /// スクリプト URL 内の &lt; &gt; が HTML エンコードされてスクリプトページのタイトルに表示されることを確認する（XSS 防止）。
+    /// BuildScriptPage は scriptUrl を HtmlEncode するため、URL 内の HTML タグはエスケープされるべき。
+    /// </summary>
+    [Fact]
+    public void BuildScriptPage_XssInScriptUrl_IsHtmlEncoded()
+    {
+        // スクリプト URL 内の < > が HTML エンコードされて出力されることを確認する（XSS 防止）
+        const string source = "var x = 1;";
+        var functions = new List<FunctionCoverage>();
+        var map = HtmlReportGenerator.BuildCoverageMap(source, functions);
+        var lines = HtmlReportGenerator.BuildLines(source, map);
+        var pageInfo = new PageInfo(0, "http://example.com/test.js");
+
+        // スクリプト URL に XSS ペイロードを埋め込む
+        var scriptPage = HtmlReportGenerator.BuildScriptPage(pageInfo, "<evil>name</evil>", lines);
+
+        // スクリプト URL の < > が &lt; &gt; にエンコードされているべき
+        Assert.Contains("&lt;evil&gt;", scriptPage);
+        Assert.DoesNotContain("<evil>", scriptPage);
+    }
+
 }
