@@ -578,4 +578,79 @@ public class CoverageMapTests
         // （ブロックではないので MarkUncalledFunctionBodiesAsUncovered に影響されない）
         Assert.Equal(-1, map[13]); // '=' of =>
     }
+
+    // -----------------------------------------------------------------------
+    // メソッド短縮構文（method shorthand）の未実行検出テスト
+    // オブジェクトリテラル・クラスのメソッドが未実行の場合の補正を検証する
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// 未実行のメソッド短縮構文が赤くマークされることを確認する。
+    /// オブジェクトリテラル内の greet() { } のようなメソッドは
+    /// function キーワードを使わないため、通常の補正では検出されない。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledMethodShorthand_MarkedAsUncovered()
+    {
+        // 未実行のメソッド短縮構文が赤くマークされることを確認する
+        const string source = "const obj = { greet() { return 1; } };";
+        //                     0         1         2         3
+        //                     0123456789012345678901234567890123456789
+        // greet は index 14、( は index 19、) は index 20、{ は index 22、} は index 34
+
+        // カバレッジデータなし（全体 -1 ニュートラル）
+        var functions = new List<FunctionCoverage>();
+        var map = HtmlReportGenerator.BuildCoverageMap(source, functions);
+
+        // greet（index 14）から始まり、{ } 内も 0（未実行）
+        Assert.Equal(0, map[14]); // 'g' of greet
+        Assert.Equal(0, map[22]); // {
+        Assert.Equal(0, map[34]); // }
+    }
+
+    /// <summary>
+    /// 実行済みのメソッド短縮構文は赤くならないことを確認する。
+    /// カバレッジデータが存在するメソッドは補正の対象外となる。
+    /// </summary>
+    [Fact]
+    public void BuildMap_CalledMethodShorthand_NotMarkedAsUncovered()
+    {
+        // 実行済みのメソッド短縮構文は赤くならないことを確認する
+        const string source = "const obj = { greet() { return 1; } };";
+
+        // greet 全体を実行済み（count=1）にする
+        var functions = new List<FunctionCoverage>
+        {
+            new FunctionCoverage("greet", new List<CoverageRange>
+            {
+                new CoverageRange(14, 35, 1),
+            }),
+        };
+        var map = HtmlReportGenerator.BuildCoverageMap(source, functions);
+
+        // 実行済みなので { } 内は 1（緑）のまま
+        Assert.Equal(1, map[22]); // {
+        Assert.Equal(1, map[34]); // }
+    }
+
+    /// <summary>
+    /// if (...) {} がメソッドとして誤検出されないことを確認する。
+    /// "if" はコントロールフローキーワードとして除外される必要がある。
+    /// </summary>
+    [Fact]
+    public void BuildMap_IfStatementNotDetectedAsMethod_RemainsNeutral()
+    {
+        // if (...) {} がメソッドとして誤検出されないことを確認する
+        const string source = "if (true) { x = 1; }";
+        //                     0         1         2
+        //                     012345678901234567890
+
+        // カバレッジデータなし（全体 -1 ニュートラル）
+        var functions = new List<FunctionCoverage>();
+        var map = HtmlReportGenerator.BuildCoverageMap(source, functions);
+
+        // if ブロック内は -1（ニュートラル）のまま
+        Assert.Equal(-1, map[10]); // {
+        Assert.Equal(-1, map[19]); // }
+    }
 }

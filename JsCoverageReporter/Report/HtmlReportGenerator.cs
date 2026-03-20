@@ -34,6 +34,15 @@ internal record LineData(string Html, LineCoverageStatus Status);
 internal class HtmlReportGenerator
 {
     /// <summary>
+    /// メソッド短縮構文の検出対象から除外するコントロールフローキーワードの集合。
+    /// これらのキーワードは identifier(...) { } の形でも関数定義ではないため除外する。
+    /// 例: if (cond) { } や for (;;) { } を誤検出しないようにする。
+    /// </summary>
+    private static readonly HashSet<string> ControlFlowKeywords = new HashSet<string>
+    {
+        "if", "for", "while", "switch", "catch", "do",
+    };
+    /// <summary>
     /// ソースコードの各文字に対してカバレッジ値を記録した配列を作成する。
     /// 値の意味: -1 = カバレッジ対象外, 0 = 未実行, 1 = 実行済み。
     /// 処理順: 範囲の大きいものから小さいものの順に処理することで、
@@ -332,7 +341,119 @@ internal class HtmlReportGenerator
                 }
             }
 
+            // メソッド短縮構文（例: greet() { }）の検出
+            // identifier の先頭にいる場合（前の文字がidentifier文字でない）に処理する
+            bool prevIsIdentChar;
+            if (i == 0)
+            {
+                // ファイル先頭なので直前に文字がない → identifier 先頭とみなす
+                prevIsIdentChar = false;
+            }
+            else
+            {
+                // 直前の文字が識別子文字かどうかを確認する
+                prevIsIdentChar = IsIdentifierChar(source[i - 1]);
+            }
+
+            if (IsIdentifierChar(c) && !prevIsIdentChar)
+            {
+                // メソッド短縮構文の検出と未実行マークをヘルパーメソッドに委譲する
+                TryMarkMethodShorthand(source, map, i, len);
+            }
+
             i++;
+        }
+    }
+
+    /// <summary>
+    /// メソッド短縮構文（例: greet() { }）を検出し、
+    /// カバレッジデータにない（未実行）場合は本体全体を未実行（0）としてマークする。
+    /// function キーワードおよびコントロールフローキーワードは除外する。
+    /// </summary>
+    /// <param name="source">スクリプトのソースコード全文</param>
+    /// <param name="map">BuildCoverageMap で作成したカバレッジマップ（内容を書き換える）</param>
+    /// <param name="identStart">identifier の先頭インデックス</param>
+    /// <param name="len">ソースコードの長さ（source.Length）</param>
+    private static void TryMarkMethodShorthand(string source, int[] map, int identStart, int len)
+    {
+        // identifier 名を収集する
+        int identEnd = identStart;
+        while (identEnd < len && IsIdentifierChar(source[identEnd]))
+        {
+            identEnd++;
+        }
+        string identName = source.Substring(identStart, identEnd - identStart);
+
+        // function キーワードとコントロールフローキーワードは除外する
+        // （function は上の処理で別途扱うため、ここでは処理しない）
+        bool isExcluded;
+        if (identName == "function")
+        {
+            // function キーワードは上の処理で別途扱うため除外する
+            isExcluded = true;
+        }
+        else if (ControlFlowKeywords.Contains(identName))
+        {
+            // if / for / while / switch / catch / do は関数でないため除外する
+            isExcluded = true;
+        }
+        else
+        {
+            // その他の identifier はメソッド短縮構文の候補とする
+            isExcluded = false;
+        }
+
+        if (isExcluded)
+        {
+            // 除外対象なので何もしない
+            return;
+        }
+
+        // identifier の後の空白をスキップする
+        int afterIdent = identEnd;
+        while (afterIdent < len && char.IsWhiteSpace(source[afterIdent]))
+        {
+            afterIdent++;
+        }
+
+        // 次の文字が ( でなければメソッド短縮構文でない
+        if (afterIdent >= len || source[afterIdent] != '(')
+        {
+            return;
+        }
+
+        // SkipBalancedParens でパラメータ括弧をスキップする
+        // SkipBalancedParens は閉じ括弧 ) の直後のインデックスを返す
+        int afterParens = SkipBalancedParens(source, afterIdent);
+
+        // パラメータの後の空白をスキップする
+        while (afterParens < len && char.IsWhiteSpace(source[afterParens]))
+        {
+            afterParens++;
+        }
+
+        // 次の文字が { であり、かつカバレッジデータにない場合のみ処理する
+        if (afterParens >= len || source[afterParens] != '{' || map[identStart] != -1)
+        {
+            return;
+        }
+
+        // 対応する } を探す（FindMatchingBrace は } の直後のインデックスを返す）
+        int braceEnd = FindMatchingBrace(source, afterParens);
+        if (braceEnd <= afterParens)
+        {
+            // 対応する } が見つからなかった場合は何もしない
+            return;
+        }
+
+        // FindMatchingBrace は } の次の位置を返すため、} 自体は braceEnd - 1
+        // identifier の先頭から } までを未実行（0）にマークする
+        for (int m = identStart; m <= braceEnd - 1; m++)
+        {
+            if (map[m] == -1)
+            {
+                map[m] = 0;
+            }
         }
     }
 
