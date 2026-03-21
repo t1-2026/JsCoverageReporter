@@ -702,6 +702,35 @@ public class CoverageMapTests
         Assert.Equal(-1, map[9]);
     }
 
+    /// <summary>
+    /// 関数本体内にテンプレートリテラル補間 ${...} が含まれ、
+    /// その補間式の中に波括弧（オブジェクトリテラル等）が入っている場合、
+    /// FindMatchingBrace が関数の閉じ } を正しく見つけることを確認する。
+    /// テンプレートリテラルスキャンは ` まで全文字を飛ばすため、
+    /// ${ } 内の { } は深さカウントに影響しない。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledFunctionWithTemplateLiteralInterpolation_CorrectlyMarked()
+    {
+        // function f() { return `${obj.method({key: 'val'})}`; }
+        //  0         1         2         3         4         5
+        //  01234567890123456789012345678901234567890123456789012 3
+        // function=0, {=13, `=22, ${...}=23-49, `=50, ;=51, ' '=52, }=53
+        // source.Length = 54（index 0-53）
+        const string source = "function f() { return `${obj.method({key: 'val'})}`; }";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // function キーワードの先頭は 0（未実行）
+        Assert.Equal(0, map[0]); // 'f' of 'function'
+        // 関数本体の開き { は 0（未実行）
+        Assert.Equal(0, map[13]); // '{'
+        // 関数の閉じ } は 0（未実行）
+        // FindMatchingBrace のテンプレートリテラルスキャンが ${ } 内の { } を
+        // 深さカウントに含めずスキップするため、正しく末尾 } を検出できていることを確認する
+        Assert.Equal(0, map[53]); // '}' — 最後の文字（source.Length-1）
+    }
+
     // -----------------------------------------------------------------------
     // ジェネレータ関数・async メソッド・ネスト関数の検出テスト
     // 新観点: function* / async method / 外側呼出し済み+内側未呼出し
