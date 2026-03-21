@@ -550,9 +550,9 @@ public class HtmlOutputTests
     [Fact]
     public void BuildScriptPage_ContainsBothPageUrlAndScriptUrl()
     {
-        // tab1 のページから取得したスクリプトを想定する
+        // ページ URL リストを渡す（旧: PageInfo(1, ...) → 新: リスト）
         var html = HtmlReportGenerator.BuildScriptPage(
-            new PageInfo(1, "https://example.com/page2"),
+            ["https://example.com/page2"],
             "https://example.com/js/app.js",
             []);
 
@@ -563,20 +563,19 @@ public class HtmlOutputTests
     }
 
     /// <summary>
-    /// BuildScriptPage に空の Url を持つ PageInfo を渡した場合、
-    /// "(tab {Index})" 形式のフォールバック文字列が表示されることを確認する。
+    /// BuildScriptPage にページ URL リストが空の場合、「(不明)」が表示されることを確認する。
     /// </summary>
     [Fact]
-    public void BuildScriptPage_EmptyPageUrl_ShowsTabIndex()
+    public void BuildScriptPage_EmptyPageUrls_ShowsUnknown()
     {
-        // ページ URL が空（取得できなかった）の場合を想定する
+        // ページ URL リストが空の場合は「(不明)」と表示されるはず
         var html = HtmlReportGenerator.BuildScriptPage(
-            new PageInfo(2, ""),
+            new List<string>(),
             "https://example.com/js/app.js",
             []);
 
-        // フォールバックとして "(tab 2)" が含まれているか確認する
-        Assert.Contains("(tab 2)", html);
+        // フォールバックとして "(不明)" が含まれているか確認する
+        Assert.Contains("(不明)", html);
     }
 
     // -----------------------------------------------------------------------
@@ -656,9 +655,8 @@ public class HtmlOutputTests
         var lines = HtmlReportGenerator.BuildLines(source, map);
 
         // BuildScriptPage を呼び出して HTML 出力を確認する
-        // ページ情報（タブ0）を指定する
-        var pageInfo = new PageInfo(0, "http://example.com/test.js");
-        var scriptPage = HtmlReportGenerator.BuildScriptPage(pageInfo, "test.js", lines);
+        var scriptPage = HtmlReportGenerator.BuildScriptPage(
+            ["http://example.com/test.js"], "test.js", lines);
 
         // <script> タグが &lt;script&gt; にエンコードされているべき
         Assert.Contains("&lt;script&gt;", scriptPage);
@@ -697,10 +695,9 @@ public class HtmlOutputTests
         var functions = new List<FunctionCoverage>();
         var map = HtmlReportGenerator.BuildCoverageMap(source, functions);
         var lines = HtmlReportGenerator.BuildLines(source, map);
-        var pageInfo = new PageInfo(0, "http://example.com/test.js");
-
         // スクリプト URL に XSS ペイロードを埋め込む
-        var scriptPage = HtmlReportGenerator.BuildScriptPage(pageInfo, "<evil>name</evil>", lines);
+        var scriptPage = HtmlReportGenerator.BuildScriptPage(
+            ["http://example.com/test.js"], "<evil>name</evil>", lines);
 
         // スクリプト URL の < > が &lt; &gt; にエンコードされているべき
         Assert.Contains("&lt;evil&gt;", scriptPage);
@@ -884,5 +881,22 @@ public class HtmlOutputTests
         // 対応するファイル名リンクも含まれることを確認する
         Assert.Contains("script-0-tab0.html", html);
         Assert.Contains("script-2-tab0.html", html);
+    }
+
+    /// <summary>
+    /// 複数のページ URL を渡した場合、すべての URL がページ内に含まれることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildScriptPage_MultiplePageUrls_ShowsAllUrls()
+    {
+        // 2つのページ URL を渡す
+        var html = HtmlReportGenerator.BuildScriptPage(
+            ["https://page-a.com/", "https://page-b.com/"],
+            "app.js",
+            []);
+
+        // 両方の URL が HTML に含まれているか確認する
+        Assert.Contains("https://page-a.com/", html);
+        Assert.Contains("https://page-b.com/", html);
     }
 }

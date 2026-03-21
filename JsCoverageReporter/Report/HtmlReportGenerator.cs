@@ -1006,9 +1006,14 @@ internal class HtmlReportGenerator
             }
 
             // スクリプト詳細ページのHTMLを生成してファイルに書き出す
+            var singlePageUrls = new List<string>();
+            if (!string.IsNullOrEmpty(script.Page.Url))
+            {
+                singlePageUrls.Add(script.Page.Url);
+            }
             File.WriteAllText(
                 Path.Combine(scriptsDir, filename),
-                BuildScriptPage(script.Page, script.Url, lines),
+                BuildScriptPage(singlePageUrls, script.Url, lines),
                 Encoding.UTF8);
 
             // このスクリプトのサマリー情報（URL・行数・ファイル名）をリストに追加する
@@ -1025,10 +1030,11 @@ internal class HtmlReportGenerator
     /// <summary>
     /// スクリプト詳細ページ（行ごとに色付けされたソースコード表示）のHTMLを生成する。
     /// </summary>
-    /// <param name="url">スクリプトのURL（ページタイトルと見出しに使用）</param>
+    /// <param name="pageUrls">このスクリプトが読み込まれたページURLのリスト（複数タブの場合は複数）</param>
+    /// <param name="scriptUrl">スクリプトのURL（ページタイトルと見出しに使用）</param>
     /// <param name="lines">BuildLines が返した行データのリスト</param>
     /// <returns>スクリプト詳細ページの完全なHTML文字列</returns>
-    internal static string BuildScriptPage(PageInfo page, string scriptUrl, List<LineData> lines)
+    internal static string BuildScriptPage(IReadOnlyList<string> pageUrls, string scriptUrl, List<LineData> lines)
     {
         // HTMLを構築するための文字列ビルダー
         var sb = new StringBuilder();
@@ -1062,17 +1068,27 @@ internal class HtmlReportGenerator
             </style></head><body>
             """);
 
-        // ページ URL を取得する（空の場合は "(tab {Index})" と表示する）
+        // ページ URL の表示文字列を決める
         string pageUrlDisplay;
-        if (string.IsNullOrEmpty(page.Url))
+        if (pageUrls.Count == 0)
         {
-            // ページ URL が取得できなかった場合はタブ番号をフォールバックとして表示する
-            pageUrlDisplay = $"(tab {page.Index})";
+            // ページ URL が取得できなかった場合のフォールバック表示
+            pageUrlDisplay = "(不明)";
+        }
+        else if (pageUrls.Count == 1)
+        {
+            // 1ページの場合はそのまま表示する（XSS 対策のため HTML エスケープする）
+            pageUrlDisplay = HtmlEncode(pageUrls[0]);
         }
         else
         {
-            // XSS 対策のため HTML エスケープする
-            pageUrlDisplay = HtmlEncode(page.Url);
+            // 複数ページの場合はカンマ区切りで表示する
+            var encodedUrls = new List<string>();
+            foreach (var u in pageUrls)
+            {
+                encodedUrls.Add(HtmlEncode(u));
+            }
+            pageUrlDisplay = string.Join(", ", encodedUrls);
         }
         // ページ URL とスクリプト URL をページ見出しとして出力する
         sb.AppendLine($"<h1>{pageUrlDisplay} / {HtmlEncode(scriptUrl)}</h1>");
