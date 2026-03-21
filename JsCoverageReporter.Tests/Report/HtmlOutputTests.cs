@@ -1029,14 +1029,13 @@ public class HtmlOutputTests
 
     /// <summary>
     /// パスがルートスラッシュのみの URL（http://example.com/）の場合、
-    /// TrimEnd('/') によって空文字列が返されることを確認する。
-    /// （ルートインラインスクリプトの場合にリンクテキストが空になる既知の挙動）
+    /// ホスト名（example.com）が返されることを確認する。
     /// </summary>
     [Fact]
-    public void GetFileName_UrlWithRootSlashOnly_ReturnsEmpty()
+    public void GetFileName_UrlWithRootSlashOnly_ReturnsHostname()
     {
-        // '/' だけのパスは TrimEnd('/') で空になる — 既知の挙動として記録
-        Assert.Equal("", HtmlReportGenerator.GetFileName("http://example.com/"));
+        // '/' だけのパスの場合はホスト名を返す
+        Assert.Equal("example.com", HtmlReportGenerator.GetFileName("http://example.com/"));
     }
 
     /// <summary>
@@ -1244,4 +1243,77 @@ public class HtmlOutputTests
         // NUL 文字のみの行は Neutral になっているか確認する
         Assert.Equal(LineCoverageStatus.Neutral, lines[0].Status);
     }
+
+    // -----------------------------------------------------------------------
+    // GetFileName — エッジケーステスト
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// クエリ文字列を含む URL でクエリ部分を除去したファイル名を返すことを確認する。
+    /// </summary>
+    [Fact]
+    public void GetFileName_UrlWithQueryString_ReturnsFileNameWithoutQuery()
+    {
+        var result = HtmlReportGenerator.GetFileName("http://example.com/app.js?v=1.2.3");
+        Assert.Equal("app.js", result);
+    }
+
+    /// <summary>
+    /// クエリ文字列だけの URL（パスなし）でホスト名を返すことを確認する。
+    /// </summary>
+    [Fact]
+    public void GetFileName_UrlWithQueryStringOnly_ReturnsHostname()
+    {
+        var result = HtmlReportGenerator.GetFileName("http://example.com/?q=1");
+        Assert.False(string.IsNullOrEmpty(result));
+        Assert.Equal("example.com", result);
+    }
 }
+
+public class BuildLinesEdgeCaseTests
+{
+    /// <summary>
+    /// ソースコードが空文字の場合に BuildLines が空のリストを返すことを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildLines_EmptySource_ReturnsEmptyList()
+    {
+        var lines = HtmlReportGenerator.BuildLines("", []);
+
+        Assert.Empty(lines);
+    }
+
+    /// <summary>
+    /// ソースコードが改行文字だけ（"\n"）の場合、
+    /// 末尾の空行除外ロジックにより空のリストになることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildLines_OnlyNewline_ReturnsEmptyList()
+    {
+        // "\n" → Split('\n') = ["", ""] → 末尾の空要素を除外 → [""] → 1行
+        // さらにその1行も rawLine = "" で処理される
+        var lines = HtmlReportGenerator.BuildLines("\n", []);
+
+        // "\n" は Split で ["", ""] になり、末尾の空行を除いて1行（"" の行）
+        // 実質空行が1行あることになる
+        Assert.Single(lines);
+        Assert.Equal(LineCoverageStatus.Neutral, lines[0].Status);
+    }
+
+    /// <summary>
+    /// map の長さがソース文字列より長い場合、余剰要素が安全に無視されることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildLines_MapLongerThanSource_ExtraElementsIgnored()
+    {
+        const string source = "ab";      // 2文字
+        var map = new int[] { 1, 0, 1, 1 }; // 4要素（ソースより2つ多い）
+
+        var lines = HtmlReportGenerator.BuildLines(source, map);
+
+        Assert.Single(lines);
+        // 'a'=covered, 'b'=uncovered → Partial
+        Assert.Equal(LineCoverageStatus.Partial, lines[0].Status);
+    }
+}
+

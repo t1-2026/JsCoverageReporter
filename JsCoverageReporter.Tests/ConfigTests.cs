@@ -280,15 +280,14 @@ public class ConfigTests
     /// ActionRunner で NullReferenceException が発生するリスクがある既知の挙動。
     /// </summary>
     [Fact]
-    public void Deserialize_ActionsExplicitlyNull_PropertyBecomesNull()
+    public void Deserialize_ActionsExplicitlyNull_PropertyBecomesEmptyList()
     {
         // "actions": null を含む JSON を用意する
         var json = """{"url": "https://example.com", "actions": null}""";
         var config = JsonSerializer.Deserialize<ScenarioConfig>(json, ScenarioConfig.JsonOptions)!;
 
-        // System.Text.Json は JSON null でプロパティの初期値を上書きする
-        // → config.Actions が null になり、ActionRunner の foreach で NullReferenceException が発生しうる
-        Assert.Null(config.Actions);
+        // Configuration sets Actions to empty array when null is provided
+        Assert.Empty(config.Actions);
     }
 
     /// <summary>
@@ -348,5 +347,31 @@ public class ConfigTests
         Assert.Equal("input",  config.Actions[0].Selector);
         // value を省略した場合は null になるべき（ActionRunner が "Enter" にフォールバックする）
         Assert.Null(config.Actions[0].Value);
+    }
+
+    /// <summary>
+    /// scriptFilters に明示的に null を指定した場合、空リストになることを確認する。
+    /// </summary>
+    [Fact]
+    public void Deserialize_ScriptFiltersExplicitlyNull_PropertyBecomesEmptyList()
+    {
+        var json = """{"url": "https://example.com", "scriptFilters": null}""";
+        var config = JsonSerializer.Deserialize<ScenarioConfig>(json, ScenarioConfig.JsonOptions)!;
+
+        Assert.NotNull(config.ScriptFilters);
+        Assert.Empty(config.ScriptFilters);
+    }
+
+    /// <summary>
+    /// scriptExcludes に明示的に null を指定した場合、空リストになることを確認する。
+    /// </summary>
+    [Fact]
+    public void Deserialize_ScriptExcludesExplicitlyNull_PropertyBecomesEmptyList()
+    {
+        var json = """{"url": "https://example.com", "scriptExcludes": null}""";
+        var config = JsonSerializer.Deserialize<ScenarioConfig>(json, ScenarioConfig.JsonOptions)!;
+
+        Assert.NotNull(config.ScriptExcludes);
+        Assert.Empty(config.ScriptExcludes);
     }
 }

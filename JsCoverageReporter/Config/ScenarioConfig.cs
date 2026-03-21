@@ -25,23 +25,61 @@ internal class ScenarioConfig
     [JsonPropertyName("url")]
     public string Url { get; set; } = "";
 
+    // ScriptFilters のバッキングフィールド（JSON null → 空リストに変換するために使用する）
+    private List<string> _scriptFilters = [];
+
     /// <summary>
     /// スクリプトURLの絞り込み文字列のリスト。
     /// 指定すると、いずれかの文字列を URL に含むスクリプトだけをレポートに含める。
     /// 省略（空リスト）すると全スクリプトが対象になる。
     /// 例: ["app.js", "utils.js"]
+    /// JSON で null が渡された場合も空リストとして扱う。
     /// </summary>
     [JsonPropertyName("scriptFilters")]
-    public List<string> ScriptFilters { get; set; } = [];
+    public List<string> ScriptFilters
+    {
+        get { return _scriptFilters; }
+        set
+        {
+            // JSON で null が設定された場合は空リストに変換する
+            if (value == null)
+            {
+                _scriptFilters = [];
+            }
+            else
+            {
+                _scriptFilters = value;
+            }
+        }
+    }
+
+    // ScriptExcludes のバッキングフィールド（JSON null → 空リストに変換するために使用する）
+    private List<string> _scriptExcludes = [];
 
     /// <summary>
     /// スクリプトURLの除外文字列のリスト。
     /// 指定すると、いずれかの文字列を URL に含むスクリプトをレポートから除外する。
     /// scriptFilters による絞り込みの後に適用される（最終的な除外として機能する）。
     /// 例: ["__playwright", "pptr:"]
+    /// JSON で null が渡された場合も空リストとして扱う。
     /// </summary>
     [JsonPropertyName("scriptExcludes")]
-    public List<string> ScriptExcludes { get; set; } = [];
+    public List<string> ScriptExcludes
+    {
+        get { return _scriptExcludes; }
+        set
+        {
+            // JSON で null が設定された場合は空リストに変換する
+            if (value == null)
+            {
+                _scriptExcludes = [];
+            }
+            else
+            {
+                _scriptExcludes = value;
+            }
+        }
+    }
 
     /// <summary>
     /// Playwrightのアクションタイムアウト（ミリ秒単位）。
@@ -58,12 +96,31 @@ internal class ScenarioConfig
     [JsonPropertyName("continueOnError")]
     public bool ContinueOnError { get; set; } = false;
 
+    // Actions のバッキングフィールド（JSON null → 空リストに変換するために使用する）
+    private List<ScenarioAction> _actions = [];
+
     /// <summary>
     /// 実行するアクションのリスト。
     /// JSONの "actions" 配列をデシリアライズしたもの。
+    /// JSON で null が渡された場合も空リストとして扱う。
     /// </summary>
     [JsonPropertyName("actions")]
-    public List<ScenarioAction> Actions { get; set; } = [];
+    public List<ScenarioAction> Actions
+    {
+        get { return _actions; }
+        set
+        {
+            // JSON で null が設定された場合は空リストに変換する
+            if (value == null)
+            {
+                _actions = [];
+            }
+            else
+            {
+                _actions = value;
+            }
+        }
+    }
 }
 
 /// <summary>
@@ -74,7 +131,7 @@ internal class ScenarioAction
 {
     /// <summary>
     /// アクションの種類を示す文字列。
-    /// 使用可能な値: "click", "fill", "navigate", "waitForSelector", "hover", "press", "wait"
+    /// 使用可能な値: "click", "fill", "navigate", "waitForSelector", "hover", "press", "wait", "select", "check", "uncheck", "dblclick"
     /// </summary>
     [JsonPropertyName("type")]
     public string Type { get; set; } = "";

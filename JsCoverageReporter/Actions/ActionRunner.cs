@@ -18,6 +18,11 @@ internal static class ActionRunner
     /// <param name="continueOnError">true にすると、アクションが失敗しても後続のアクションを続行する</param>
     internal static async Task RunAsync(IPage page, IEnumerable<ScenarioAction> actions, int? timeoutMs = null, bool continueOnError = false)
     {
+        if (actions == null)
+        {
+            return;
+        }
+
         // すべてのアクションを順番に実行する
         foreach (var action in actions)
         {
@@ -67,10 +72,10 @@ internal static class ActionRunner
 
                 // 別のURLへ移動する
                 case "navigate":
-                    // url が指定されていない場合は警告してスキップする
-                    if (action.Url is null)
+                    // url が指定されていない、または空文字の場合は警告してスキップする
+                    if (string.IsNullOrEmpty(action.Url))
                     {
-                        Console.Error.WriteLine("[Warning] 'navigate' action missing 'url' — skipping.");
+                        Console.Error.WriteLine("[Warning] 'navigate' action missing or empty 'url' — skipping.");
                         break;
                     }
                     // 指定されたURLへページを遷移する
@@ -137,10 +142,72 @@ internal static class ActionRunner
                     else
                     {
                         // milliseconds が指定されている場合はその値を使う
-                        delayMs = action.Milliseconds.Value;
+                        // 負の待機時間が指定された場合は0にクランプして ArgumentOutOfRangeException を防ぐ
+                        delayMs = Math.Max(0, action.Milliseconds.Value);
                     }
-                    // 決定したミリ秒だけ待機する
-                    await Task.Delay(delayMs);
+                    // 決定したミリ秒だけ待機する。タイムアウト機構に対応するため CancellationToken を使う
+                    using (var cts = new CancellationTokenSource())
+                    {
+                        // timeoutMs が 0 の場合は Playwright では「無限待機」を意味するため、CancelAfter を呼ばない
+                        if (timeoutMs.HasValue && timeoutMs.Value > 0)
+                        {
+                            cts.CancelAfter(timeoutMs.Value);
+                        }
+                        try
+                        {
+                            await Task.Delay(delayMs, cts.Token);
+                        }
+                        catch (TaskCanceledException)
+                        {
+                            throw new TimeoutException($"Action 'wait' timed out after {timeoutMs}ms.");
+                        }
+                    }
+                    break;
+
+                // ドロップダウンの選択肢を選ぶ
+                case "select":
+                    if (action.Selector is null)
+                    {
+                        Console.Error.WriteLine("[Warning] 'select' action missing 'selector' — skipping.");
+                        break;
+                    }
+                    // value が null（未指定）の場合は選択肢が特定できないため警告してスキップする
+                    if (action.Value is null)
+                    {
+                        Console.Error.WriteLine("[Warning] 'select' action missing 'value' — skipping.");
+                        break;
+                    }
+                    await page.SelectOptionAsync(action.Selector, new[] { action.Value }, new PageSelectOptionOptions { Timeout = timeoutMs });
+                    break;
+
+                // チェックボックスやラジオボタンをオンにする
+                case "check":
+                    if (action.Selector is null)
+                    {
+                        Console.Error.WriteLine("[Warning] 'check' action missing 'selector' — skipping.");
+                        break;
+                    }
+                    await page.CheckAsync(action.Selector, new PageCheckOptions { Timeout = timeoutMs });
+                    break;
+
+                // チェックボックスやラジオボタンをオフにする
+                case "uncheck":
+                    if (action.Selector is null)
+                    {
+                        Console.Error.WriteLine("[Warning] 'uncheck' action missing 'selector' — skipping.");
+                        break;
+                    }
+                    await page.UncheckAsync(action.Selector, new PageUncheckOptions { Timeout = timeoutMs });
+                    break;
+
+                // 要素をダブルクリックする
+                case "dblclick":
+                    if (action.Selector is null)
+                    {
+                        Console.Error.WriteLine("[Warning] 'dblclick' action missing 'selector' — skipping.");
+                        break;
+                    }
+                    await page.DblClickAsync(action.Selector, new PageDblClickOptions { Timeout = timeoutMs });
                     break;
 
                 // 未知のアクション種別はスキップして警告する
@@ -150,7 +217,7 @@ internal static class ActionRunner
             }
 
             } // try ブロックの終わり
-            catch (PlaywrightException ex)
+            catch (Exception ex)
             {
                 // continueOnError が false の場合は例外を再スローして処理を止める
                 if (!continueOnError)

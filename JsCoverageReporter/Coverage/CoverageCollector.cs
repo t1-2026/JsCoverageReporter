@@ -31,10 +31,9 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
     // スクリプト除外フィルター（StartAsync で設定。中間スナップショット時にも使う）
     private IReadOnlyList<string> _scriptExcludes = [];
 
-    // ページごとの収集済みスクリプト ID セット（二重収集を防ぐ）
-    private readonly Dictionary<IPage, HashSet<string>>        _processedScriptIds  = [];
-    // 中間スナップショットで収集したスクリプトのリスト（最終的に StopAsync で返す）
-    private readonly List<ScriptCoverage>                       _intermediateScripts = [];
+    // ページごとの全収集済みスクリプトカバレッジデータ（scriptId -> ScriptCoverage）
+    // ナビゲーションキャンセルの際に生存しているスクリプトの実行数を更新するために利用する
+    private readonly Dictionary<IPage, Dictionary<string, ScriptCoverage>> _scriptCache = [];
     // 中間スナップショットタスクのリスト（StopAsync で待機する）
     private readonly List<Task>                                 _snapTasks           = [];
     // ページごとのリクエストイベントハンドラー（DisposeAsync / StopAsync で解除する）
@@ -80,8 +79,8 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
         lock (_lock)
         {
             _trackedPages.Add(targetPage);
-            // このページの収集済みスクリプト ID セットを初期化する
-            _processedScriptIds[targetPage] = new HashSet<string>();
+            // このページのスクリプトキャッシュを初期化する
+            _scriptCache[targetPage] = new Dictionary<string, ScriptCoverage>();
         }
 
         // ページに接続したCDPセッションを作成する
@@ -110,6 +109,7 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
         {
             // ナビゲーションリクエスト以外は無視する
             if (!req.IsNavigationRequest) { return; }
+            lock (_lock) { if (_stopped) { return; } } // StopAsync 中に呼ばれた場合は破棄する
 
             // ナビゲーション開始直前の現在 URL を取得する（遷移後は変わるため）
             string currentUrl = targetPage.Url;
@@ -119,6 +119,7 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
             var snapTask = TakeIntermediateSnapshotAsync(targetPage, currentUrl);
             lock (_lock)
             {
+                if (_stopped) { return; } // もう一度チェック
                 _snapTasks.Add(snapTask);
             }
         };
@@ -166,41 +167,32 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
         // この時点でのページ情報（ナビゲーション前の URL）でスクリプトを記録する
         var pageInfo = new PageInfo(tabIndex, pageUrl);
 
-        // このページの収集済みIDセットを取得する
-        HashSet<string>? processedIds;
+        // このページのキャッシュマップを取得する
+        Dictionary<string, ScriptCoverage>? scriptCache;
         lock (_lock)
         {
-            _processedScriptIds.TryGetValue(targetPage, out processedIds);
+            _scriptCache.TryGetValue(targetPage, out scriptCache);
         }
-        // SetupPageAsync が完了する前に到達することは通常ないが、念のため早期リターンする
-        // （ローカルな HashSet を作ると _processedScriptIds と切り離されて二重集計になるため）
-        if (processedIds == null) { return; }
+        if (scriptCache == null) { return; }
 
-        // 新しいスクリプト（未収集のもの）を処理して中間リストに追加する
-        var newScripts = await ProcessNewScriptsAsync(result.Value, cdp, pageInfo, processedIds);
-        lock (_lock)
-        {
-            _intermediateScripts.AddRange(newScripts);
-        }
+        await ProcessNewScriptsAsync(result.Value, cdp, pageInfo, scriptCache);
     }
 
     /// <summary>
-    /// CDP スナップショット結果から未収集スクリプトのみを処理して返す。
-    /// processedIds に含まれるスクリプト ID はスキップし、新規のものは processedIds に追加する。
-    /// Profiler や Debugger の停止は行わない（最終収集時のみ停止する）。
+    /// CDP スナップショット結果からスクリプトカバレッジデータを処理する。
+    /// キャッシュ（scriptCache）に存在しない新規スクリプトは Debugger.getScriptSource でソースを取得し、
+    /// 既存のものはソースコードを再利用しつつ最終実行数（functions）のみ最新状態に更新（上書き）する。
     /// </summary>
-    private async Task<List<ScriptCoverage>> ProcessNewScriptsAsync(
+    private async Task ProcessNewScriptsAsync(
         System.Text.Json.JsonElement root,
         ICDPSession cdp,
         PageInfo pageInfo,
-        HashSet<string> processedIds)
+        Dictionary<string, ScriptCoverage> scriptCache)
     {
-        var scripts = new List<ScriptCoverage>();
-
         // CDP レスポンスの "result" 配列を取り出す
         if (!root.TryGetProperty("result", out var resultArray))
         {
-            return scripts;
+            return;
         }
 
         foreach (var entry in resultArray.EnumerateArray())
@@ -230,15 +222,6 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
             // URL が空のスクリプト（内部スクリプトなど）はスキップする
             if (string.IsNullOrEmpty(url)) { continue; }
 
-            // 収集済みスクリプト ID はスキップする（二重収集防止）
-            // lock の中で Add を呼ぶことでスレッドセーフに「初回のみ処理」を保証する
-            bool isNew;
-            lock (_lock)
-            {
-                isNew = processedIds.Add(scriptId);
-            }
-            if (!isNew) { continue; }
-
             // scriptFilters に一致するスクリプトのみ処理する
             if (_scriptFilters.Count > 0 && !_scriptFilters.Any(f => url.Contains(f, StringComparison.OrdinalIgnoreCase)))
             {
@@ -251,24 +234,39 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
                 continue;
             }
 
-            // Debugger.getScriptSource でスクリプトのソースコードを取得する
-            string source = "";
-            try
+            // キャッシュから既存のスクリプトデータを取得する
+            ScriptCoverage? existingCoverage = null;
+            lock (_lock)
             {
-                var srcResult = await cdp.SendAsync("Debugger.getScriptSource", new Dictionary<string, object>
-                {
-                    ["scriptId"] = scriptId,
-                });
-                if (srcResult.HasValue && srcResult.Value.TryGetProperty("scriptSource", out var srcProp))
-                {
-                    string? srcTmp = srcProp.GetString();
-                    if (srcTmp == null) { source = ""; } else { source = srcTmp; }
-                }
+                scriptCache.TryGetValue(scriptId, out existingCoverage);
             }
-            catch (PlaywrightException)
+
+            string source = "";
+            if (existingCoverage != null)
             {
-                Console.Error.WriteLine($"[Warning] Could not retrieve source for '{url}' — skipping.");
-                continue;
+                // 既にソースを取得済みのスクリプトならソースコードを再利用する
+                source = existingCoverage.Source;
+            }
+            else
+            {
+                // Debugger.getScriptSource でスクリプトのソースコードを新規取得する
+                try
+                {
+                    var srcResult = await cdp.SendAsync("Debugger.getScriptSource", new Dictionary<string, object>
+                    {
+                        ["scriptId"] = scriptId,
+                    });
+                    if (srcResult.HasValue && srcResult.Value.TryGetProperty("scriptSource", out var srcProp))
+                    {
+                        string? srcTmp = srcProp.GetString();
+                        if (srcTmp == null) { source = ""; } else { source = srcTmp; }
+                    }
+                }
+                catch (PlaywrightException)
+                {
+                    Console.Error.WriteLine($"[Warning] Could not retrieve source for '{url}' — skipping.");
+                    continue;
+                }
             }
 
             if (string.IsNullOrEmpty(source)) { continue; }
@@ -307,10 +305,15 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
                 }
             }
 
-            scripts.Add(new ScriptCoverage(pageInfo, url, source, functions));
-        }
+            // キャッシュに保存（最新の実行数で上書き更新する。URLのPageInfoは既存のものを優先）
+            var finalPageInfo = existingCoverage?.Page ?? pageInfo;
+            var newCoverage = new ScriptCoverage(finalPageInfo, url, source, functions);
 
-        return scripts;
+            lock (_lock)
+            {
+                scriptCache[scriptId] = newCoverage;
+            }
+        }
     }
 
     /// <summary>
@@ -366,9 +369,6 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
         await Task.WhenAll(setupTasks);
 
         // 中間スナップショットタスクが完了するまで待機する
-        // 【注意】ハンドラ解除とスナップタスクのコピーは別のロック区間になるため、
-        // 解除直前に発火したハンドラが _snapTasks に追加するタイミングが前後する可能性がある。
-        // セットアップ完了後に再コピーすることで、その間に追加されたタスクも確実に待機する。
         List<Task> snapTasks;
         lock (_lock)
         {
@@ -387,14 +387,7 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
             await Task.WhenAll(snapTasks2);
         }
 
-        // 中間スナップショットで収集済みのスクリプトをまとめリストに追加する
-        var allScripts = new List<ScriptCoverage>();
-        lock (_lock)
-        {
-            allScripts.AddRange(_intermediateScripts);
-        }
-
-        // 全ページの最終カバレッジを収集する（中間スナップショット以降の新規スクリプトのみ）
+        // 全ページの最終カバレッジを収集する（全スクリプトの最終状態をマージする）
         List<IPage> pageSnapshot;
         lock (_lock)
         {
@@ -408,42 +401,43 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
             var pageInfo = new PageInfo(i, targetPage.Url);
 
             ICDPSession? cdp;
-            HashSet<string>? processedIds;
+            Dictionary<string, ScriptCoverage>? scriptCache;
             lock (_lock)
             {
                 _cdpSessions.TryGetValue(targetPage, out cdp);
-                _processedScriptIds.TryGetValue(targetPage, out processedIds);
+                _scriptCache.TryGetValue(targetPage, out scriptCache);
             }
 
-            if (cdp == null)
+            if (cdp == null || scriptCache == null)
             {
-                Console.Error.WriteLine($"[Warning] No CDP session for tab {i} ('{targetPage.Url}') — skipping.");
-                continue;
-            }
-
-            // SetupPageAsync が完了する前に到達することは通常ないが、念のため早期スキップする
-            // （ローカルな HashSet を作ると _processedScriptIds と切り離されて二重集計になるため）
-            if (processedIds == null)
-            {
-                Console.Error.WriteLine($"[Warning] No processedIds for tab {i} ('{targetPage.Url}') — skipping.");
+                Console.Error.WriteLine($"[Warning] No CDP session or cache for tab {i} ('{targetPage.Url}') — skipping.");
                 continue;
             }
 
             // 最終収集（Profiler と Debugger を停止しながら残りのスクリプトを収集する）
-            var scripts = await FinalCollectFromPageAsync(cdp, pageInfo, processedIds);
-            allScripts.AddRange(scripts);
+            await FinalCollectFromPageAsync(cdp, pageInfo, scriptCache);
+        }
+
+        // キャッシュに蓄積されたすべてのスクリプトデータをフラットなリストにする
+        var allScripts = new List<ScriptCoverage>();
+        lock (_lock)
+        {
+            foreach (var cache in _scriptCache.Values)
+            {
+                allScripts.AddRange(cache.Values);
+            }
         }
 
         return allScripts;
     }
 
     /// <summary>
-    /// 1ページ分の最終カバレッジ収集。Profiler と Debugger を停止しながら未収集スクリプトを取得する。
+    /// 1ページ分の最終カバレッジ収集。Profiler と Debugger を停止しながら最終スクリプト実行状況を取得する。
     /// </summary>
-    private async Task<List<ScriptCoverage>> FinalCollectFromPageAsync(
+    private async Task FinalCollectFromPageAsync(
         ICDPSession cdp,
         PageInfo pageInfo,
-        HashSet<string> processedIds)
+        Dictionary<string, ScriptCoverage> scriptCache)
     {
         // スナップショットを取得する
         System.Text.Json.JsonElement? result = null;
@@ -462,24 +456,19 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
             catch (Exception ex) { Console.Error.WriteLine($"[Warning] Profiler.disable failed: {ex.Message}"); }
         }
 
-        if (result is null) { return []; }
+        if (result is null) { return; }
 
-        // 未収集スクリプトを処理する（Debugger は ProcessNewScriptsAsync の後に無効化する）
-        List<ScriptCoverage> scripts;
+        // スクリプトカバレッジデータを処理する（Debugger は ProcessNewScriptsAsync の後に無効化する）
         try
         {
-            scripts = await ProcessNewScriptsAsync(result.Value, cdp, pageInfo, processedIds);
+            await ProcessNewScriptsAsync(result.Value, cdp, pageInfo, scriptCache);
         }
         finally
         {
             // 成功・失敗どちらでも必ず Debugger を無効化する
-            // ページがクラッシュしている場合など CDP 側でも例外が出ることがあるため
-            // try/catch で囲み、元の例外を飲み込まないようにする
             try { await cdp.SendAsync("Debugger.disable"); }
             catch (Exception ex) { Console.Error.WriteLine($"[Warning] Debugger.disable failed: {ex.Message}"); }
         }
-
-        return scripts;
     }
 
     /// <summary>
@@ -517,6 +506,7 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
         }
 
         // すべての CDP セッションを解放する
+        // StopAsync を経由せず Dispose された場合は Profiler / Debugger を明示的に停止する
         List<ICDPSession> sessions;
         lock (_lock)
         {
@@ -524,6 +514,14 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
         }
         foreach (var cdp in sessions)
         {
+            // StopAsync を経ていない場合は Profiler / Debugger が enable のまま残っている
+            // 安全に停止を試みる（失敗しても Dispose は続行する）
+            if (!_stopped)
+            {
+                try { await cdp.SendAsync("Profiler.stopPreciseCoverage"); } catch { }
+                try { await cdp.SendAsync("Profiler.disable"); } catch { }
+                try { await cdp.SendAsync("Debugger.disable"); } catch { }
+            }
             await cdp.DisposeAsync();
         }
     }
