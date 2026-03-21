@@ -416,8 +416,44 @@ internal class HtmlReportGenerator
         }
 
         // FindMatchingBrace は } の次の位置を返すため、} 自体は braceEnd - 1
-        // identifier の先頭から } までを未実行（0）にマークする
-        for (int m = identStart; m <= braceEnd - 1; m++)
+        // async メソッド短縮構文の場合、async キーワードも未実行（赤）としてマークする
+        // 例: async greet() { } → async の先頭からマークする
+        // まず identStart を基準のマーク開始位置として設定する
+        int markStart = identStart;
+        // identStart の直前を逆走査して async キーワードを探す
+        int asyncScanBack = identStart - 1;
+        // 空白をスキップする（async と識別子の間にスペースがある）
+        while (asyncScanBack >= 0 && char.IsWhiteSpace(source[asyncScanBack]))
+        {
+            asyncScanBack--;
+        }
+        // 5文字以上あり "async" であれば async キーワードとして検出する
+        if (asyncScanBack >= 4)
+        {
+            string asyncCandidate = source.Substring(asyncScanBack - 4, 5);
+            if (asyncCandidate == "async")
+            {
+                // async の前が識別子文字でないことを確認する（notasync などを除外する）
+                bool asyncPrevOk;
+                if (asyncScanBack - 5 < 0)
+                {
+                    // ファイル先頭なので前に文字がない → standalone async
+                    asyncPrevOk = true;
+                }
+                else
+                {
+                    asyncPrevOk = !IsIdentifierChar(source[asyncScanBack - 5]);
+                }
+                if (asyncPrevOk)
+                {
+                    // async キーワードの先頭（'a' の位置）をマーク開始位置にする
+                    markStart = asyncScanBack - 4;
+                }
+            }
+        }
+
+        // markStart（async先頭 または identStart）から } までを未実行（0）にマークする
+        for (int m = markStart; m <= braceEnd - 1; m++)
         {
             if (map[m] == -1)
             {

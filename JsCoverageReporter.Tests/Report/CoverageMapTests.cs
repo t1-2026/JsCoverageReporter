@@ -818,7 +818,7 @@ public class CoverageMapTests
     /// 現在の実装では async キーワードが -1（ニュートラル）のまま残る既知のギャップ。
     /// （async function の場合は修正済みだが、async method shorthand は未対応）
     /// </summary>
-    [Fact(Skip = "gap: async keyword before method shorthand is not marked uncovered (async function case is fixed but async method shorthand is not)")]
+    [Fact]
     public void BuildMap_UncalledAsyncMethodShorthand_AsyncKeywordAlsoMarked()
     {
         const string source = "const obj = { async greet() { return 1; } };";
