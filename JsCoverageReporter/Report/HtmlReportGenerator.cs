@@ -666,21 +666,21 @@ internal class HtmlReportGenerator
             else if (c == ')') { depth--; }
             else if (c == '\'')
             {
-                // 単一引用符の文字列をスキップする
-                i++;
-                while (i < len && source[i] != '\'') { if (source[i] == '\\') { i++; } i++; }
+                // 単一引用符の文字列をスキップする（ヘルパーを使用）
+                i = SkipSingleQuotedString(source, i);
+                continue;
             }
             else if (c == '"')
             {
-                // 二重引用符の文字列をスキップする
-                i++;
-                while (i < len && source[i] != '"') { if (source[i] == '\\') { i++; } i++; }
+                // 二重引用符の文字列をスキップする（ヘルパーを使用）
+                i = SkipDoubleQuotedString(source, i);
+                continue;
             }
             else if (c == '`')
             {
-                // テンプレートリテラルをスキップする（簡易版）
-                i++;
-                while (i < len && source[i] != '`') { if (source[i] == '\\') { i++; } i++; }
+                // テンプレートリテラルをスキップする（${ } ネスト対応の完全版）
+                i = SkipTemplateLiteralFull(source, i);
+                continue;
             }
             else if (c == '/' && i + 1 < len && source[i + 1] == '/')
             {
@@ -731,21 +731,21 @@ internal class HtmlReportGenerator
             }
             else if (c == '\'')
             {
-                // 単一引用符の文字列をスキップする
-                i++;
-                while (i < len && source[i] != '\'') { if (source[i] == '\\') { i++; } i++; }
+                // 単一引用符の文字列をスキップする（ヘルパーを使用）
+                i = SkipSingleQuotedString(source, i);
+                continue;
             }
             else if (c == '"')
             {
-                // 二重引用符の文字列をスキップする
-                i++;
-                while (i < len && source[i] != '"') { if (source[i] == '\\') { i++; } i++; }
+                // 二重引用符の文字列をスキップする（ヘルパーを使用）
+                i = SkipDoubleQuotedString(source, i);
+                continue;
             }
             else if (c == '`')
             {
-                // テンプレートリテラルをスキップする（簡易版）
-                i++;
-                while (i < len && source[i] != '`') { if (source[i] == '\\') { i++; } i++; }
+                // テンプレートリテラルをスキップする（${ } ネスト対応の完全版）
+                i = SkipTemplateLiteralFull(source, i);
+                continue;
             }
             else if (c == '/')
             {

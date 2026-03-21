@@ -1839,4 +1839,56 @@ public class CoverageMapTests
         // コロンの直後の値部分も -1 のまま
         Assert.Equal(-1, map[22]); // '1'
     }
+
+    // -----------------------------------------------------------------------
+    // Issue 3 — SkipBalancedParens / FindMatchingBrace のテンプレートリテラル修正
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// テンプレートリテラルのデフォルト引数内に ) が含まれる場合、
+    /// SkipBalancedParens が括弧カウントを狂わせずに正しくスキップすることを確認する。
+    /// 例: function f(x = `${ ')' }`) { } — ${ } 内の ) でパラメータリストが終わると誤認識しないこと。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledFunction_TemplateLiteralParamWithParen_CorrectlyDetected()
+    {
+        // function f(x = `${ ')' }`) { }
+        // ${ ')' } 内の ) で SkipBalancedParens が早期終了すると、
+        // 関数本体 { } が検出されず -1 のままになる（バグ時）
+        // 修正後は全体が 0（未実行）になる
+        const string source = "function f(x = `${ ')' }`) { }";
+        //                     0         1         2         3
+        //                     0123456789012345678901234567890
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // 関数全体が 0（未実行）になっているか確認する
+        Assert.Equal(0, map[0]);  // 'f' of function
+        Assert.Equal(0, map[29]); // '}'（関数本体の閉じ括弧）
+    }
+
+    /// <summary>
+    /// テンプレートリテラルを含む関数本体で、${ } 内の } が
+    /// FindMatchingBrace の波括弧カウントを狂わせないことを確認する。
+    /// 例: function f() { return `${a}`; } — ${a} の } で関数終端と誤認識しないこと。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledFunction_TemplateLiteralBodyWithBrace_CorrectlyDetected()
+    {
+        // function foo() { return `${a}`; }
+        // 修正前は ${a} 内の } で FindMatchingBrace が早期終了し、
+        // "; }" の部分が -1 のままになる
+        const string source = "function foo() { return `${a}`; }";
+        //                     0         1         2         3
+        //                     01234567890123456789012345678901234
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // 関数全体が 0（未実行）になっているか確認する
+        Assert.Equal(0, map[0]);  // 'f' of function
+        Assert.Equal(0, map[32]); // '}'（関数本体の閉じ括弧）
+        // "; }" 部分が -1 のままではないことを確認する
+        Assert.Equal(0, map[30]); // ';'
+        Assert.Equal(0, map[31]); // ' '
+    }
 }
