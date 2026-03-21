@@ -835,4 +835,54 @@ public class HtmlOutputTests
         // map 範囲外の文字はすべて -1（ニュートラル）→ 行ステータスは Neutral
         Assert.Equal(LineCoverageStatus.Neutral, lines[0].Status);
     }
+
+    // -----------------------------------------------------------------------
+    // BuildIndexPage の追加確認テスト
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// スクリプトが 1 件もない状態で BuildIndexPage を呼んでも、
+    /// 有効な HTML が返されクラッシュしないことを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildIndexPage_EmptyRows_ReturnsValidHtml()
+    {
+        // スクリプト行が空のリストを渡す
+        var rows = new List<(string pageUrl, string url, int covered, int partial, int total, string filename)>();
+
+        // 例外が発生せずに HTML が返されることを確認する
+        var html = HtmlReportGenerator.BuildIndexPage(rows);
+
+        // 有効な HTML であること（最低限の構造が含まれる）
+        Assert.NotNull(html);
+        Assert.NotEmpty(html);
+        Assert.Contains("<html", html);
+        // テーブルヘッダーは存在するが、データ行はないことを確認する
+        Assert.Contains("ページ URL", html);
+    }
+
+    /// <summary>
+    /// 複数スクリプトを渡した場合、すべての行が出力に含まれることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildIndexPage_MultipleRows_AllIncluded()
+    {
+        // 3 スクリプト分のサマリー行を用意する
+        var rows = new List<(string pageUrl, string url, int covered, int partial, int total, string filename)>
+        {
+            ("https://example.com", "https://example.com/a.js",  5,  0, 10, "script-0-tab0.html"),
+            ("https://example.com", "https://example.com/b.js",  3,  2, 10, "script-1-tab0.html"),
+            ("https://example.com", "https://example.com/c.js",  0,  0, 10, "script-2-tab0.html"),
+        };
+
+        var html = HtmlReportGenerator.BuildIndexPage(rows);
+
+        // 3 つのスクリプト URL がすべて出力に含まれることを確認する
+        Assert.Contains("a.js", html);
+        Assert.Contains("b.js", html);
+        Assert.Contains("c.js", html);
+        // 対応するファイル名リンクも含まれることを確認する
+        Assert.Contains("script-0-tab0.html", html);
+        Assert.Contains("script-2-tab0.html", html);
+    }
 }

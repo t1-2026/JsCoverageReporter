@@ -42,6 +42,17 @@ internal class HtmlReportGenerator
     {
         "if", "for", "while", "switch", "catch", "do",
     };
+
+    /// <summary>
+    /// '/' の直前に現れたとき正規表現リテラルの開始と判断すべき JavaScript キーワードの集合。
+    /// これらのキーワードは識別子文字で終わるため IsRegexStart の素朴な実装では除算と誤判定される。
+    /// 例: return /regex/ は正規表現だが、'n' が識別子文字のため特別扱いが必要。
+    /// </summary>
+    private static readonly HashSet<string> RegexPrecedingKeywords = new HashSet<string>
+    {
+        "return", "typeof", "void", "delete", "throw",
+        "new", "in", "instanceof",
+    };
     /// <summary>
     /// ソースコードの各文字に対してカバレッジ値を記録した配列を作成する。
     /// 値の意味: -1 = カバレッジ対象外, 0 = 未実行, 1 = 実行済み。
@@ -230,7 +241,9 @@ internal class HtmlReportGenerator
                         if (braceEnd > afterArrow)
                         {
                             // => から } までを未実行（0）にマークする
-                            for (int m = arrowStart; m <= braceEnd; m++)
+                            // braceEnd は FindMatchingBrace が返す「} の次の位置」なので
+                            // m < braceEnd とすることで } 自体までをマークし、次の文字を含めない
+                            for (int m = arrowStart; m < braceEnd; m++)
                             {
                                 if (map[m] == -1)
                                 {
@@ -486,8 +499,21 @@ internal class HtmlReportGenerator
         // ファイル先頭または文の先頭なら正規表現
         if (i < 0) { return true; }
         char prev = source[i];
-        // 識別子末尾・数字・閉じ括弧の後は除算演算子
-        if (IsIdentifierChar(prev) || prev == ')' || prev == ']') { return false; }
+        // 閉じ括弧・閉じ角括弧の後は除算演算子（式の末尾）
+        if (prev == ')' || prev == ']') { return false; }
+        // 識別子文字で終わる場合は、直前のトークン全体を確認する
+        if (IsIdentifierChar(prev))
+        {
+            // 直前のトークン（識別子またはキーワード）を取り出す
+            int j = i;
+            while (j >= 0 && IsIdentifierChar(source[j])) { j--; }
+            string token = source.Substring(j + 1, i - j);
+            // return / typeof / void / delete / throw / new / in / instanceof の後は正規表現
+            // （これらはオペランドを期待するキーワードなので、直後の / は除算でなく正規表現の開始）
+            if (RegexPrecedingKeywords.Contains(token)) { return true; }
+            // それ以外の識別子・変数名の後は除算演算子
+            return false;
+        }
         // 演算子・区切り文字の後は正規表現
         return true;
     }
@@ -559,6 +585,18 @@ internal class HtmlReportGenerator
                 // テンプレートリテラルをスキップする（簡易版）
                 i++;
                 while (i < len && source[i] != '`') { if (source[i] == '\\') { i++; } i++; }
+            }
+            else if (c == '/' && i + 1 < len && source[i + 1] == '/')
+            {
+                // 行コメントをスキップする（コメント内の ( ) が深さカウントに影響しないようにする）
+                while (i < len && source[i] != '\n') { i++; }
+            }
+            else if (c == '/' && i + 1 < len && source[i + 1] == '*')
+            {
+                // ブロックコメントをスキップする（コメント内の ( ) が深さカウントに影響しないようにする）
+                i += 2;
+                while (i + 1 < len && !(source[i] == '*' && source[i + 1] == '/')) { i++; }
+                i++; // '*' をスキップする（直後の '/' は外側の i++ で処理される）
             }
             else if (c == '/' && IsRegexStart(source, i))
             {
@@ -1142,6 +1180,39 @@ internal class HtmlReportGenerator
                   <td>コメント・空行・変数宣言のみの行など（カバレッジ計測の対象外）</td>
                 </tr>
               </table>
+            </div>
+            """);
+
+        // 制約・計測対象外パターンのセクションを出力する
+        sb.AppendLine("""
+            <div class="guide">
+              <h2>制約・計測対象外パターン</h2>
+              <ul style="margin:4px 0 0;padding-left:20px;line-height:1.9">
+                <li>
+                  <strong>eval() / new Function() で動的生成されるコード</strong> —
+                  V8 がこれらのスクリプトに URL を付与しないためスキップされます。
+                </li>
+                <li>
+                  <strong>Web Worker 内のスクリプト</strong> —
+                  Worker は別スレッドで動作するため、このツールの CDP セッションの対象外です。
+                </li>
+                <li>
+                  <strong>ソースマップ非対応</strong> —
+                  TypeScript や webpack などでバンドルされた JavaScript は、変換後のコードがそのまま計測対象になります。
+                  元のソースファイルへのマッピングは行いません。
+                </li>
+                <li>
+                  <strong>外側関数が実行された場合の内側未実行関数</strong> —
+                  V8 は外側関数の実行範囲を CDP で報告するため、その範囲内に定義された内側の未実行関数が
+                  「カバー済み（緑）」として表示されることがあります。
+                </li>
+                <li>
+                  <strong>インラインスクリプト（&lt;script&gt; ブロック）の取得条件</strong> —
+                  インラインスクリプトの URL はページ URL と同じになります。
+                  scriptFilters が空の場合はキャプチャされます。
+                  scriptFilters を指定する場合は、ページ URL に含まれるキーワード（例: ページのファイル名）を追加してください。
+                </li>
+              </ul>
             </div>
             """);
 

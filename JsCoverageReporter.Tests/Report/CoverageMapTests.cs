@@ -807,8 +807,7 @@ public class CoverageMapTests
     /// アロー関数のマーク処理で "m &lt;= braceEnd" としているため
     /// } の直後の文字（; など）も誤って 0（赤）にマークされる。
     /// </summary>
-    [Fact(Skip = "bug: arrow function marking uses m <= braceEnd but FindMatchingBrace returns index AFTER '}'," +
-                 " so the character after '}' is incorrectly marked as uncovered (off-by-one)")]
+    [Fact]
     public void BuildMap_UncalledArrowFunction_CharAfterClosingBraceRemainsNeutral()
     {
         const string source = "const f = () => { return 1; };";
@@ -840,6 +839,110 @@ public class CoverageMapTests
     }
 
     // -----------------------------------------------------------------------
+    // Bug fix: IsRegexStart — return / typeof など JS キーワード後の正規表現誤認識
+    // 修正前: キーワードの末尾が識別子文字のため IsRegexStart が false を返し
+    //         FindMatchingBrace が正規表現内の } を関数終端と誤認識していた
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// 未実行の関数本体に "return /[}]/;" が含まれる場合でも、
+    /// 正規表現内の '}' を関数の閉じ波括弧と誤認識せず、
+    /// 関数全体（function キーワードから最終 '}' まで）が 0（未実行）になることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledFunction_ReturnRegexWithBrace_FullBodyMarkedUncovered()
+    {
+        // function foo() { return /[}]/; }
+        // 修正前は /[}]/ 内の '}' で FindMatchingBrace が早期終了し、
+        // "/ }" の部分が -1（ニュートラル）のまま残っていた
+        const string source = "function foo() { return /[}]/; }";
+        //                     0         1         2         3
+        //                     01234567890123456789012345678901
+        // function: 0, {: 15 ... }: 31
+
+        // カバレッジデータなし → V8 未コンパイル → 全文字が未実行(0)になるべき
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // 関数全体が未実行（0）になっているか確認する
+        Assert.Equal(0, map[0]);  // 'f' of function
+        Assert.Equal(0, map[15]); // '{'
+        Assert.Equal(0, map[31]); // '}' （最後の閉じ波括弧）
+        // 修正前にここが -1 になっていた: 正規表現内の } の直後以降
+        Assert.Equal(0, map[29]); // ';' after /[}]/
+        Assert.Equal(0, map[30]); // ' ' before final }
+    }
+
+    /// <summary>
+    /// typeof 演算子の後に正規表現リテラルが来る場合でも、
+    /// 正規表現内の '}' を関数終端と誤認識しないことを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledFunction_TypeofRegexWithBrace_FullBodyMarkedUncovered()
+    {
+        // function foo() { if (typeof /[{}]/ === "object") { } }
+        const string source = "function foo() { var t = typeof /[{}]/; }";
+        //                     0         1         2         3         4
+        //                     01234567890123456789012345678901234567890
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // 関数本体の最後の } (index 40) が 0 になっていれば、正規表現を正しくスキップできている
+        Assert.Equal(0, map[40]); // '}' of function body
+    }
+
+    // -----------------------------------------------------------------------
+    // Bug fix: SkipBalancedParens — コメント内の括弧による深さカウントのずれ
+    // 修正前: // コメントや /* */ コメント内の ( ) をカウントしてしまい、
+    //         パラメータリストの終端 ')' を正しく検出できなかった
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// 関数パラメータリスト内に行コメント // があり、
+    /// コメント中に '(' が含まれる場合でも、関数本体が正しく 0（未実行）になることを確認する。
+    /// 修正前はコメント内の '(' が深さカウントに加算され、パラメータリストの終端を見失っていた。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledFunction_ParamWithLineCommentContainingParen_BodyMarkedUncovered()
+    {
+        // function foo(a, // default (optional)
+        //              b) { return a + b; }
+        // 行コメント内の '(' がパラメータ深さカウントに影響してはいけない
+        const string source = "function foo(a, // (opt)\n b) { return 1; }";
+        //                     0         1         2         3         4
+        //                     012345678901234567890123456789012345678901
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // 関数本体（{ } 内）が 0（未実行）になっているか確認する
+        // 修正前は // (opt) 内の ( でカウントがずれ、} を見失って -1 のままになっていた
+        Assert.Equal(0, map[0]);  // 'f' of function
+        // { は \n の後なので index を数える: "function foo(a, // (opt)\n b) " = 30 chars → { は 29
+        int braceOpen = source.IndexOf('{');
+        int braceClose = source.LastIndexOf('}');
+        Assert.Equal(0, map[braceOpen]);  // '{'
+        Assert.Equal(0, map[braceClose]); // '}'
+    }
+
+    /// <summary>
+    /// 関数パラメータリスト内にブロックコメント /* */ があり、
+    /// コメント中に ')' が含まれる場合でも、関数本体が正しく 0（未実行）になることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledFunction_ParamWithBlockCommentContainingParen_BodyMarkedUncovered()
+    {
+        // function foo(a /* default: bar() */, b) { return 1; }
+        const string source = "function foo(a /* bar() */, b) { return 1; }";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        int braceOpen  = source.IndexOf('{');
+        int braceClose = source.LastIndexOf('}');
+        Assert.Equal(0, map[0]);          // 'f' of function
+        Assert.Equal(0, map[braceOpen]);  // '{'
+        Assert.Equal(0, map[braceClose]); // '}'
+    }
+
+    // -----------------------------------------------------------------------
     // CoverageRange 境界値テスト（既存テストが未カバーの観点のみ）
     // -----------------------------------------------------------------------
 
@@ -857,5 +960,740 @@ public class CoverageMapTests
 
         // クランプ後に start(5) >= end(2) になるためループが回らず全文字 -1 のまま
         Assert.Equal([-1, -1, -1, -1, -1], map);
+    }
+
+    // -----------------------------------------------------------------------
+    // JavaScript 構成・実行パターン観点のテスト
+    // クラス構文 / 関数式 / IIFE / アロー関数バリエーション /
+    // ジェネレータメソッド / export / 制御構文誤検出 / 壊れたソース
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// クラス内のメソッド（メソッド短縮構文）が未実行の場合、
+    /// メソッド本体が 0（未実行）としてマークされることを確認する。
+    /// class キーワードや Foo 識別子は '(' を持たないため誤検出されない。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledClassMethod_MarkedAsUncovered()
+    {
+        // class Foo { method() {} }
+        //  0         1         2
+        //  0123456789012345678901234
+        // m=12, (=18, {=21, }=22, outer }=24
+        const string source = "class Foo { method() {} }";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // メソッド本体（m から } まで）が 0（未実行）であることを確認する
+        Assert.Equal(0, map[12]); // 'm' of method
+        Assert.Equal(0, map[21]); // {
+        Assert.Equal(0, map[22]); // }
+        // クラスの外側の } はメソッドの範囲外なので -1 のまま
+        Assert.Equal(-1, map[24]); // outer '}' of class
+    }
+
+    /// <summary>
+    /// static メソッドが未実行の場合、static キーワード自体はマークされず、
+    /// メソッド名以降の本体が 0（未実行）としてマークされることを確認する。
+    /// static は ControlFlowKeywords にないが、直後に '(' がないため誤検出されない。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledStaticMethod_MethodBodyMarkedAsUncovered()
+    {
+        // class Foo { static run() {} }
+        //  0         1         2
+        //  01234567890123456789012345678
+        // s=12 (static), r=19 (run), (=22, {=25, }=26, outer }=28
+        const string source = "class Foo { static run() {} }";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // static キーワードは '(' を持たないため誤検出されない → -1 のまま
+        Assert.Equal(-1, map[12]); // 's' of static
+        // run メソッドの先頭から } まで 0（未実行）になっていることを確認する
+        Assert.Equal(0, map[19]); // 'r' of run
+        Assert.Equal(0, map[25]); // {
+        Assert.Equal(0, map[26]); // }
+    }
+
+    /// <summary>
+    /// getter 構文（get prop() {}）が未実行の場合、
+    /// get キーワード自体はマークされず、プロパティ名以降の本体が 0（未実行）になることを確認する。
+    /// get は直後に '(' がないため誤検出されない。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledGetter_BodyMarkedAsUncovered()
+    {
+        // class Foo { get value() {} }
+        //  0         1         2
+        //  0123456789012345678901234567
+        // g=12 (get), v=16 (value), (=21, {=24, }=25, outer }=27
+        const string source = "class Foo { get value() {} }";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // get キーワードは '(' を持たないため誤検出されない → -1 のまま
+        Assert.Equal(-1, map[12]); // 'g' of get
+        // value プロパティの先頭から } まで 0（未実行）になっていることを確認する
+        Assert.Equal(0, map[16]); // 'v' of value
+        Assert.Equal(0, map[24]); // {
+        Assert.Equal(0, map[25]); // }
+    }
+
+    /// <summary>
+    /// extends を使ったクラスでメソッドが未実行の場合、
+    /// extends / Parent 識別子はマークされず、メソッド本体だけが 0（未実行）になることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledClassWithExtends_MethodMarkedAsUncovered()
+    {
+        // class Child extends Parent { greet() {} }
+        //  0         1         2         3         4
+        //  01234567890123456789012345678901234567890
+        // e=12 (extends), P=20 (Parent), g=29 (greet), (=34, {=37, }=38, outer }=40
+        const string source = "class Child extends Parent { greet() {} }";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // extends と Parent は '(' を持たないため誤検出されない → -1 のまま
+        Assert.Equal(-1, map[12]); // 'e' of extends
+        Assert.Equal(-1, map[20]); // 'P' of Parent
+        // greet メソッドの先頭から } まで 0（未実行）になっていることを確認する
+        Assert.Equal(0, map[29]); // 'g' of greet
+        Assert.Equal(0, map[37]); // {
+        Assert.Equal(0, map[38]); // }
+    }
+
+    /// <summary>
+    /// 名前付き関数式（named function expression）が未実行の場合、
+    /// function キーワードの先頭から関数本体 } まで 0（未実行）になることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledNamedFunctionExpression_MarkedAsUncovered()
+    {
+        // var f = function named() { return 1; }
+        //  0         1         2         3
+        //  01234567890123456789012345678901234567
+        // function=8, named=17, (=22, {=25, }=37
+        const string source = "var f = function named() { return 1; }";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // function キーワードから } まで 0（未実行）であることを確認する
+        Assert.Equal(0, map[8]);  // 'f' of function
+        Assert.Equal(0, map[25]); // {
+        Assert.Equal(0, map[37]); // }
+        // = の前後の空白は範囲外なので -1 のまま
+        Assert.Equal(-1, map[7]); // ' ' before function
+    }
+
+    /// <summary>
+    /// オブジェクトプロパティ値の関数式（function expression as property value）が未実行の場合、
+    /// function キーワードの先頭から関数本体 } まで 0（未実行）になることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledObjectPropertyFunction_MarkedAsUncovered()
+    {
+        // var o = { foo: function() { return 1; } }
+        //  0         1         2         3         4
+        //  01234567890123456789012345678901234567890
+        // function=15, (=23, {=26, }=38
+        const string source = "var o = { foo: function() { return 1; } }";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // function キーワードから } まで 0（未実行）であることを確認する
+        Assert.Equal(0, map[15]); // 'f' of function
+        Assert.Equal(0, map[26]); // {
+        Assert.Equal(0, map[38]); // }
+        // : の前後（プロパティ名部分）は -1 のまま
+        Assert.Equal(-1, map[14]); // ' ' before function
+    }
+
+    /// <summary>
+    /// IIFE（即時実行関数式）はカバレッジデータがある（実行済み）場合、
+    /// MarkUncalledFunctionBodiesAsUncovered による再マークの対象外になることを確認する。
+    /// map[funcStart] == 1 のため補正されない。
+    /// </summary>
+    [Fact]
+    public void BuildMap_CalledIIFE_NotReMarkedAsUncovered()
+    {
+        // (function() { return 1; })()
+        //  0         1         2
+        //  0123456789012345678901234567
+        // function=1, (=9, {=12, }=23
+        const string source = "(function() { return 1; })()";
+
+        // 全体を実行済み（count=1）にする
+        var functions = new List<FunctionCoverage>
+        {
+            new FunctionCoverage("", new List<CoverageRange>
+            {
+                new CoverageRange(0, source.Length, 1),
+            }),
+        };
+        var map = HtmlReportGenerator.BuildCoverageMap(source, functions);
+
+        // IIFE は実行済みなので map[funcStart] != -1 → 補正されない → 1 のまま
+        Assert.Equal(1, map[1]);  // 'f' of function
+        Assert.Equal(1, map[12]); // {
+        Assert.Equal(1, map[23]); // }
+    }
+
+    /// <summary>
+    /// async アロー関数（async () => { }）が未実行の場合、
+    /// => の位置からブロック本体 } まで 0（未実行）になることを確認する。
+    /// async キーワード自体はアロー関数の補正対象外のため -1 のまま残る。
+    /// （async function の場合は async もマーク済みだが async arrow は未対応）
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledAsyncArrowFunction_BlockBodyMarkedFromArrow()
+    {
+        // const f = async () => { return 1; }
+        //  0         1         2         3
+        //  01234567890123456789012345678901234
+        // async=10, (=16, )=17, =>: ==19 >=20, {=22, }=34
+        const string source = "const f = async () => { return 1; }";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // => から } まで 0（未実行）になっていることを確認する
+        Assert.Equal(0, map[19]); // '=' of =>
+        Assert.Equal(0, map[22]); // {
+        Assert.Equal(0, map[34]); // }
+        // async キーワードはアロー関数の補正では async をマークしないため -1 のまま
+        Assert.Equal(-1, map[10]); // 'a' of async
+    }
+
+    /// <summary>
+    /// ネストされたアロー関数が未実行の場合、
+    /// 外側アロー関数の => から最後の } まで全体が 0（未実行）になることを確認する。
+    /// FindMatchingBrace が外側の対応する } を返すため、内側も一括でマークされる。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledNestedArrowFunctions_BothMarkedAsUncovered()
+    {
+        // const f = () => { const g = () => { return 1; }; }
+        //  0         1         2         3         4
+        //  01234567890123456789012345678901234567890123456789
+        // outer =>: ==13 >=14, outer {=16, inner =>: ==31 >=32, inner {=34, inner }=46, outer }=49
+        const string source = "const f = () => { const g = () => { return 1; }; }";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // 外側 => から最外 } まで（インデックス 13〜49）が 0 になっていることを確認する
+        Assert.Equal(0, map[13]); // '=' of outer =>
+        Assert.Equal(0, map[16]); // outer {
+        Assert.Equal(0, map[31]); // '=' of inner =>
+        Assert.Equal(0, map[34]); // inner {
+        Assert.Equal(0, map[46]); // inner }
+        Assert.Equal(0, map[49]); // outer }
+    }
+
+    /// <summary>
+    /// 同一行に複数のアロー関数（ブロック本体）がある場合、
+    /// それぞれが独立して 0（未実行）としてマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledMultipleArrowsOnSameLine_BothMarkedAsUncovered()
+    {
+        // const a = () => { return 1; }; const b = () => { return 2; };
+        //  0         1         2         3         4         5         6
+        //  0123456789012345678901234567890123456789012345678901234567890
+        // first =>: ==13, first {=16, first }=28, second =>: ==44, second {=47, second }=59
+        const string source = "const a = () => { return 1; }; const b = () => { return 2; };";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // 最初のアロー関数（13〜28）が 0 になっていることを確認する
+        Assert.Equal(0, map[13]); // '=' of first =>
+        Assert.Equal(0, map[16]); // first {
+        Assert.Equal(0, map[28]); // first }
+        // 2番目のアロー関数（44〜59）が 0 になっていることを確認する
+        Assert.Equal(0, map[44]); // '=' of second =>
+        Assert.Equal(0, map[47]); // second {
+        Assert.Equal(0, map[59]); // second }
+        // 2つのアロー関数の間（; とスペース）は -1 のまま
+        Assert.Equal(-1, map[29]); // ';' after first }
+        Assert.Equal(-1, map[30]); // ' ' before const b
+    }
+
+    /// <summary>
+    /// ジェネレータメソッド短縮構文（*gen() {}）が未実行の場合、
+    /// * 自体は識別子文字でないため -1 のまま残り、
+    /// gen の先頭からメソッド本体 } までが 0（未実行）になることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledGeneratorMethodShorthand_BodyMarkedAsUncovered()
+    {
+        // const obj = { *gen() { yield 1; } }
+        //  0         1         2         3
+        //  01234567890123456789012345678901234
+        // *=14, g=15 (gen), (=18, {=21, }=32, outer }=34
+        const string source = "const obj = { *gen() { yield 1; } }";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // * は識別子文字でないため -1 のまま残ることを確認する
+        Assert.Equal(-1, map[14]); // '*' of *gen
+        // gen の先頭から } まで 0（未実行）になっていることを確認する
+        Assert.Equal(0, map[15]); // 'g' of gen
+        Assert.Equal(0, map[21]); // {
+        Assert.Equal(0, map[32]); // }
+    }
+
+    /// <summary>
+    /// export function が未実行の場合、
+    /// function キーワードの先頭から関数本体 } まで 0（未実行）になることを確認する。
+    /// export キーワード自体は '(' を持たないため誤検出されない。
+    /// </summary>
+    [Fact]
+    public void BuildMap_ExportFunction_MarkedAsUncovered()
+    {
+        // export function foo() { return 1; }
+        //  0         1         2         3
+        //  01234567890123456789012345678901234
+        // function=7, f=16 (foo), (=19, {=22, }=34
+        const string source = "export function foo() { return 1; }";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // function キーワードから } まで 0（未実行）であることを確認する
+        Assert.Equal(0, map[7]);  // 'f' of function
+        Assert.Equal(0, map[22]); // {
+        Assert.Equal(0, map[34]); // }
+        // export キーワードは '(' を持たないため -1 のまま
+        Assert.Equal(-1, map[6]); // ' ' before function
+    }
+
+    /// <summary>
+    /// export default function（匿名）が未実行の場合、
+    /// function キーワードの先頭から関数本体 } まで 0（未実行）になることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_ExportDefaultFunction_MarkedAsUncovered()
+    {
+        // export default function() { return 1; }
+        //  0         1         2         3
+        //  0123456789012345678901234567890123456789
+        // function=15, (=23, {=26, }=38
+        const string source = "export default function() { return 1; }";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // function キーワードから } まで 0（未実行）であることを確認する
+        Assert.Equal(0, map[15]); // 'f' of function
+        Assert.Equal(0, map[26]); // {
+        Assert.Equal(0, map[38]); // }
+        // default の直後の空白は -1 のまま
+        Assert.Equal(-1, map[14]); // ' ' before function
+    }
+
+    /// <summary>
+    /// try { } ブロックはパラメータ括弧 '(' を持たないため、
+    /// メソッド短縮構文として誤検出されず -1（ニュートラル）のままになることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_TryBlock_RemainsNeutral()
+    {
+        // try { throw 1; }
+        //  0         1
+        //  0123456789012345
+        // {=4, }=15
+        const string source = "try { throw 1; }";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // try ブロックは method shorthand でないため -1 のまま
+        Assert.Equal(-1, map[4]);  // '{'
+        Assert.Equal(-1, map[15]); // '}'
+    }
+
+    /// <summary>
+    /// else { } ブロックはパラメータ括弧 '(' を持たないため、
+    /// メソッド短縮構文として誤検出されず -1（ニュートラル）のままになることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_ElseBlock_RemainsNeutral()
+    {
+        // if (x) {} else { throw 1; }
+        //  0         1         2
+        //  012345678901234567890123456
+        // else {=15, else }=26
+        const string source = "if (x) {} else { throw 1; }";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // else ブロックは '(' を持たないため method shorthand でない → -1 のまま
+        Assert.Equal(-1, map[15]); // '{' of else block
+        Assert.Equal(-1, map[26]); // '}' of else block
+    }
+
+    /// <summary>
+    /// with 文（with(obj){}）は ControlFlowKeywords に含まれず '(' を持つため、
+    /// メソッド短縮構文として誤検出される（既知の false positive）。
+    /// この動作は実装の既知制限として文書化する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_WithStatement_FalsePositive_KnownLimitation()
+    {
+        // with (obj) { x = 1; }
+        //  0         1         2
+        //  012345678901234567890
+        // w=0 (with), {=11, }=20
+        const string source = "with (obj) { x = 1; }";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // 既知の制限: with(obj){} が method shorthand として誤検出されるため 0 になる
+        // with は ControlFlowKeywords に含まれないため除外されない
+        Assert.Equal(0, map[0]);  // 'w' of with — false positive
+        Assert.Equal(0, map[11]); // '{'
+        Assert.Equal(0, map[20]); // '}'
+    }
+
+    /// <summary>
+    /// 閉じ波括弧 '}' のないソースコード（構文が壊れている場合）でも、
+    /// 例外を発生させずに安全に処理されることを確認する。
+    /// FindMatchingBrace が -1 を返し条件チェックで除外されるため何もマークされない。
+    /// </summary>
+    [Fact]
+    public void BuildMap_MissingClosingBrace_NoExceptionAllNeutral()
+    {
+        // 閉じ } がない不完全なソースコード
+        const string source = "function foo() { return 1;";
+
+        // 例外が発生しないことと、全文字が -1 のままであることを確認する
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // FindMatchingBrace が -1 を返し、funcEnd > 0 の条件が偽になるため何もマークされない
+        Assert.All(map, v => Assert.Equal(-1, v));
+    }
+
+    // -----------------------------------------------------------------------
+    // FindMatchingBrace の文字列・コメント内 {} スキップの確認テスト
+    // 誤った } でブレースが早期クローズされないことを検証する
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// 関数本体内の単一引用符文字列に '}' が含まれる場合、
+    /// FindMatchingBrace がその '}' を関数終端と誤認識しないことを確認する。
+    /// 単一引用符の文字列スキップにより、文字列内の '}' は深さカウントに影響しない。
+    /// </summary>
+    [Fact]
+    public void BuildMap_FunctionBody_SingleQuotedCloseBrace_NotClosedEarly()
+    {
+        // function foo() { var s = '}'; return 1; }
+        //  0         1         2         3         4
+        //  01234567890123456789012345678901234567890
+        // {=15（開き）, '}'=26（文字列内）, }=40（真の閉じ）
+        const string source = "function foo() { var s = '}'; return 1; }";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // 文字列内の '}' は関数終端でないため、全体（0〜40）が 0（未実行）になるべき
+        Assert.Equal(0, map[0]);  // 'f' of function
+        Assert.Equal(0, map[15]); // opening '{'
+        Assert.Equal(0, map[40]); // true closing '}'
+    }
+
+    /// <summary>
+    /// 関数本体内の二重引用符文字列に '}' が含まれる場合、
+    /// FindMatchingBrace がその '}' を関数終端と誤認識しないことを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_FunctionBody_DoubleQuotedCloseBrace_NotClosedEarly()
+    {
+        // function foo() { var s = "}"; return 1; }
+        //  0         1         2         3         4
+        //  01234567890123456789012345678901234567890
+        // {=15（開き）, "}"=25〜27（文字列）, }=40（真の閉じ）
+        const string source = "function foo() { var s = \"}\"; return 1; }";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        Assert.Equal(0, map[0]);  // 'f' of function
+        Assert.Equal(0, map[15]); // opening '{'
+        Assert.Equal(0, map[40]); // true closing '}'
+    }
+
+    /// <summary>
+    /// 関数本体内のブロックコメント /* */ に '}' が含まれる場合、
+    /// FindMatchingBrace がその '}' を関数終端と誤認識しないことを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_FunctionBody_BlockCommentCloseBrace_NotClosedEarly()
+    {
+        // function foo() { /* } */ return 1; }
+        //  0         1         2         3
+        //  0123456789012345678901234567890123456
+        // {=15, /* } */ にある }=20（コメント内）, }=35（真の閉じ）
+        const string source = "function foo() { /* } */ return 1; }";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        Assert.Equal(0, map[0]);  // 'f' of function
+        Assert.Equal(0, map[35]); // true closing '}'
+    }
+
+    /// <summary>
+    /// 関数本体内の行コメント // に '{' が含まれる場合、
+    /// FindMatchingBrace がその '{' を深さカウントに加算しないことを確認する。
+    /// 深さカウントが狂うと、関数の真の '}' を見落とす可能性がある。
+    /// </summary>
+    [Fact]
+    public void BuildMap_FunctionBody_LineCommentOpenBrace_DepthNotAffected()
+    {
+        // "function foo() {\n// {\nreturn 1;\n}"
+        //  {=15, // { → コメント内の {、真の閉じ }=32
+        const string source = "function foo() {\n// {\nreturn 1;\n}";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        Assert.Equal(0, map[0]);  // 'f' of function
+        Assert.Equal(0, map[32]); // true closing '}'
+    }
+
+    // -----------------------------------------------------------------------
+    // メインスキャナーの文字列スキップ確認テスト（単引用符）
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// 単一引用符文字列内の "function" キーワードが関数として誤検出されないことを確認する。
+    /// 二重引用符のテスト（BuildMap_FunctionInStringLiteral_RemainsNeutral）と対になる。
+    /// </summary>
+    [Fact]
+    public void BuildMap_FunctionInSingleQuoteString_RemainsNeutral()
+    {
+        // 単引用符文字列内の function はスキップされるため補正の対象にならない
+        const string source = "var s = 'function foo() { return 1; }';";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // 単引用符内なので全体が -1（ニュートラル）のままであることを確認する
+        Assert.All(map, v => Assert.Equal(-1, v));
+    }
+
+    /// <summary>
+    /// 文字列リテラル内の "=>" が本物のアロー関数と誤認識されないことを確認する。
+    /// 文字列スキップにより、文字列内の => は補正対象にならない。
+    /// 後続の本物のアロー関数（ブロック本体）は正しく 0（未実行）にマークされる。
+    /// </summary>
+    [Fact]
+    public void BuildMap_ArrowInStringLiteral_RemainsNeutral_RealArrowMarked()
+    {
+        // const s = "() => {}"; const f = () => { return 1; };
+        //  0         1         2         3         4         5
+        //  0123456789012345678901234567890123456789012345678901
+        // "() => {}" は index 10〜19 の二重引用符内（=14 は文字列内）
+        // 本物の => は index 35（= のインデックス）
+        const string source = "const s = \"() => {}\"; const f = () => { return 1; };";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // 文字列内の '=' は -1 のまま
+        Assert.Equal(-1, map[14]); // '=' inside "() => {}" — not processed
+        // 本物のアロー関数（=> から } まで）は 0 になる
+        Assert.Equal(0, map[35]); // '=' of real =>
+        Assert.Equal(0, map[38]); // {
+        Assert.Equal(0, map[50]); // }
+    }
+
+    // -----------------------------------------------------------------------
+    // SkipBalancedParens — 単引用符内の ')' スキップ確認テスト
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// 関数パラメータ内の単一引用符文字列に ')' が含まれる場合、
+    /// SkipBalancedParens がその ')' をパラメータ終端と誤認識しないことを確認する。
+    /// 修正済みの行コメント・ブロックコメントと同様の確認。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledFunction_ParamWithSingleQuotedParen_BodyMarkedUncovered()
+    {
+        // function foo(a = ')', b) { return 1; }
+        //  0         1         2         3
+        //  01234567890123456789012345678901234567
+        // params: a = ')' → ')' は単引用符内なので SkipBalancedParens は無視する
+        const string source = "function foo(a = ')', b) { return 1; }";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        int braceOpen  = source.IndexOf('{');
+        int braceClose = source.LastIndexOf('}');
+        // 関数全体が 0（未実行）になっていることを確認する
+        Assert.Equal(0, map[0]);           // 'f' of function
+        Assert.Equal(0, map[braceOpen]);   // '{'
+        Assert.Equal(0, map[braceClose]);  // '}'
+    }
+
+    // -----------------------------------------------------------------------
+    // SkipRegexLiteral のエッジケース確認テスト
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// 正規表現リテラル /\// （エスケープされたスラッシュ）を含む関数本体で、
+    /// SkipRegexLiteral が \/ をエスケープとして処理し正規表現を正しく終端することを確認する。
+    /// エスケープを誤処理した場合、2番目の / で終端してしまい、3番目の / が
+    /// 除算または新たな正規表現として誤処理される可能性がある。
+    /// </summary>
+    [Fact]
+    public void BuildMap_FunctionBody_RegexWithEscapedSlash_CorrectlySkipped()
+    {
+        // function foo() { var re = /\//; return 1; }
+        //  0         1         2         3         4
+        //  01234567890123456789012345678901234567890123
+        // /\// は JS のバックスラッシュエスケープ済み /。}=42 が真の閉じ
+        const string source = "function foo() { var re = /\\//; return 1; }";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // SkipRegexLiteral が \/ を正しくスキップし、真の } で関数が終わる → 全体 0
+        Assert.Equal(0, map[0]);                        // 'f' of function
+        Assert.Equal(0, map[source.Length - 1]);        // true closing '}'
+    }
+
+    /// <summary>
+    /// 正規表現リテラル /[/]/ （文字クラス内にスラッシュ）を含む関数本体で、
+    /// SkipRegexLiteral が文字クラス内の / を正規表現終端と誤認識しないことを確認する。
+    /// inCharClass フラグにより [ ] 内の / は終端として扱われない。
+    /// </summary>
+    [Fact]
+    public void BuildMap_FunctionBody_RegexCharClassWithSlash_CorrectlySkipped()
+    {
+        // function foo() { var re = /[/]/; return 1; }
+        //  0         1         2         3         4
+        //  0123456789012345678901234567890123456789012345
+        // /[/]/ の文字クラス [/] 内の / は終端ではない。}=43 が真の閉じ
+        const string source = "function foo() { var re = /[/]/; return 1; }";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // 文字クラス内の / を正しくスキップし、真の } で関数が終わる → 全体 0
+        Assert.Equal(0, map[0]);                        // 'f' of function
+        Assert.Equal(0, map[source.Length - 1]);        // true closing '}'
+    }
+
+    // -----------------------------------------------------------------------
+    // アロー関数の追加パターン確認テスト
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// 括弧なし単一パラメータのアロー関数（x => { }）が未実行の場合、
+    /// => の位置からブロック本体 } まで 0（未実行）になることを確認する。
+    /// 既存テストは全て () => {} 形式のため、括弧なしパラメータは未テスト。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledArrowFunction_SingleBareParam_MarkedAsUncovered()
+    {
+        // const f = x => { return x; }
+        //  0         1         2
+        //  012345678901234567890123456789
+        // x=10（パラメータ）, =>(==12, >=13), {=15, }=27
+        // 代入の = が index 8 にあるが source[9]='x'（'>'でない）なので => でない
+        const string source = "const f = x => { return x; }";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // => の位置から } まで 0（未実行）になっていることを確認する
+        Assert.Equal(0, map[12]); // '=' of =>
+        Assert.Equal(0, map[15]); // {
+        Assert.Equal(0, map[27]); // }
+        // パラメータ x と代入の = は補正対象外なので -1 のまま
+        Assert.Equal(-1, map[10]); // 'x' (parameter)
+        Assert.Equal(-1, map[8]);  // '=' of assignment
+    }
+
+    // -----------------------------------------------------------------------
+    // メソッド短縮構文の追加パターン確認テスト
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// setter 構文（set prop(v) {}）が未実行の場合、
+    /// set キーワード自体は -1 のまま、プロパティ名以降の本体が 0（未実行）になることを確認する。
+    /// get と同様に set は '(' を持たないため誤検出されない。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledSetter_BodyMarkedAsUncovered()
+    {
+        // const obj = { set value(v) {} }
+        //  0         1         2         3
+        //  0123456789012345678901234567890
+        // s=14（set）, v=18（value）, (=23, {=27, }=28, outer }=30
+        const string source = "const obj = { set value(v) {} }";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // set キーワードは '(' を持たないため -1 のまま
+        Assert.Equal(-1, map[14]); // 's' of set
+        // value プロパティの先頭から } まで 0（未実行）になっていることを確認する
+        Assert.Equal(0, map[18]); // 'v' of value
+        Assert.Equal(0, map[27]); // {
+        Assert.Equal(0, map[28]); // }
+    }
+
+    /// <summary>
+    /// オブジェクトのメソッド名が "async" の場合（async キーワードとしてではなくメソッド名として）、
+    /// async() {} がメソッド短縮構文として検出され 0（未実行）になることを確認する。
+    /// これは "async greet() {}" の async キーワード（SKIP テスト）とは別の確認である。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledMethodNamedAsync_MarkedAsUncovered()
+    {
+        // const obj = { async() { return 1; } }
+        //  0         1         2         3
+        //  0123456789012345678901234567890123456
+        // a=14（async メソッド名）, (=19, {=22, }=34, outer }=36
+        const string source = "const obj = { async() { return 1; } }";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // async メソッド名（識別子として）の先頭から } まで 0（未実行）になっていることを確認する
+        Assert.Equal(0, map[14]); // 'a' of async (as method name)
+        Assert.Equal(0, map[22]); // {
+        Assert.Equal(0, map[34]); // }
+    }
+
+    /// <summary>
+    /// 計算プロパティメソッド（["method"]() {}）は識別子が角括弧で囲まれているため、
+    /// TryMarkMethodShorthand の対象にならず -1（ニュートラル）のままになることを確認する。
+    /// これは既知の制限（false negative）として文書化する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_ComputedPropertyMethod_RemainsNeutral_KnownLimitation()
+    {
+        // 計算プロパティメソッド: [ で始まるため識別子の先頭条件を満たさない
+        const string source = "const obj = { [\"method\"]() { return 1; } }";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // 計算プロパティメソッドは検出されないため全体が -1（ニュートラル）のまま
+        // 既知の制限: function キーワードや通常の identifier() {} でなければ補正できない
+        Assert.All(map, v => Assert.Equal(-1, v));
+    }
+
+    // -----------------------------------------------------------------------
+    // ネスト関数（両方未呼び出し）の確認テスト
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// 外側関数と内側関数の両方がカバレッジデータにない（どちらも未呼び出し）場合、
+    /// ソース全体が 0（未実行）としてマークされることを確認する。
+    /// 外側関数の FindMatchingBrace が内側の {} も含めた全体を正しくスキャンし、
+    /// 外側の funcEnd まで一括でマークする動作を確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_BothOuterAndInnerUncalled_EntireSourceMarkedAsUncovered()
+    {
+        // function outer() { function inner() { return 1; } return 2; }
+        //  0         1         2         3         4         5         6
+        //  0123456789012345678901234567890123456789012345678901234567890
+        // outer {=17, inner function=19, inner {=36, inner }=48, outer }=60
+        const string source = "function outer() { function inner() { return 1; } return 2; }";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // 外側の FindMatchingBrace が depth=2 を経由して outer } で終端し全体をマーク
+        Assert.All(map, v => Assert.Equal(0, v));
     }
 }

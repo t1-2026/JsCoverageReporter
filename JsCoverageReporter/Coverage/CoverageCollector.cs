@@ -15,10 +15,14 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
     private readonly Dictionary<IPage, ICDPSession> _cdpSessions    = [];
     // 新しいタブの SetupPageAsync タスクを格納するリスト（StopAsync で待機する）
     private readonly List<Task>                     _pageSetupTasks = [];
-    // _pageSetupTasks へのアクセスを同期するためのロックオブジェクト
+    // _trackedPages / _cdpSessions / _pageSetupTasks へのアクセスを同期するためのロックオブジェクト
     private readonly object                         _lock           = new();
     // DisposeAsync が既に呼ばれたかどうかを示すフラグ（二重解放を防ぐ）
     private bool _disposed = false;
+    // StopAsync が既に呼ばれたかどうかを示すフラグ（二重呼び出しによる CDP エラーを防ぐ）
+    private bool _stopped  = false;
+    // Context.Page イベントハンドラの参照（DisposeAsync / StopAsync で解除するために保持する）
+    private EventHandler<IPage>? _pageEventHandler = null;
 
     /// <summary>
     /// カバレッジ収集を開始する。
@@ -29,18 +33,21 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
         // 最初のページ（コンストラクタで渡されたページ）のカバレッジを開始する
         await SetupPageAsync(page);
 
-        // 新しいタブが開いたとき自動でカバレッジを開始するイベントを登録する
-        // C# のイベントハンドラは async void にできないので、タスクをリストに格納して StopAsync で待機する
-        page.Context.Page += (_, newPage) =>
+        // 新しいタブが開いたとき自動でカバレッジを開始するイベントハンドラを定義する
+        // ハンドラ参照を保持して StopAsync / DisposeAsync で解除できるようにする
+        _pageEventHandler = (_, newPage) =>
         {
             // 新タブのセットアップタスクを開始する（await はしない — イベントハンドラのため）
             var task = SetupPageAsync(newPage);
-            // 別スレッドから追加される可能性があるためロックして追加する
+            // _pageSetupTasks と _trackedPages / _cdpSessions は複数スレッドから触れるためロックする
             lock (_lock)
             {
                 _pageSetupTasks.Add(task);
             }
         };
+
+        // 新しいタブが開いたときのイベントを購読する
+        page.Context.Page += _pageEventHandler;
     }
 
     /// <summary>
@@ -51,13 +58,20 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
     private async Task SetupPageAsync(IPage targetPage)
     {
         // 追跡ページリストにこのページを追加する（追加順がタブ番号になる）
-        _trackedPages.Add(targetPage);
+        // Context.Page イベントハンドラから並行して呼ばれる可能性があるためロックする
+        lock (_lock)
+        {
+            _trackedPages.Add(targetPage);
+        }
 
-        // ページに接続したCDPセッションを作成する
+        // ページに接続したCDPセッションを作成する（await 中はロックを保持できないため lock の外で行う）
         var cdp = await targetPage.Context.NewCDPSessionAsync(targetPage);
 
-        // 作成したCDPセッションをページに対応させて保存する
-        _cdpSessions[targetPage] = cdp;
+        // 作成したCDPセッションをページに対応させて保存する（Dictionary も lock で保護する）
+        lock (_lock)
+        {
+            _cdpSessions[targetPage] = cdp;
+        }
 
         // V8 Profilerを有効にする（カバレッジ計測に必要）
         await cdp.SendAsync("Profiler.enable");
@@ -89,8 +103,28 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
         IReadOnlyList<string> scriptFilters,
         IReadOnlyList<string> scriptExcludes)
     {
+        // 二重呼び出しを防ぐ（2回目以降は空リストを返す）
+        // _stopped フラグはメインスレッドからのみ操作されることを前提とする
+        if (_stopped)
+        {
+            return [];
+        }
+        _stopped = true;
+
+        // イベントハンドラをまず解除する（以降に開く新タブは追跡対象外にする）
+        if (_pageEventHandler != null)
+        {
+            page.Context.Page -= _pageEventHandler;
+            _pageEventHandler  = null;
+        }
+
         // StartAsync が呼ばれていない場合（追跡ページなし）は空リストを返す
-        if (_trackedPages.Count == 0)
+        int trackedCount;
+        lock (_lock)
+        {
+            trackedCount = _trackedPages.Count;
+        }
+        if (trackedCount == 0)
         {
             return [];
         }
@@ -107,15 +141,27 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
         // 全ページのカバレッジを収集してまとめる
         var allScripts = new List<ScriptCoverage>();
 
-        // _trackedPages の順番がそのままタブ番号（Index）になる
-        for (int i = 0; i < _trackedPages.Count; i++)
+        // _trackedPages をスナップショットして反復する（反復中に別スレッドが変更しないよう保護）
+        List<IPage> pageSnapshot;
+        lock (_lock)
+        {
+            pageSnapshot = new List<IPage>(_trackedPages);
+        }
+
+        // スナップショットの順番がそのままタブ番号（Index）になる
+        for (int i = 0; i < pageSnapshot.Count; i++)
         {
             // このページ（タブ）の情報を作成する（Url は収集直前の値を使う）
-            var targetPage = _trackedPages[i];
+            var targetPage = pageSnapshot[i];
             var pageInfo = new PageInfo(i, targetPage.Url);
 
             // このページの CDP セッションが存在する場合のみ収集する
-            if (!_cdpSessions.TryGetValue(targetPage, out var cdp))
+            ICDPSession? cdp;
+            lock (_lock)
+            {
+                _cdpSessions.TryGetValue(targetPage, out cdp);
+            }
+            if (cdp == null)
             {
                 // セットアップが失敗して CDP セッションが作れなかった場合はスキップする
                 Console.Error.WriteLine($"[Warning] No CDP session for tab {i} ('{targetPage.Url}') — skipping.");
@@ -286,8 +332,21 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
         }
         _disposed = true;
 
+        // StopAsync が呼ばれずに Dispose された場合でもイベントハンドラを解除する
+        // （コンテキストが長命な場合のハンドラリークを防ぐ）
+        if (_pageEventHandler != null)
+        {
+            page.Context.Page -= _pageEventHandler;
+            _pageEventHandler  = null;
+        }
+
         // すべての CDP セッションを解放する
-        foreach (var cdp in _cdpSessions.Values)
+        List<ICDPSession> sessions;
+        lock (_lock)
+        {
+            sessions = new List<ICDPSession>(_cdpSessions.Values);
+        }
+        foreach (var cdp in sessions)
         {
             await cdp.DisposeAsync();
         }
