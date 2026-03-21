@@ -311,7 +311,14 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
 
             lock (_lock)
             {
-                scriptCache[scriptId] = newCoverage;
+                // 並行処理で別のスナップショットが先にキャッシュした場合はそのページ情報を優先する
+                // （ロック外での読み取りと書き込みの間に別の処理が書き込んだ場合の TOCTOU 対策）
+                ScriptCoverage? currentInCache;
+                if (scriptCache.TryGetValue(scriptId, out currentInCache) && currentInCache != null)
+                {
+                    finalPageInfo = currentInCache.Page;
+                }
+                scriptCache[scriptId] = new ScriptCoverage(finalPageInfo, url, source, functions);
             }
         }
     }
@@ -369,22 +376,22 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
         await Task.WhenAll(setupTasks);
 
         // 中間スナップショットタスクが完了するまで待機する
-        List<Task> snapTasks;
-        lock (_lock)
+        // 新しいタスクが追加されなくなるまでループする（2段階以上の連鎖が起きても安全）
+        int lastSnapCount = 0;
+        while (true)
         {
-            snapTasks = new List<Task>(_snapTasks);
-        }
-        await Task.WhenAll(snapTasks);
-
-        // セットアップ待機中に追加されたスナップタスクを二段階目として確認する
-        List<Task> snapTasks2;
-        lock (_lock)
-        {
-            snapTasks2 = new List<Task>(_snapTasks);
-        }
-        if (snapTasks2.Count > snapTasks.Count)
-        {
-            await Task.WhenAll(snapTasks2);
+            List<Task> snapTasksLoop;
+            lock (_lock)
+            {
+                snapTasksLoop = new List<Task>(_snapTasks);
+            }
+            // 前回のループから増えていなければすべてのタスクが完了している
+            if (snapTasksLoop.Count == lastSnapCount)
+            {
+                break;
+            }
+            lastSnapCount = snapTasksLoop.Count;
+            await Task.WhenAll(snapTasksLoop);
         }
 
         // 全ページの最終カバレッジを収集する（全スクリプトの最終状態をマージする）
@@ -481,6 +488,9 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
         {
             if (_disposed) { return; }
             _disposed = true;
+            // _stopped = true を設定して未完了の snapTask が解放済み CDP セッションを使わないようにする
+            // StopAsync を経由せずに Dispose された場合のレース条件を防ぐ
+            _stopped = true;
         }
 
         // Context.Page イベントハンドラを解除する
