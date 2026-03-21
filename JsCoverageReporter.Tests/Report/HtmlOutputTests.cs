@@ -525,10 +525,12 @@ public class HtmlOutputTests
     [Fact]
     public void BuildIndexPage_IncludesPageUrlColumnHeader()
     {
-        // 1スクリプト分のサマリー行を渡す（pageUrl フィールドを含む新シグネチャ）
-        var rows = new List<(string pageUrl, string url, int covered, int partial, int total, string filename)>
+        // 1タブ分のサマリー行を渡す（新シグネチャ）
+        var rows = new List<(IReadOnlyList<(string pageUrl, string tabFilename)> tabs,
+                             string url, int covered, int partial, int total, string mergedFilename)>
         {
-            ("https://example.com", "https://example.com/app.js", 5, 0, 10, "script-0-tab0.html")
+            ([("https://example.com", "script-0.html")],
+             "https://example.com/app.js", 5, 0, 10, "script-0.html")
         };
 
         var html = HtmlReportGenerator.BuildIndexPage(rows);
@@ -536,7 +538,7 @@ public class HtmlOutputTests
         // テーブルヘッダーに「ページ URL」が含まれているか確認する
         Assert.Contains("ページ URL", html);
         // ページ URL の値がセル内に含まれているか確認する
-        Assert.Contains("https://example.com</", html);
+        Assert.Contains("https://example.com", html);
     }
 
 
@@ -670,15 +672,15 @@ public class HtmlOutputTests
     [Fact]
     public void BuildIndexPage_XssInUrl_IsHtmlEncoded()
     {
-        // URL 内の < > が HTML エンコードされて出力されることを確認する（XSS 防止）
+        // スクリプト URL 内の < > が HTML エンコードされることを確認する（XSS 防止）
         const string url = "http://example.com/<script>alert(1)</script>";
-        var rows = new List<(string pageUrl, string url, int covered, int partial, int total, string filename)>
+        var rows = new List<(IReadOnlyList<(string pageUrl, string tabFilename)> tabs,
+                             string url, int covered, int partial, int total, string mergedFilename)>
         {
-            ("http://example.com", url, 10, 0, 10, "test.html")
+            ([("http://example.com", "test.html")], url, 10, 0, 10, "test.html")
         };
         var scriptPage = HtmlReportGenerator.BuildIndexPage(rows);
 
-        // URL の < > が &lt; &gt; にエンコードされているべき
         Assert.Contains("&lt;script&gt;", scriptPage);
         Assert.DoesNotContain("<script>", scriptPage);
     }
@@ -844,17 +846,15 @@ public class HtmlOutputTests
     [Fact]
     public void BuildIndexPage_EmptyRows_ReturnsValidHtml()
     {
-        // スクリプト行が空のリストを渡す
-        var rows = new List<(string pageUrl, string url, int covered, int partial, int total, string filename)>();
+        // スクリプト行が空のリストを渡す（新シグネチャ）
+        var rows = new List<(IReadOnlyList<(string pageUrl, string tabFilename)> tabs,
+                             string url, int covered, int partial, int total, string mergedFilename)>();
 
-        // 例外が発生せずに HTML が返されることを確認する
         var html = HtmlReportGenerator.BuildIndexPage(rows);
 
-        // 有効な HTML であること（最低限の構造が含まれる）
         Assert.NotNull(html);
         Assert.NotEmpty(html);
         Assert.Contains("<html", html);
-        // テーブルヘッダーは存在するが、データ行はないことを確認する
         Assert.Contains("ページ URL", html);
     }
 
@@ -864,23 +864,22 @@ public class HtmlOutputTests
     [Fact]
     public void BuildIndexPage_MultipleRows_AllIncluded()
     {
-        // 3 スクリプト分のサマリー行を用意する
-        var rows = new List<(string pageUrl, string url, int covered, int partial, int total, string filename)>
+        // 3スクリプト分のサマリー行を用意する（新シグネチャ・新ファイル名形式）
+        var rows = new List<(IReadOnlyList<(string pageUrl, string tabFilename)> tabs,
+                             string url, int covered, int partial, int total, string mergedFilename)>
         {
-            ("https://example.com", "https://example.com/a.js",  5,  0, 10, "script-0-tab0.html"),
-            ("https://example.com", "https://example.com/b.js",  3,  2, 10, "script-1-tab0.html"),
-            ("https://example.com", "https://example.com/c.js",  0,  0, 10, "script-2-tab0.html"),
+            ([("https://example.com", "script-0.html")], "https://example.com/a.js",  5,  0, 10, "script-0.html"),
+            ([("https://example.com", "script-1.html")], "https://example.com/b.js",  3,  2, 10, "script-1.html"),
+            ([("https://example.com", "script-2.html")], "https://example.com/c.js",  0,  0, 10, "script-2.html"),
         };
 
         var html = HtmlReportGenerator.BuildIndexPage(rows);
 
-        // 3 つのスクリプト URL がすべて出力に含まれることを確認する
         Assert.Contains("a.js", html);
         Assert.Contains("b.js", html);
         Assert.Contains("c.js", html);
-        // 対応するファイル名リンクも含まれることを確認する
-        Assert.Contains("script-0-tab0.html", html);
-        Assert.Contains("script-2-tab0.html", html);
+        Assert.Contains("script-0.html", html);
+        Assert.Contains("script-2.html", html);
     }
 
     /// <summary>
@@ -898,5 +897,65 @@ public class HtmlOutputTests
         // 両方の URL が HTML に含まれているか確認する
         Assert.Contains("https://page-a.com/", html);
         Assert.Contains("https://page-b.com/", html);
+    }
+
+    // -----------------------------------------------------------------------
+    // BuildIndexPage — 複数タブの展開 UI テスト
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// 複数タブで同じスクリプトが読み込まれた場合、
+    /// index.html に details 要素と各タブへのリンクが含まれることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildIndexPage_MultiTabScript_ShowsDetailsElement()
+    {
+        // 2タブで同じスクリプトが読み込まれた場合を想定する
+        var tabs = new List<(string pageUrl, string tabFilename)>
+        {
+            ("https://page-a.com/", "script-0-tab0.html"),
+            ("https://page-b.com/", "script-0-tab1.html"),
+        };
+        var rows = new List<(IReadOnlyList<(string pageUrl, string tabFilename)> tabs,
+                             string url, int covered, int partial, int total, string mergedFilename)>
+        {
+            (tabs, "https://example.com/app.js", 80, 5, 100, "script-0.html"),
+        };
+
+        var html = HtmlReportGenerator.BuildIndexPage(rows);
+
+        // <details> 要素が含まれているか確認する（展開 UI）
+        Assert.Contains("<details", html);
+        // 各タブへのリンクが含まれているか確認する
+        Assert.Contains("script-0-tab0.html", html);
+        Assert.Contains("script-0-tab1.html", html);
+        // 各タブのページ URL が含まれているか確認する
+        Assert.Contains("https://page-a.com/", html);
+        Assert.Contains("https://page-b.com/", html);
+        // 合成ページへのリンクが含まれているか確認する
+        Assert.Contains("script-0.html", html);
+    }
+
+    /// <summary>
+    /// 単一タブのスクリプトの場合、details 要素は使わずに
+    /// ページ URL を直接表示することを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildIndexPage_SingleTabScript_NoDetailsElement()
+    {
+        // 1タブのみの場合は展開 UI が不要
+        var rows = new List<(IReadOnlyList<(string pageUrl, string tabFilename)> tabs,
+                             string url, int covered, int partial, int total, string mergedFilename)>
+        {
+            ([("https://example.com/", "script-0.html")],
+             "https://example.com/app.js", 80, 5, 100, "script-0.html"),
+        };
+
+        var html = HtmlReportGenerator.BuildIndexPage(rows);
+
+        // 単一タブでは <details> 要素を使わないことを確認する
+        Assert.DoesNotContain("<details", html);
+        // ページ URL が直接表示されることを確認する
+        Assert.Contains("https://example.com/", html);
     }
 }

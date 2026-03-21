@@ -955,16 +955,17 @@ internal class HtmlReportGenerator
         // スクリプト詳細ページ用のサブディレクトリを作成する
         Directory.CreateDirectory(scriptsDir);
 
-        // インデックスページに表示するサマリー行のリスト（URL・行数・ファイル名を持つタプル）
-        var summaryRows = new List<(string pageUrl, string url, int covered, int partial, int total, string filename)>();
+        // インデックスページに表示するサマリー行のリスト
+        var summaryRows = new List<(
+            IReadOnlyList<(string pageUrl, string tabFilename)> tabs,
+            string url, int covered, int partial, int total, string mergedFilename)>();
 
         // 各スクリプトのカバレッジデータを処理して詳細ページを生成する
         for (int i = 0; i < coverages.Count; i++)
         {
             // 現在処理中のスクリプトカバレッジデータ
             var script = coverages[i];
-            // このスクリプトの詳細ページのファイル名（例: script-0.html）
-            // ファイル名にタブ番号を含める（例: script-0-tab0.html、script-1-tab0.html）
+            // このスクリプトの詳細ページのファイル名（例: script-0-tab0.html）
             var filename = $"script-{i}-tab{script.Page.Index}.html";
 
             // カバレッジマップ（各文字のカバレッジ値の配列）を生成する
@@ -1016,8 +1017,12 @@ internal class HtmlReportGenerator
                 BuildScriptPage(singlePageUrls, script.Url, lines),
                 Encoding.UTF8);
 
-            // このスクリプトのサマリー情報（URL・行数・ファイル名）をリストに追加する
-            summaryRows.Add((script.Page.Url, script.Url, covered, partial, total, filename));
+            // このスクリプトのサマリー情報をリストに追加する（単一タブとして追加）
+            var singleTab = new List<(string pageUrl, string tabFilename)>
+            {
+                (script.Page.Url, filename)
+            };
+            summaryRows.Add((singleTab, script.Url, covered, partial, total, filename));
         }
 
         // インデックスページ（全スクリプトのサマリー表）のHTMLを生成してファイルに書き出す
@@ -1147,11 +1152,13 @@ internal class HtmlReportGenerator
 
     /// <summary>
     /// インデックスページ（スクリプト一覧とカバレッジ率の表）のHTMLを生成する。
+    /// 複数タブで同じスクリプトが読み込まれた場合は展開ボタン付きで表示する。
     /// </summary>
-    /// <param name="rows">各スクリプトのサマリー情報（URL・行数・ファイル名）のリスト</param>
+    /// <param name="rows">各スクリプトのサマリー情報のリスト</param>
     /// <returns>インデックスページの完全なHTML文字列</returns>
     internal static string BuildIndexPage(
-        List<(string pageUrl, string url, int covered, int partial, int total, string filename)> rows)
+        List<(IReadOnlyList<(string pageUrl, string tabFilename)> tabs,
+              string url, int covered, int partial, int total, string mergedFilename)> rows)
     {
         // 全スクリプトのカバー済み行数の合計
         int totalCovered = 0;
@@ -1160,15 +1167,12 @@ internal class HtmlReportGenerator
         // 全スクリプトのカバレッジ対象行数の合計
         int totalLines = 0;
 
-        // 各スクリプトの行数を合計する
-        foreach (var row in rows)
+        // 各スクリプトの行数を合計する（タプル要素名が変わるため分割代入を使う）
+        foreach (var (_, _, covered, partial, total, _) in rows)
         {
-            // カバー済み行数を合計に加算する
-            totalCovered += row.covered;
-            // 部分カバー行数を合計に加算する
-            totalPartial += row.partial;
-            // 対象行数を合計に加算する
-            totalLines += row.total;
+            totalCovered += covered;
+            totalPartial += partial;
+            totalLines   += total;
         }
 
         // 全体のカバレッジ率を計算する（ゼロ除算を避けるため行数が0のときは0%にする）
@@ -1211,6 +1215,11 @@ internal class HtmlReportGenerator
             td.num{text-align:right;font-variant-numeric:tabular-nums}
             a{color:#1a7a4a;text-decoration:none}
             a:hover{text-decoration:underline}
+            details > summary { cursor:pointer; color:#1a7a4a; list-style:none }
+            details > summary::before { content:"▶ " }
+            details[open] > summary::before { content:"▼ " }
+            details ul { margin:4px 0 0;padding-left:16px;list-style:disc;font-size:12px }
+            details ul li { margin:2px 0 }
             </style></head><body>
             <h1>JS カバレッジレポート</h1>
             """);
@@ -1288,38 +1297,64 @@ internal class HtmlReportGenerator
             """);
 
         // スクリプトごとのデータ行を出力する
-        foreach (var (pageUrl, url, covered, partial, total, filename) in rows)
+        foreach (var (tabs, url, covered, partial, total, mergedFilename) in rows)
         {
             // このスクリプトのカバレッジ率を計算する（ゼロ除算を避ける）
             double pct;
             if (total > 0)
             {
-                // (カバー済み + 部分カバー) / 全対象行数 × 100 でパーセントを計算する
                 pct = 100.0 * (covered + partial) / total;
             }
             else
             {
-                // 対象行がない場合は 0% とする
                 pct = 0;
             }
 
-            // ページ URL のセル表示文字列を決める（空の場合は "(不明)" とする）
-            string pageUrlDisplay;
-            if (string.IsNullOrEmpty(pageUrl))
+            // ページ URL セルの表示を決める
+            // タブが1件: ページ URL を直接表示する
+            // タブが2件以上: <details>/<summary> で展開表示する
+            string pageUrlCell;
+            if (tabs.Count <= 1)
             {
-                // ページ URL が取得できなかった場合のフォールバック表示
-                pageUrlDisplay = "(不明)";
+                // 単一タブ: URL をそのままテキストとして表示する（XSS 対策）
+                string singleUrl;
+                if (tabs.Count == 0 || string.IsNullOrEmpty(tabs[0].pageUrl))
+                {
+                    singleUrl = "(不明)";
+                }
+                else
+                {
+                    singleUrl = HtmlEncode(tabs[0].pageUrl);
+                }
+                pageUrlCell = singleUrl;
             }
             else
             {
-                // XSS 対策のため HTML エスケープする
-                pageUrlDisplay = HtmlEncode(pageUrl);
+                // 複数タブ: <details>/<summary> で展開できるようにする
+                var sbDetails = new StringBuilder();
+                sbDetails.Append($"<details><summary>複数ページ ({tabs.Count})</summary><ul>");
+                foreach (var (pageUrl, tabFilename) in tabs)
+                {
+                    string displayUrl;
+                    if (string.IsNullOrEmpty(pageUrl))
+                    {
+                        displayUrl = "(不明)";
+                    }
+                    else
+                    {
+                        displayUrl = HtmlEncode(pageUrl);
+                    }
+                    sbDetails.Append($"<li><a href=\"scripts/{tabFilename}\">{displayUrl}</a></li>");
+                }
+                sbDetails.Append("</ul></details>");
+                pageUrlCell = sbDetails.ToString();
             }
 
-            // ページ URL・スクリプト URL（リンク付き）・各行数・カバレッジ率を出力する
-            sb.AppendLine($"<tr><td>{pageUrlDisplay}</td><td><a href=\"scripts/{filename}\">{HtmlEncode(url)}</a></td>" +
-                          $"<td class=\"num\">{covered}</td><td class=\"num\">{partial}</td><td class=\"num\">{total}</td>" +
-                          $"<td class=\"num\">{pct:F1}%</td></tr>");
+            // ページ URL・スクリプト URL（合成ページへのリンク付き）・各行数・カバレッジ率を出力する
+            sb.AppendLine($"<tr><td>{pageUrlCell}</td>" +
+                          $"<td><a href=\"scripts/{mergedFilename}\">{HtmlEncode(url)}</a></td>" +
+                          $"<td class=\"num\">{covered}</td><td class=\"num\">{partial}</td>" +
+                          $"<td class=\"num\">{total}</td><td class=\"num\">{pct:F1}%</td></tr>");
         }
 
         // テーブルとページの閉じタグを出力する
