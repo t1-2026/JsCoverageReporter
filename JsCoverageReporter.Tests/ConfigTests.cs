@@ -37,7 +37,7 @@ public class ConfigTests
     [Fact]
     public void Deserialize_AllActionTypes()
     {
-        // 6種類のアクションをすべて含む JSON を用意する
+        // 11種類のアクションをすべて含む JSON を用意する
         var json = """
         {
             "url": "https://example.com",
@@ -48,7 +48,13 @@ public class ConfigTests
                 { "type": "navigate",        "url": "https://example.com/p2" },
                 { "type": "waitForSelector", "selector": ".ready" },
                 { "type": "hover",           "selector": ".menu" },
-                { "type": "wait",            "milliseconds": 500 }
+                { "type": "wait",            "milliseconds": 500 },
+                { "type": "select",          "selector": "#sel", "value": "opt1" },
+                { "type": "check",           "selector": "#chk" },
+                { "type": "uncheck",         "selector": "#chk" },
+                { "type": "dblclick",        "selector": "#dbtn" },
+                { "type": "scroll",          "selector": "#target" },
+                { "type": "scroll",          "x": 100, "y": 200 }
             ]
         }
         """;
@@ -58,14 +64,24 @@ public class ConfigTests
 
         // scriptFilters が正しく読み込まれているか確認する
         Assert.Equal(["app.js"], config.ScriptFilters);
-        // アクションが6件読み込まれているか確認する
-        Assert.Equal(6, config.Actions.Count);
-        // 各アクションのフィールドが正しく読み込まれているか確認する
-        Assert.Equal("click",   config.Actions[0].Type);
-        Assert.Equal("#btn",    config.Actions[0].Selector);
-        Assert.Equal("hello",   config.Actions[1].Value);
+        // アクションが12件読み込まれているか確認する
+        Assert.Equal(12, config.Actions.Count);
+        // 各アクションの type と主要フィールドが正しく読み込まれているか確認する
+        Assert.Equal("click",          config.Actions[0].Type);
+        Assert.Equal("#btn",           config.Actions[0].Selector);
+        Assert.Equal("hello",          config.Actions[1].Value);
         Assert.Equal("https://example.com/p2", config.Actions[2].Url);
-        Assert.Equal(500,       config.Actions[5].Milliseconds);
+        Assert.Equal(500,              config.Actions[5].Milliseconds);
+        Assert.Equal("select",         config.Actions[6].Type);
+        Assert.Equal("opt1",           config.Actions[6].Value);
+        Assert.Equal("check",          config.Actions[7].Type);
+        Assert.Equal("uncheck",        config.Actions[8].Type);
+        Assert.Equal("dblclick",       config.Actions[9].Type);
+        Assert.Equal("scroll",         config.Actions[10].Type);
+        Assert.Equal("#target",        config.Actions[10].Selector);
+        Assert.Equal("scroll",         config.Actions[11].Type);
+        Assert.Equal(100,              config.Actions[11].X);
+        Assert.Equal(200,              config.Actions[11].Y);
     }
 
     /// <summary>
