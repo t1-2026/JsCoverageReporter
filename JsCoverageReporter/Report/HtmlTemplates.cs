@@ -90,7 +90,7 @@ internal static class HtmlTemplates
             </tr>
             <tr>
               <td><span class="swatch" style="background:#f0e8a0"></span><strong>部分実行</strong></td>
-              <td>if / else など、実行された部分と未実行の部分が混在（分岐の片側だけ通った場合など）</td>
+              <td>if / else など、実行された部分と未実行の部分が混在する（分岐の片側だけ通った場合など）</td>
             </tr>
             <tr>
               <td><span class="swatch" style="background:#f0c6c6"></span><strong>未実行</strong></td>

@@ -906,17 +906,38 @@ internal class HtmlReportGenerator
     /// <returns>HTMLエスケープ済みの文字列</returns>
     internal static string HtmlEncode(string text)
     {
-        // エスケープ処理の対象文字列（元の text を上書きしながら変換する）
-        string result = text;
-        // & は必ず最初に変換する（他の変換結果の & を二重変換しないため）
-        result = result.Replace("&", "&amp;");
-        // < をエスケープする（HTMLタグの開始文字として解釈されないようにする）
-        result = result.Replace("<", "&lt;");
-        // > をエスケープする（HTMLタグの終了文字として解釈されないようにする）
-        result = result.Replace(">", "&gt;");
-        // " をエスケープする（HTML属性値の中で使用できるようにする）
-        result = result.Replace("\"", "&quot;");
-        return result;
+        // 1文字ずつスキャンして HTML 特殊文字をエスケープする
+        // sequential Replace では中間文字列が4つ生成されるため StringBuilder を使う（1パスで完結）
+        var sb = new StringBuilder(text.Length);
+        foreach (char c in text)
+        {
+            if (c == '&')
+            {
+                // & は &amp; にエスケープする（他の変換結果の & を二重変換しないよう最初に処理）
+                sb.Append("&amp;");
+            }
+            else if (c == '<')
+            {
+                // < は &lt; にエスケープする（HTML タグの開始文字として解釈されないようにする）
+                sb.Append("&lt;");
+            }
+            else if (c == '>')
+            {
+                // > は &gt; にエスケープする（HTML タグの終了文字として解釈されないようにする）
+                sb.Append("&gt;");
+            }
+            else if (c == '"')
+            {
+                // " は &quot; にエスケープする（HTML 属性値の中で使用できるようにする）
+                sb.Append("&quot;");
+            }
+            else
+            {
+                // その他の文字はそのまま追加する
+                sb.Append(c);
+            }
+        }
+        return sb.ToString();
     }
 
     /// <summary>
@@ -1398,35 +1419,8 @@ internal class HtmlReportGenerator
         // HTMLヘッダーとスタイルシートを出力する
         sb.AppendLine(HtmlTemplates.IndexPageHeader);
 
-        // レポートの見方・凡例セクションを出力する
-        sb.AppendLine("""
-            <div class="guide">
-              <h2>レポートの見方</h2>
-              <p>このレポートは、JavaScript ファイルの各行が実際に実行されたかどうかを記録したカバレッジレポートです。<br>
-              スクリプト名をクリックすると、行ごとの実行状況を色分け表示で確認できます。</p>
-              <p><strong>カバレッジ率の計算式</strong><br>
-              <span class="formula">（実行済み行数 ＋ 部分実行行数 × 0.5）÷ 対象行数 × 100</span><br>
-              ※ 対象行数にはコメント・空行・宣言のみの行（対象外）は含みません。</p>
-              <table class="legend-table">
-                <tr>
-                  <td><span class="swatch" style="background:#c6efc6"></span><strong>実行済み</strong></td>
-                  <td>行内のすべてのブロックが実行された</td>
-                </tr>
-                <tr>
-                  <td><span class="swatch" style="background:#f0e8a0"></span><strong>部分実行</strong></td>
-                  <td>if / else など、実行された部分と未実行の部分が混在する（分岐の片側だけ通った場合など）</td>
-                </tr>
-                <tr>
-                  <td><span class="swatch" style="background:#f0c6c6"></span><strong>未実行</strong></td>
-                  <td>行内のコードが一度も実行されなかった</td>
-                </tr>
-                <tr>
-                  <td><span class="swatch" style="background:#e8e8e8;border-color:#ccc"></span><strong>対象外</strong></td>
-                  <td>コメント・空行・変数宣言のみの行など（カバレッジ計測の対象外）</td>
-                </tr>
-              </table>
-            </div>
-            """);
+        // レポートの見方・凡例セクションを出力する（HtmlTemplates 定数を使用して重複を避ける）
+        sb.AppendLine(HtmlTemplates.IndexPageGuide);
 
         // 全体カバレッジ率のサマリー行を出力する（小数点以下1桁で表示）
         sb.AppendLine($"<p>全体カバレッジ: <strong>{overallPct:F1}%</strong>（実行済み {totalCovered} 行、部分実行 {totalPartial} 行 / 対象 {totalLines} 行）</p>");
