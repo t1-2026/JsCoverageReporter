@@ -1891,4 +1891,54 @@ public class CoverageMapTests
         Assert.Equal(0, map[30]); // ';'
         Assert.Equal(0, map[31]); // ' '
     }
+
+    // -----------------------------------------------------------------------
+    // Issue 4 — テンプレートリテラル内の未実行関数補正
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// テンプレートリテラルの ${ } 内に定義された未実行関数が
+    /// カバレッジ対象外（-1）ではなく未実行（0）としてマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledFunctionInsideTemplateLiteral_MarkedAsUncovered()
+    {
+        // `${ function foo() { } }`
+        //  0 12           3  4 56
+        //  0123456789012345678901234
+        // ${ から function foo() { } が始まる
+        const string source = "`${ function foo() { } }`";
+        //                     0123456789012345678901234
+        //                     function at 4, { at 19, } at 21
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // function キーワードが 0（未実行）になっているか確認する
+        Assert.Equal(0, map[4]);  // 'f' of function
+        Assert.Equal(0, map[19]); // '{' of function body
+        Assert.Equal(0, map[21]); // '}'
+    }
+
+    /// <summary>
+    /// ${ } 内の関数本体にテンプレートリテラルが含まれる場合でも
+    /// FindMatchingBrace + ScanRange が正しく動作することを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledFunctionInsideTemplateWithNestedTemplate_MarkedAsUncovered()
+    {
+        // `${ function foo() { return `${x}`; } }`
+        //  0 12           3          4       5
+        //  01234567890123456789012345678901234567890
+        // function at 4, outer { at 19, inner template at 28-33, outer } at 35
+        const string source = "`${ function foo() { return `${x}`; } }`";
+        //                     0         1         2         3         4
+        //                     0123456789012345678901234567890123456789 0
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // function キーワードが 0（未実行）になっているか確認する
+        Assert.Equal(0, map[4]);  // 'f' of function
+        // 関数の閉じ括弧も 0（未実行）になっているか確認する
+        Assert.Equal(0, map[36]); // '}'（外側の関数の閉じ括弧）
+    }
 }

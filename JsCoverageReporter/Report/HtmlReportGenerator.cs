@@ -128,83 +128,90 @@ internal class HtmlReportGenerator
 
     /// <summary>
     /// V8 の遅延コンパイルにより未実行関数がカバレッジデータに含まれなかった場合の補正処理。
-    /// ソースコードを走査して function キーワードで始まる関数宣言を検出し、
-    /// カバレッジ対象外（-1）のままになっている関数本体全体を未実行（0）としてマークする。
-    /// 文字列・コメント・テンプレートリテラルの中に現れる function は正しく無視する。
+    /// ソースコード全体を ScanRange でスキャンして未実行関数本体を 0（未実行）としてマークする。
+    /// テンプレートリテラルの ${ } 内も再帰的にスキャンするため、
+    /// そこに定義された関数も正しく補正される。
     /// </summary>
     /// <param name="source">スクリプトのソースコード全文</param>
     /// <param name="map">BuildCoverageMap で作成したカバレッジマップ（内容を書き換える）</param>
     internal static void MarkUncalledFunctionBodiesAsUncovered(string source, int[] map)
     {
-        int len = source.Length;
-        int i = 0;
+        // ソースコード全体をスキャンして未実行関数本体をマークする
+        ScanRange(source, map, 0, source.Length);
+    }
 
-        // ソースコード全体を1文字ずつ走査する
-        while (i < len)
+    /// <summary>
+    /// ソースコードの指定範囲 [start, end) をスキャンして未実行関数本体を探し、
+    /// カバレッジ対象外（-1）の部分を未実行（0）としてマークする。
+    /// テンプレートリテラルの ${ } 内は FindMatchingBrace で対応する } を見つけ、
+    /// その中を再帰的にスキャンすることで内側の function キーワードも検出できる。
+    /// </summary>
+    /// <param name="source">スクリプトのソースコード全文</param>
+    /// <param name="map">BuildCoverageMap で作成したカバレッジマップ（内容を書き換える）</param>
+    /// <param name="start">スキャン開始インデックス（含む）</param>
+    /// <param name="end">スキャン終了インデックス（含まない）</param>
+    private static void ScanRange(string source, int[] map, int start, int end)
+    {
+        int i = start;
+
+        while (i < end)
         {
             char c = source[i];
 
             // 単一引用符の文字列をスキップする（中の function は無視する）
-            if (c == '\'')
-            {
-                i++;
-                while (i < len && source[i] != '\'')
-                {
-                    // バックスラッシュによるエスケープシーケンスの次の文字を読み飛ばす
-                    if (source[i] == '\\') { i++; }
-                    i++;
-                }
-                i++; // 閉じ引用符をスキップする
-                continue;
-            }
+            if (c == '\'') { i = SkipSingleQuotedString(source, i); continue; }
 
             // 二重引用符の文字列をスキップする（中の function は無視する）
-            if (c == '"')
-            {
-                i++;
-                while (i < len && source[i] != '"')
-                {
-                    // バックスラッシュによるエスケープシーケンスの次の文字を読み飛ばす
-                    if (source[i] == '\\') { i++; }
-                    i++;
-                }
-                i++; // 閉じ引用符をスキップする
-                continue;
-            }
+            if (c == '"') { i = SkipDoubleQuotedString(source, i); continue; }
 
-            // テンプレートリテラルをスキップする（${ } の中はネスト深さで処理する）
+            // テンプレートリテラルをスキップし、${ } の中は再帰スキャンする
             if (c == '`')
             {
-                i++;
-                int depth = 0;
-                while (i < len)
+                i++; // 開き ` をスキップする
+                while (i < end)
                 {
                     char t = source[i];
-                    // バックスラッシュによるエスケープをスキップする
+                    // バックスラッシュエスケープの次の文字を読み飛ばす
                     if (t == '\\') { i += 2; continue; }
-                    // テンプレートリテラルの終端（${ の外側のみ）
-                    if (t == '`' && depth == 0) { i++; break; }
-                    // ${ でネストが1段深くなる
-                    if (t == '$' && i + 1 < len && source[i + 1] == '{') { depth++; i += 2; continue; }
-                    // } でネストが1段浅くなる
-                    if (t == '}' && depth > 0) { depth--; }
+                    // 閉じ ` でテンプレートリテラル終了
+                    if (t == '`') { i++; break; }
+                    // ${ を発見したら、対応する } を FindMatchingBrace で探して再帰スキャンする
+                    if (t == '$' && i + 1 < source.Length && source[i + 1] == '{')
+                    {
+                        int braceStart = i + 1; // { の位置
+                        int braceEnd = FindMatchingBrace(source, braceStart);
+                        if (braceEnd > braceStart)
+                        {
+                            // ${ と } の間（braceStart+1 から braceEnd-2）を再帰的にスキャンする
+                            // FindMatchingBrace は } の直後の位置を返すため braceEnd-1 が } の位置
+                            // よって content は braceStart+1 から braceEnd-2（= braceEnd-1 を含まない）
+                            ScanRange(source, map, braceStart + 1, braceEnd - 1);
+                            i = braceEnd; // } の直後へ進む
+                        }
+                        else
+                        {
+                            // 対応する } が見つからない場合は ${ の2文字をスキップして続ける
+                            i += 2;
+                        }
+                        continue;
+                    }
                     i++;
                 }
                 continue;
             }
 
             // 行コメント // をスキップする（改行まで読み飛ばす）
-            if (c == '/' && i + 1 < len && source[i + 1] == '/')
+            if (c == '/' && i + 1 < end && source[i + 1] == '/')
             {
-                while (i < len && source[i] != '\n') { i++; }
+                while (i < end && source[i] != '\n') { i++; }
                 continue;
             }
 
             // ブロックコメント /* */ をスキップする
-            if (c == '/' && i + 1 < len && source[i + 1] == '*')
+            if (c == '/' && i + 1 < end && source[i + 1] == '*')
             {
                 i += 2;
-                while (i + 1 < len && !(source[i] == '*' && source[i + 1] == '/')) { i++; }
+                while (i + 1 < end && !(source[i] == '*' && source[i + 1] == '/')) { i++; }
                 i += 2; // */ の2文字をスキップする
                 continue;
             }
@@ -212,128 +219,91 @@ internal class HtmlReportGenerator
             // 正規表現リテラルをスキップして function キーワードを誤検出しないようにする
             if (c == '/' && IsRegexStart(source, i))
             {
-                // 正規表現リテラル全体をスキップして直後の位置へ進む
                 i = SkipRegexLiteral(source, i);
                 continue;
             }
 
             // アロー関数 => の検出（ブロック本体 {} を持つ場合のみ）
-            if (c == '=' && i + 1 < len && source[i + 1] == '>')
+            if (c == '=' && i + 1 < end && source[i + 1] == '>')
             {
                 // => の開始位置を記録する
                 int arrowStart = i;
-
                 // => の後の空白をスキップする
                 int afterArrow = i + 2;
-                while (afterArrow < len && char.IsWhiteSpace(source[afterArrow]))
+                while (afterArrow < end && char.IsWhiteSpace(source[afterArrow])) { afterArrow++; }
+                // 次の文字が { であり、このアロー関数がカバレッジデータにない場合のみ処理する
+                if (afterArrow < end && source[afterArrow] == '{' && map[arrowStart] == -1)
                 {
-                    afterArrow++;
-                }
-
-                // 次の文字が { でなければブロック本体ではないのでスキップする（例: x => x + 1）
-                if (afterArrow < len && source[afterArrow] == '{')
-                {
-                    // このアロー関数がカバレッジデータにない（未実行）場合のみ処理する
-                    if (map[arrowStart] == -1)
+                    int braceEnd = FindMatchingBrace(source, afterArrow);
+                    if (braceEnd > afterArrow)
                     {
-                        // 対応する } を探す
-                        int braceEnd = FindMatchingBrace(source, afterArrow);
-                        if (braceEnd > afterArrow)
+                        // => から } まで（braceEnd の直前）を未実行（0）にマークする
+                        for (int m = arrowStart; m < braceEnd; m++)
                         {
-                            // => から } までを未実行（0）にマークする
-                            // braceEnd は FindMatchingBrace が返す「} の次の位置」なので
-                            // m < braceEnd とすることで } 自体までをマークし、次の文字を含めない
-                            for (int m = arrowStart; m < braceEnd; m++)
-                            {
-                                if (map[m] == -1)
-                                {
-                                    map[m] = 0;
-                                }
-                            }
+                            if (map[m] == -1) { map[m] = 0; }
                         }
                     }
                 }
-
                 // => の 2 文字目（>）をスキップして次の文字へ進む
-                i++;
+                i += 2;
+                continue;
             }
 
             // function キーワードの検出を試みる（'f' 以外の文字は確実にスキップする）
-            if (c == 'f' && i + 8 <= len && source.Substring(i, 8) == "function")
+            if (c == 'f' && i + 8 <= end && source.Substring(i, 8) == "function")
             {
                 // function の前が識別子文字でないことを確認する（別の単語の一部を誤検出しない）
                 bool prevOk = i == 0 || !IsIdentifierChar(source[i - 1]);
                 // function の直後が識別子文字でないことを確認する（例: functionCall を除外する）
-                bool nextOk = i + 8 >= len || !IsIdentifierChar(source[i + 8]);
+                bool nextOk = i + 8 >= end || !IsIdentifierChar(source[i + 8]);
 
                 if (prevOk && nextOk && map[i] == -1)
                 {
-                    // このオフセットは V8 がカバレッジデータに含めなかった関数と判断する
                     int funcStart = i;
 
                     // async function の場合、async キーワードも未実行（赤）としてマークする
-                    // function キーワードの直前を逆方向に走査して async を探す
                     int scanBack = funcStart - 1;
-                    // function キーワードの前の空白をスキップする
-                    while (scanBack >= 0 && char.IsWhiteSpace(source[scanBack]))
-                    {
-                        scanBack--;
-                    }
-                    // 5文字以上あり、その位置の5文字が "async" であるか確認する
+                    while (scanBack >= 0 && char.IsWhiteSpace(source[scanBack])) { scanBack--; }
                     if (scanBack >= 4)
                     {
                         string candidate = source.Substring(scanBack - 4, 5);
                         if (candidate == "async")
                         {
-                            // async の前がidentifier文字でないことを確認する（notasync などを除外）
                             bool isStandaloneAsync;
                             if (scanBack - 5 < 0)
                             {
-                                // ファイル先頭なので前に文字がない → standalone async
                                 isStandaloneAsync = true;
                             }
                             else
                             {
-                                // 直前の文字が識別子文字でなければ standalone async
                                 isStandaloneAsync = !IsIdentifierChar(source[scanBack - 5]);
                             }
                             if (isStandaloneAsync)
                             {
-                                // async キーワードの開始位置（scanBack - 4）から5文字を 0 にマークする
                                 int asyncStart = scanBack - 4;
                                 for (int a = asyncStart; a <= scanBack; a++)
                                 {
-                                    if (map[a] == -1)
-                                    {
-                                        map[a] = 0;
-                                    }
+                                    if (map[a] == -1) { map[a] = 0; }
                                 }
                             }
                         }
                     }
 
                     int j = i + 8; // "function" の次の文字へ進む
-
                     // ジェネレータ関数の * をスキップする
-                    if (j < len && source[j] == '*') { j++; }
+                    if (j < end && source[j] == '*') { j++; }
                     // 空白をスキップする
-                    while (j < len && char.IsWhiteSpace(source[j])) { j++; }
+                    while (j < end && char.IsWhiteSpace(source[j])) { j++; }
                     // 関数名（識別子）をスキップする（無名関数の場合はスキップなし）
-                    while (j < len && IsIdentifierChar(source[j])) { j++; }
+                    while (j < end && IsIdentifierChar(source[j])) { j++; }
                     // 空白をスキップする
-                    while (j < len && char.IsWhiteSpace(source[j])) { j++; }
-
+                    while (j < end && char.IsWhiteSpace(source[j])) { j++; }
                     // パラメータリスト ( ... ) をスキップする
-                    if (j < len && source[j] == '(')
-                    {
-                        j = SkipBalancedParens(source, j);
-                    }
-
+                    if (j < end && source[j] == '(') { j = SkipBalancedParens(source, j); }
                     // 空白をスキップする
-                    while (j < len && char.IsWhiteSpace(source[j])) { j++; }
+                    while (j < end && char.IsWhiteSpace(source[j])) { j++; }
 
-                    // 関数本体 { ... } の終端位置を探す
-                    if (j < len && source[j] == '{')
+                    if (j < end && source[j] == '{')
                     {
                         int funcEnd = FindMatchingBrace(source, j);
                         if (funcEnd > 0)
@@ -341,12 +311,8 @@ internal class HtmlReportGenerator
                             // 関数本体内でカバレッジ対象外(-1)の部分を未実行(0)としてマークする
                             for (int k = funcStart; k < funcEnd; k++)
                             {
-                                if (map[k] == -1)
-                                {
-                                    map[k] = 0;
-                                }
+                                if (map[k] == -1) { map[k] = 0; }
                             }
-                            // 関数本体をスキップして次の走査位置へ進む
                             i = funcEnd;
                             continue;
                         }
@@ -355,23 +321,13 @@ internal class HtmlReportGenerator
             }
 
             // メソッド短縮構文（例: greet() { }）の検出
-            // identifier の先頭にいる場合（前の文字がidentifier文字でない）に処理する
             bool prevIsIdentChar;
-            if (i == 0)
-            {
-                // ファイル先頭なので直前に文字がない → identifier 先頭とみなす
-                prevIsIdentChar = false;
-            }
-            else
-            {
-                // 直前の文字が識別子文字かどうかを確認する
-                prevIsIdentChar = IsIdentifierChar(source[i - 1]);
-            }
+            if (i == 0) { prevIsIdentChar = false; }
+            else { prevIsIdentChar = IsIdentifierChar(source[i - 1]); }
 
             if (IsIdentifierChar(c) && !prevIsIdentChar)
             {
-                // メソッド短縮構文の検出と未実行マークをヘルパーメソッドに委譲する
-                TryMarkMethodShorthand(source, map, i, len);
+                TryMarkMethodShorthand(source, map, i, end);
             }
 
             i++;
