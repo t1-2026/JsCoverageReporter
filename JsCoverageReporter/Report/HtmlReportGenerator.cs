@@ -967,7 +967,7 @@ internal class HtmlReportGenerator
 
         // インデックスページに表示するサマリー行のリスト
         var summaryRows = new List<(
-            IReadOnlyList<(string pageUrl, string tabFilename)> tabs,
+            IReadOnlyList<(string label, string pageUrl, string tabFilename)> tabs,
             string url, int covered, int partial, int total, string mergedFilename)>();
 
         int i = 0;
@@ -990,24 +990,30 @@ internal class HtmlReportGenerator
             // 合成ページのファイル名（全タブの OR 合成カバレッジを表示する）
             var mergedFilename = $"script-{i}.html";
 
-            // 合成ページに表示するページ URL リスト（重複なし・空文字除外）
-            var pageUrls = new List<string>();
+            // 合成ページに表示する画面情報リスト（重複なし・URL 空文字除外）
+            // 画面ラベルは "画面N"（N = タブインデックス + 1）
+            var pageInfos = new List<(string label, string url)>();
+            var seenPageInfos = new HashSet<(string, string)>();
             foreach (var s in group)
             {
-                if (!string.IsNullOrEmpty(s.Page.Url) && !pageUrls.Contains(s.Page.Url))
+                string screenLabel = $"画面{s.Page.Index + 1}";
+                if (!string.IsNullOrEmpty(s.Page.Url))
                 {
-                    pageUrls.Add(s.Page.Url);
+                    if (seenPageInfos.Add((screenLabel, s.Page.Url)))
+                    {
+                        pageInfos.Add((screenLabel, s.Page.Url));
+                    }
                 }
             }
 
             // 合成カバレッジの詳細ページを生成する
             File.WriteAllText(
                 Path.Combine(scriptsDir, mergedFilename),
-                BuildScriptPage(pageUrls, scriptUrl, mergedLines),
+                BuildScriptPage(pageInfos, scriptUrl, mergedLines),
                 Encoding.UTF8);
 
             // タブ情報リストを構築する（展開 UI 用）
-            var tabs = new List<(string pageUrl, string tabFilename)>();
+            var tabs = new List<(string label, string pageUrl, string tabFilename)>();
             if (group.Count > 1)
             {
                 // 複数タブの場合: 各タブ別の詳細ページも生成する
@@ -1016,29 +1022,31 @@ internal class HtmlReportGenerator
                     var script = group[g];
                     // タブ別ページのファイル名（例: script-0-tab2.html）
                     var tabFilename = $"script-{i}-tab{script.Page.Index}.html";
+                    string tabLabel = $"画面{script.Page.Index + 1}";
 
                     // このタブ単独のカバレッジマップを生成する
                     var tabMap = BuildCoverageMap(script.Source, script.Functions);
                     var tabLines = BuildLines(script.Source, tabMap);
 
-                    // タブ別詳細ページを生成する
-                    var tabPageUrls = new List<string>();
+                    // タブ別詳細ページを生成する（このタブの画面ラベルと URL を渡す）
+                    var tabPageInfos = new List<(string label, string url)>();
                     if (!string.IsNullOrEmpty(script.Page.Url))
                     {
-                        tabPageUrls.Add(script.Page.Url);
+                        tabPageInfos.Add((tabLabel, script.Page.Url));
                     }
                     File.WriteAllText(
                         Path.Combine(scriptsDir, tabFilename),
-                        BuildScriptPage(tabPageUrls, scriptUrl, tabLines),
+                        BuildScriptPage(tabPageInfos, scriptUrl, tabLines),
                         Encoding.UTF8);
 
-                    tabs.Add((script.Page.Url, tabFilename));
+                    tabs.Add((tabLabel, script.Page.Url, tabFilename));
                 }
             }
             else
             {
                 // 単一タブの場合: タブ別ページは合成ページと同じ（別ファイルは生成しない）
-                tabs.Add((group[0].Page.Url, mergedFilename));
+                string singleLabel = $"画面{group[0].Page.Index + 1}";
+                tabs.Add((singleLabel, group[0].Page.Url, mergedFilename));
             }
 
             // 合成データの行数を集計する
@@ -1075,11 +1083,11 @@ internal class HtmlReportGenerator
     /// <summary>
     /// スクリプト詳細ページ（行ごとに色付けされたソースコード表示）のHTMLを生成する。
     /// </summary>
-    /// <param name="pageUrls">このスクリプトが読み込まれたページURLのリスト（複数タブの場合は複数）</param>
+    /// <param name="pageInfos">このスクリプトが読み込まれた画面情報のリスト（label="画面N", url=ページURL）</param>
     /// <param name="scriptUrl">スクリプトのURL（ページタイトルと見出しに使用）</param>
     /// <param name="lines">BuildLines が返した行データのリスト</param>
     /// <returns>スクリプト詳細ページの完全なHTML文字列</returns>
-    internal static string BuildScriptPage(IReadOnlyList<string> pageUrls, string scriptUrl, List<LineData> lines)
+    internal static string BuildScriptPage(IReadOnlyList<(string label, string url)> pageInfos, string scriptUrl, List<LineData> lines)
     {
         // HTMLを構築するための文字列ビルダー
         var sb = new StringBuilder();
@@ -1113,30 +1121,47 @@ internal class HtmlReportGenerator
             </style></head><body>
             """);
 
-        // ページ URL の表示文字列を決める
-        string pageUrlDisplay;
-        if (pageUrls.Count == 0)
+        // 画面ラベルと URL の表示文字列を決める
+        // 形式: "画面N (URL)" — URL が空の場合は "画面N" のみ
+        string pageDisplay;
+        if (pageInfos.Count == 0)
         {
-            // ページ URL が取得できなかった場合のフォールバック表示
-            pageUrlDisplay = "(不明)";
+            // 画面情報が取得できなかった場合のフォールバック表示
+            pageDisplay = "(不明)";
         }
-        else if (pageUrls.Count == 1)
+        else if (pageInfos.Count == 1)
         {
-            // 1ページの場合はそのまま表示する（XSS 対策のため HTML エスケープする）
-            pageUrlDisplay = HtmlEncode(pageUrls[0]);
+            // 1画面の場合: "画面N (URL)" または URL なしなら "画面N"
+            string lbl = HtmlEncode(pageInfos[0].label);
+            if (string.IsNullOrEmpty(pageInfos[0].url))
+            {
+                pageDisplay = lbl;
+            }
+            else
+            {
+                pageDisplay = $"{lbl} ({HtmlEncode(pageInfos[0].url)})";
+            }
         }
         else
         {
-            // 複数ページの場合はカンマ区切りで表示する
-            var encodedUrls = new List<string>();
-            foreach (var u in pageUrls)
+            // 複数画面の場合: "画面N (URL), 画面M (URL)" カンマ区切り
+            var parts = new List<string>();
+            foreach (var (lbl, u) in pageInfos)
             {
-                encodedUrls.Add(HtmlEncode(u));
+                string encodedLbl = HtmlEncode(lbl);
+                if (string.IsNullOrEmpty(u))
+                {
+                    parts.Add(encodedLbl);
+                }
+                else
+                {
+                    parts.Add($"{encodedLbl} ({HtmlEncode(u)})");
+                }
             }
-            pageUrlDisplay = string.Join(", ", encodedUrls);
+            pageDisplay = string.Join(", ", parts);
         }
-        // ページ URL とスクリプト URL をページ見出しとして出力する
-        sb.AppendLine($"<h1>{pageUrlDisplay} / {HtmlEncode(scriptUrl)}</h1>");
+        // 画面情報とスクリプト URL をページ見出しとして出力する
+        sb.AppendLine($"<h1>{pageDisplay} / {HtmlEncode(scriptUrl)}</h1>");
 
         // 各色の意味を説明する凡例バーを出力する
         sb.AppendLine("""
@@ -1197,7 +1222,7 @@ internal class HtmlReportGenerator
     /// <param name="rows">各スクリプトのサマリー情報のリスト</param>
     /// <returns>インデックスページの完全なHTML文字列</returns>
     internal static string BuildIndexPage(
-        List<(IReadOnlyList<(string pageUrl, string tabFilename)> tabs,
+        List<(IReadOnlyList<(string label, string pageUrl, string tabFilename)> tabs,
               string url, int covered, int partial, int total, string mergedFilename)> rows)
     {
         // 全スクリプトのカバー済み行数の合計
@@ -1351,40 +1376,49 @@ internal class HtmlReportGenerator
             }
 
             // ページ URL セルの表示を決める
-            // タブが1件: ページ URL を直接表示する
+            // タブが1件: "画面N — URL" を直接表示する
             // タブが2件以上: <details>/<summary> で展開表示する
             string pageUrlCell;
             if (tabs.Count <= 1)
             {
-                // 単一タブ: URL をそのままテキストとして表示する（XSS 対策）
-                string singleUrl;
-                if (tabs.Count == 0 || string.IsNullOrEmpty(tabs[0].pageUrl))
+                // 単一タブ: "画面N — URL" を直接表示する（XSS 対策のため HTML エスケープする）
+                string singleDisplay;
+                if (tabs.Count == 0)
                 {
-                    singleUrl = "(不明)";
+                    singleDisplay = "(不明)";
                 }
                 else
                 {
-                    singleUrl = HtmlEncode(tabs[0].pageUrl);
+                    string lbl = HtmlEncode(tabs[0].label);
+                    if (string.IsNullOrEmpty(tabs[0].pageUrl))
+                    {
+                        singleDisplay = lbl;
+                    }
+                    else
+                    {
+                        singleDisplay = $"{lbl} — {HtmlEncode(tabs[0].pageUrl)}";
+                    }
                 }
-                pageUrlCell = singleUrl;
+                pageUrlCell = singleDisplay;
             }
             else
             {
                 // 複数タブ: <details>/<summary> で展開できるようにする
                 var sbDetails = new StringBuilder();
                 sbDetails.Append($"<details><summary>複数ページ ({tabs.Count})</summary><ul>");
-                foreach (var (pageUrl, tabFilename) in tabs)
+                foreach (var (label, pageUrl, tabFilename) in tabs)
                 {
-                    string displayUrl;
+                    // リンクテキストは "画面N — URL" 形式（URL が空の場合は画面ラベルのみ）
+                    string displayText;
                     if (string.IsNullOrEmpty(pageUrl))
                     {
-                        displayUrl = "(不明)";
+                        displayText = HtmlEncode(label);
                     }
                     else
                     {
-                        displayUrl = HtmlEncode(pageUrl);
+                        displayText = $"{HtmlEncode(label)} — {HtmlEncode(pageUrl)}";
                     }
-                    sbDetails.Append($"<li><a href=\"scripts/{tabFilename}\">{displayUrl}</a></li>");
+                    sbDetails.Append($"<li><a href=\"scripts/{tabFilename}\">{displayText}</a></li>");
                 }
                 sbDetails.Append("</ul></details>");
                 pageUrlCell = sbDetails.ToString();
