@@ -210,6 +210,42 @@ internal static class ActionRunner
                     await page.DblClickAsync(action.Selector, new PageDblClickOptions { Timeout = timeoutMs });
                     break;
 
+                // 要素またはページをスクロールする
+                case "scroll":
+                    // selector が指定されている場合はその要素をビューポートにスクロールする
+                    if (action.Selector is not null)
+                    {
+                        await page.Locator(action.Selector).ScrollIntoViewIfNeededAsync(
+                            new LocatorScrollIntoViewIfNeededOptions { Timeout = timeoutMs });
+                    }
+                    else
+                    {
+                        // selector がない場合は x/y のデルタ量だけページをホイールスクロールする
+                        // X または Y が null の場合は 0 として扱う
+                        // x/y が null の場合は 0 として扱う
+                        int deltaX;
+                        if (action.X == null)
+                        {
+                            deltaX = 0;
+                        }
+                        else
+                        {
+                            deltaX = action.X.Value;
+                        }
+                        int deltaY;
+                        if (action.Y == null)
+                        {
+                            deltaY = 0;
+                        }
+                        else
+                        {
+                            deltaY = action.Y.Value;
+                        }
+                        // window.scrollBy を使うとヘッドレスモードでも確実にスクロール位置が変わる
+                        await page.EvaluateAsync($"() => window.scrollBy({deltaX}, {deltaY})");
+                    }
+                    break;
+
                 // 未知のアクション種別はスキップして警告する
                 default:
                     Console.Error.WriteLine($"[Warning] Unknown action type '{action.Type}' — skipping.");

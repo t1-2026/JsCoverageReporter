@@ -131,7 +131,7 @@ internal class ScenarioAction
 {
     /// <summary>
     /// アクションの種類を示す文字列。
-    /// 使用可能な値: "click", "fill", "navigate", "waitForSelector", "hover", "press", "wait", "select", "check", "uncheck", "dblclick"
+    /// 使用可能な値: "click", "fill", "navigate", "waitForSelector", "hover", "press", "wait", "select", "check", "uncheck", "dblclick", "scroll"
     /// </summary>
     [JsonPropertyName("type")]
     public string Type { get; set; } = "";
@@ -161,4 +161,18 @@ internal class ScenarioAction
     /// </summary>
     [JsonPropertyName("milliseconds")]
     public int? Milliseconds { get; set; }
+
+    /// <summary>
+    /// 水平スクロール量（ピクセル）。scroll アクションでセレクターを指定しない場合に使用する。
+    /// 正の値で右方向、負の値で左方向にスクロールする。省略時は 0 として扱う。
+    /// </summary>
+    [JsonPropertyName("x")]
+    public int? X { get; set; }
+
+    /// <summary>
+    /// 垂直スクロール量（ピクセル）。scroll アクションでセレクターを指定しない場合に使用する。
+    /// 正の値で下方向、負の値で上方向にスクロールする。省略時は 0 として扱う。
+    /// </summary>
+    [JsonPropertyName("y")]
+    public int? Y { get; set; }
 }

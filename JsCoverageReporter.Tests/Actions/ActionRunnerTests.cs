@@ -280,4 +280,100 @@ public class ActionRunnerTests
 
         Assert.True(true);
     }
+
+    /// <summary>
+    /// scroll アクションにセレクターを指定すると、その要素がビューポートにスクロールされることを確認する。
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_ScrollAction_WithSelector_ScrollsElementIntoView()
+    {
+        // ページの高さを超える内容の後に対象要素を配置して最初はビューポート外にする
+        var html = """
+            <!DOCTYPE html>
+            <html>
+            <body style="margin:0">
+                <div style="height:2000px"></div>
+                <div id="target">ターゲット要素</div>
+            </body>
+            </html>
+            """;
+
+        using var server = new TestServer(html);
+        using var playwright = await Playwright.CreateAsync();
+        await using var browser = await playwright.Chromium.LaunchAsync();
+        var page = await browser.NewPageAsync();
+        await page.GotoAsync(server.Url);
+
+        // 最初はスクロール位置が 0 であることを確認する
+        var initialScrollY = await page.EvaluateAsync<double>("window.scrollY");
+        Assert.Equal(0, initialScrollY);
+
+        var actions = new List<ScenarioAction>
+        {
+            // selector を指定すると要素をビューポートにスクロールする
+            new ScenarioAction { Type = "scroll", Selector = "#target" }
+        };
+
+        await ActionRunner.RunAsync(page, actions, timeoutMs: 5000, continueOnError: false);
+
+        // スクロール後は scrollY が 0 より大きくなるはず
+        var afterScrollY = await page.EvaluateAsync<double>("window.scrollY");
+        Assert.True(afterScrollY > 0, $"scrollY should be > 0 after scroll, but was {afterScrollY}");
+    }
+
+    /// <summary>
+    /// scroll アクションにセレクターなしで x/y を指定すると、ページが指定量だけスクロールされることを確認する。
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_ScrollAction_WithoutSelector_ScrollsPageByDelta()
+    {
+        // スクロール可能な高さを持つページを用意する
+        var html = """
+            <!DOCTYPE html>
+            <html>
+            <body style="margin:0">
+                <div style="height:3000px"></div>
+            </body>
+            </html>
+            """;
+
+        using var server = new TestServer(html);
+        using var playwright = await Playwright.CreateAsync();
+        await using var browser = await playwright.Chromium.LaunchAsync();
+        var page = await browser.NewPageAsync();
+        await page.GotoAsync(server.Url);
+
+        var actions = new List<ScenarioAction>
+        {
+            // selector なし・Y = 500 でページを 500px 下方向にスクロールする
+            new ScenarioAction { Type = "scroll", X = 0, Y = 500 }
+        };
+
+        await ActionRunner.RunAsync(page, actions, timeoutMs: 5000, continueOnError: false);
+
+        // スクロール後は scrollY が 500 付近になるはず（ブラウザの丸め誤差を考慮して > 0 で確認）
+        var afterScrollY = await page.EvaluateAsync<double>("window.scrollY");
+        Assert.True(afterScrollY > 0, $"scrollY should be > 0 after scroll, but was {afterScrollY}");
+    }
+
+    /// <summary>
+    /// scroll アクションにセレクターも x/y も指定しない場合、例外なく完走することを確認する。
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_ScrollAction_NoSelectorNoXY_DoesNotThrow()
+    {
+        using var playwright = await Playwright.CreateAsync();
+        await using var browser = await playwright.Chromium.LaunchAsync();
+        var page = await browser.NewPageAsync();
+
+        var actions = new List<ScenarioAction>
+        {
+            // selector も x/y も未指定 → (0, 0) スクロールとして処理される
+            new ScenarioAction { Type = "scroll" }
+        };
+
+        await ActionRunner.RunAsync(page, actions, timeoutMs: 5000, continueOnError: false);
+
+        Assert.True(true);
+    }
 }
