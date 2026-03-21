@@ -1584,14 +1584,20 @@ internal class HtmlReportGenerator
             return hostPortion;
         }
 
-        // 最後の '/' 以降をファイル名として返す
+        // 最後の '/' 以降をファイル名として取り出す
         int lastSlash = path.LastIndexOf('/');
+        string rawName;
         if (lastSlash >= 0 && lastSlash < path.Length - 1)
         {
-            return path.Substring(lastSlash + 1);
+            rawName = path.Substring(lastSlash + 1);
+        }
+        else
+        {
+            // パスにスラッシュがない場合は path をそのまま使う
+            rawName = path;
         }
 
-        // パスにスラッシュがない場合は path をそのまま返す
-        return path;
+        // パーセントエンコード（%20 など）をデコードして返す
+        return Uri.UnescapeDataString(rawName);
     }
 }

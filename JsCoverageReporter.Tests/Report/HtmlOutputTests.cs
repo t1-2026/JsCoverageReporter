@@ -1268,6 +1268,39 @@ public class HtmlOutputTests
         Assert.False(string.IsNullOrEmpty(result));
         Assert.Equal("example.com", result);
     }
+
+    /// <summary>
+    /// パーセントエンコードされたスペース（%20）を含む URL でデコードされたファイル名を返すことを確認する。
+    /// </summary>
+    [Fact]
+    public void GetFileName_UrlWithPercentEncodedSpace_ReturnsDecodedFilename()
+    {
+        // %20 → スペースにデコードされる
+        var result = HtmlReportGenerator.GetFileName("http://example.com/my%20app.js");
+        Assert.Equal("my app.js", result);
+    }
+
+    /// <summary>
+    /// パーセントエンコードされた日本語ファイル名を含む URL でデコードされたファイル名を返すことを確認する。
+    /// </summary>
+    [Fact]
+    public void GetFileName_UrlWithPercentEncodedJapanese_ReturnsDecodedFilename()
+    {
+        // %E3%82%A2%E3%83%97%E3%83%AA → アプリ
+        var result = HtmlReportGenerator.GetFileName("http://example.com/scripts/%E3%82%A2%E3%83%97%E3%83%AA.js");
+        Assert.Equal("アプリ.js", result);
+    }
+
+    /// <summary>
+    /// パーセントエンコードされたプラス記号（%2B）を含む URL でデコードされたファイル名を返すことを確認する。
+    /// </summary>
+    [Fact]
+    public void GetFileName_UrlWithPercentEncodedPlus_ReturnsDecodedFilename()
+    {
+        // %2B → + にデコードされる
+        var result = HtmlReportGenerator.GetFileName("http://example.com/lib%2Butils.js");
+        Assert.Equal("lib+utils.js", result);
+    }
 }
 
 public class BuildLinesEdgeCaseTests
