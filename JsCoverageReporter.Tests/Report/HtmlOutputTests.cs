@@ -1348,5 +1348,219 @@ public class BuildLinesEdgeCaseTests
         // 'a'=covered, 'b'=uncovered → Partial
         Assert.Equal(LineCoverageStatus.Partial, lines[0].Status);
     }
+
+    /// <summary>
+    /// CRLF 改行を含む複数行のソースで、2行目以降のカバレッジインデックスが
+    /// 正確に計算されることを確認する。
+    /// \r を含む rawLine の Length が offset 計算に使われるため、
+    /// 2行目の文字が正しい map インデックスで参照されることを保証する。
+    /// </summary>
+    [Fact]
+    public void BuildLines_CrlfMultipleLines_SecondLineCoverageCorrect()
+    {
+        // "a\r\nfoo\r\n" — CRLF 改行の2行
+        // source インデックス: a=0, \r=1, \n=2(分割), f=3, o=4, o=5, \r=6, \n=7(末尾)
+        // map: a=1(covered), \r=1(skip), f=0, o=0, o=0, \r=0(skip)
+        const string source = "a\r\nfoo\r\n";
+        var map = new int[] { 1, 1, -1, 0, 0, 0, 0, -1 };
+
+        var lines = HtmlReportGenerator.BuildLines(source, map);
+
+        // 2行に分割されているか確認する（末尾の改行で余分な行が増えないこと）
+        Assert.Equal(2, lines.Count);
+        // 1行目（"a"）は実行済み（covered）になっているか確認する
+        Assert.Equal(LineCoverageStatus.Covered, lines[0].Status);
+        // 2行目（"foo"）は未実行（uncovered）になっているか確認する
+        // これが Covered になるなら offset ズレのバグがある
+        Assert.Equal(LineCoverageStatus.Uncovered, lines[1].Status);
+    }
+}
+
+/// <summary>
+/// HtmlReportGenerator.Generate メソッドの統合テスト群。
+/// 実際にファイルを生成し、出力ファイルの存在と内容を確認する。
+/// </summary>
+public class GenerateTests : IDisposable
+{
+    // テスト出力用の一時ディレクトリ（テスト終了後に削除する）
+    private readonly string _outputDir;
+
+    public GenerateTests()
+    {
+        _outputDir = Path.Combine(Path.GetTempPath(), "GenerateTests_" + Guid.NewGuid().ToString("N"));
+    }
+
+    public void Dispose()
+    {
+        if (Directory.Exists(_outputDir))
+        {
+            Directory.Delete(_outputDir, recursive: true);
+        }
+    }
+
+    // カバレッジデータなしのシンプルな ScriptCoverage を作るヘルパー
+    private static JsCoverageReporter.Coverage.ScriptCoverage MakeScript(
+        int tabIndex, string pageUrl, string scriptUrl, string source,
+        int covered = 0)
+    {
+        var ranges = new List<JsCoverageReporter.Coverage.CoverageRange>
+        {
+            new(0, source.Length, covered),
+        };
+        var functions = new List<JsCoverageReporter.Coverage.FunctionCoverage>
+        {
+            new("main", ranges),
+        };
+        var page = new JsCoverageReporter.Coverage.PageInfo(tabIndex, pageUrl);
+        return new JsCoverageReporter.Coverage.ScriptCoverage(page, scriptUrl, source, functions);
+    }
+
+    /// <summary>
+    /// カバレッジデータが空の場合でも index.html が生成されることを確認する。
+    /// </summary>
+    [Fact]
+    public void Generate_EmptyCoverages_CreatesIndexHtml()
+    {
+        var generator = new HtmlReportGenerator();
+
+        generator.Generate([], _outputDir);
+
+        // index.html が生成されているか確認する
+        string indexPath = Path.Combine(_outputDir, "index.html");
+        Assert.True(File.Exists(indexPath), "index.html が生成されていない");
+
+        // index.html の内容に「全体カバレッジ」という文字列が含まれているか確認する
+        string content = File.ReadAllText(indexPath);
+        Assert.Contains("全体カバレッジ", content);
+    }
+
+    /// <summary>
+    /// スクリプト1件の場合、index.html と scripts/script-0.html が生成されることを確認する。
+    /// </summary>
+    [Fact]
+    public void Generate_SingleScript_CreatesIndexAndScriptFile()
+    {
+        var script = MakeScript(0, "http://example.com/", "http://example.com/app.js",
+            "function foo() { return 1; }", covered: 1);
+
+        var generator = new HtmlReportGenerator();
+        generator.Generate([script], _outputDir);
+
+        // index.html が生成されているか確認する
+        Assert.True(File.Exists(Path.Combine(_outputDir, "index.html")));
+        // scripts/script-0.html が生成されているか確認する
+        Assert.True(File.Exists(Path.Combine(_outputDir, "scripts", "script-0.html")));
+
+        // index.html に app.js へのリンクが含まれているか確認する
+        string indexContent = File.ReadAllText(Path.Combine(_outputDir, "index.html"));
+        Assert.Contains("app.js", indexContent);
+        Assert.Contains("script-0.html", indexContent);
+    }
+
+    /// <summary>
+    /// スクリプトが複数件ある場合、件数分のスクリプトファイルが生成されることを確認する。
+    /// </summary>
+    [Fact]
+    public void Generate_MultipleScripts_CreatesMultipleScriptFiles()
+    {
+        var scripts = new[]
+        {
+            MakeScript(0, "http://example.com/", "http://example.com/app.js",   "var a = 1;", covered: 1),
+            MakeScript(0, "http://example.com/", "http://example.com/util.js",  "var b = 2;", covered: 0),
+            MakeScript(0, "http://example.com/", "http://example.com/extra.js", "var c = 3;", covered: 1),
+        };
+
+        var generator = new HtmlReportGenerator();
+        generator.Generate(scripts, _outputDir);
+
+        // 3件分のスクリプトファイルが生成されているか確認する
+        string scriptsDir = Path.Combine(_outputDir, "scripts");
+        Assert.True(File.Exists(Path.Combine(scriptsDir, "script-0.html")));
+        Assert.True(File.Exists(Path.Combine(scriptsDir, "script-1.html")));
+        Assert.True(File.Exists(Path.Combine(scriptsDir, "script-2.html")));
+
+        // index.html に 3件分のスクリプト名が含まれているか確認する
+        string indexContent = File.ReadAllText(Path.Combine(_outputDir, "index.html"));
+        Assert.Contains("app.js",   indexContent);
+        Assert.Contains("util.js",  indexContent);
+        Assert.Contains("extra.js", indexContent);
+    }
+
+    /// <summary>
+    /// 同一 URL のスクリプトが複数タブから収集された場合、合成ページとタブ別ページの
+    /// 両方が生成されることを確認する。
+    /// </summary>
+    [Fact]
+    public void Generate_SameScriptFromMultipleTabs_CreatesMergedAndTabFiles()
+    {
+        // 同じ URL "http://example.com/shared.js" が tab0 と tab1 から収集された
+        var tab0 = MakeScript(0, "http://example.com/page1", "http://example.com/shared.js",
+            "function shared() { return 1; }", covered: 1);
+        var tab1 = MakeScript(1, "http://example.com/page2", "http://example.com/shared.js",
+            "function shared() { return 1; }", covered: 0);
+
+        var generator = new HtmlReportGenerator();
+        generator.Generate([tab0, tab1], _outputDir);
+
+        string scriptsDir = Path.Combine(_outputDir, "scripts");
+
+        // 合成ページ（script-0.html）が生成されているか確認する
+        Assert.True(File.Exists(Path.Combine(scriptsDir, "script-0.html")),
+            "合成ページ script-0.html が生成されていない");
+
+        // タブ別ページ（script-0-tab0.html, script-0-tab1.html）が生成されているか確認する
+        Assert.True(File.Exists(Path.Combine(scriptsDir, "script-0-tab0.html")),
+            "タブ別ページ script-0-tab0.html が生成されていない");
+        Assert.True(File.Exists(Path.Combine(scriptsDir, "script-0-tab1.html")),
+            "タブ別ページ script-0-tab1.html が生成されていない");
+
+        // index.html に「複数ページ」の表示が含まれているか確認する
+        string indexContent = File.ReadAllText(Path.Combine(_outputDir, "index.html"));
+        Assert.Contains("複数ページ", indexContent);
+    }
+
+    /// <summary>
+    /// スクリプトページに URL 内の HTML 特殊文字が正しくエスケープされて出力されることを確認する。
+    /// </summary>
+    [Fact]
+    public void Generate_ScriptUrlWithHtmlChars_EscapedInOutput()
+    {
+        // XSS のリスクがある URL: スクリプト URL に < > & が含まれる
+        // GetFileName は http:// プレフィックスなしの URL をそのまま返すため、
+        // エスケープが必要
+        var script = MakeScript(0, "http://example.com/", "http://example.com/a&b.js",
+            "var x = 1;", covered: 1);
+
+        var generator = new HtmlReportGenerator();
+        generator.Generate([script], _outputDir);
+
+        string indexContent = File.ReadAllText(Path.Combine(_outputDir, "index.html"));
+        // 生の & が HTML に残っていないこと（&amp; にエスケープされていること）
+        // ただし &amp; 等のエンティティの & は除く
+        string withoutEntities = indexContent
+            .Replace("&amp;", "ENCODED_AMP")
+            .Replace("&lt;", "ENCODED_LT")
+            .Replace("&gt;", "ENCODED_GT")
+            .Replace("&quot;", "ENCODED_QUOT");
+        Assert.DoesNotContain("&", withoutEntities);
+    }
+
+    /// <summary>
+    /// カバレッジ率が正しく index.html に表示されることを確認する。
+    /// </summary>
+    [Fact]
+    public void Generate_CoveragePercentageDisplayed_InIndexHtml()
+    {
+        // source = "abcde" (5文字), 全行 covered になるようなカバレッジデータ
+        var script = MakeScript(0, "http://example.com/", "http://example.com/app.js",
+            "abcde", covered: 1);
+
+        var generator = new HtmlReportGenerator();
+        generator.Generate([script], _outputDir);
+
+        string indexContent = File.ReadAllText(Path.Combine(_outputDir, "index.html"));
+        // 何らかのパーセント表示が含まれているか確認する
+        Assert.Contains("%", indexContent);
+    }
 }
 

@@ -2352,4 +2352,126 @@ public class ScanRangeEdgeCaseTests
         // 修正前にここが -1（ニュートラル）になっていた: 正規表現内 } の直後以降
         Assert.Equal(0, map[source.Length - 1]);     // 最後の '}'
     }
+
+    // -----------------------------------------------------------------------
+    // await キーワード後の正規表現リテラル対応テスト
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// await キーワードの直後に /[{]/ のような波括弧を含む正規表現がある場合、
+    /// FindMatchingBrace が正規表現内の { を実際の波括弧と誤解釈しないことを確認する。
+    /// await が RegexPrecedingKeywords に含まれないと IsRegexStart が false を返し、
+    /// /[{]/ 内の { が深さカウントに加算されて関数終端の検出に失敗する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledFunction_AwaitRegexWithOpenBrace_BodyCorrectlyMarked()
+    {
+        // function foo() { const x = await /[{]/; return x; }
+        // await /[{]/ の { が FindMatchingBrace の深さカウントに影響して
+        // 関数末尾の } を正しく検出できなくなるバグを確認するテスト
+        const string source = "function foo() { const x = await /[{]/; return x; }";
+
+        // カバレッジデータなし → V8 未コンパイル → 全文字が未実行(0)になるべき
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // return の位置が未実行（0）になっているか確認する（バグ時は -1 のまま）
+        int returnIdx = source.IndexOf("return");
+        Assert.Equal(0, map[returnIdx]);
+
+        // 関数の最後の } も未実行になっているか確認する
+        Assert.Equal(0, map[source.Length - 1]);
+    }
+
+    /// <summary>
+    /// await キーワードの後の正規表現に閉じ波括弧 } だけが含まれる場合も
+    /// 関数本体全体が正しくマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledFunction_AwaitRegexWithCloseBrace_BodyCorrectlyMarked()
+    {
+        // function bar() { const r = await /[}]/; return r; }
+        // /[}]/ の } が FindMatchingBrace の深さカウントを早期終了させないことを確認する
+        const string source = "function bar() { const r = await /[}]/; return r; }";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        int returnIdx = source.IndexOf("return");
+        Assert.Equal(0, map[returnIdx]);
+        Assert.Equal(0, map[source.Length - 1]);
+    }
+
+    // -----------------------------------------------------------------------
+    // async アロー関数のデフォルト引数内クォートでの逆走査テスト
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// async アロー関数のパラメータにデフォルト値として文字列 ")" を含む場合、
+    /// 逆走査の括弧深さカウンタが文字列内の ')' を実際の括弧と誤認識せず、
+    /// async キーワードを正しく未実行（0）としてマークできることを確認する。
+    /// </summary>
+    [Fact]
+    public void MarkUncalledFunctionBodies_AsyncArrowWithStringDefaultContainingCloseParen_AsyncKeywordMarked()
+    {
+        // async (x = ")") => { doSomething(); }
+        // デフォルト引数の文字列 ")" に含まれる ) で逆走査が混乱するバグを確認する
+        const string source = "async (x = \")\") => { doSomething(); }";
+
+        var map = new int[source.Length];
+        Array.Fill(map, -1);
+
+        HtmlReportGenerator.MarkUncalledFunctionBodiesAsUncovered(source, map);
+
+        // async キーワード（インデックス 0）が未実行（0）になっているか確認する
+        // バグ時は逆走査が失敗し、async が -1（ニュートラル）のままになる
+        Assert.Equal(0, map[0]); // 'a' of 'async'
+
+        // 関数本体（doSomething）も未実行（0）になっているか確認する
+        int bodyIdx = source.IndexOf("doSomething");
+        Assert.Equal(0, map[bodyIdx]);
+    }
+
+    /// <summary>
+    /// async アロー関数のパラメータにデフォルト値として単一引用符を含む文字列がある場合も、
+    /// async キーワードを正しくマークできることを確認する。
+    /// </summary>
+    [Fact]
+    public void MarkUncalledFunctionBodies_AsyncArrowWithSingleQuoteDefaultContainingParen_AsyncKeywordMarked()
+    {
+        // async (x = ')') => { return x; }
+        const string source = "async (x = ')') => { return x; }";
+
+        var map = new int[source.Length];
+        Array.Fill(map, -1);
+
+        HtmlReportGenerator.MarkUncalledFunctionBodiesAsUncovered(source, map);
+
+        // async キーワードが未実行（0）になっているか確認する
+        Assert.Equal(0, map[0]);
+        int returnIdx = source.IndexOf("return");
+        Assert.Equal(0, map[returnIdx]);
+    }
+
+    // -----------------------------------------------------------------------
+    // MergeMaps — 空配列テスト
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// 両方が空配列の場合、空配列が返されることを確認する。
+    /// </summary>
+    [Fact]
+    public void MergeMaps_BothEmpty_ReturnsEmptyArray()
+    {
+        var merged = HtmlReportGenerator.MergeMaps([], []);
+        Assert.Empty(merged);
+    }
+
+    /// <summary>
+    /// baseMap が空で otherMap が非空の場合、空配列（baseMap の長さ基準）が返されることを確認する。
+    /// </summary>
+    [Fact]
+    public void MergeMaps_BaseMapEmpty_ReturnsEmpty()
+    {
+        var merged = HtmlReportGenerator.MergeMaps([], [1, 0, -1]);
+        Assert.Empty(merged);
+    }
 }

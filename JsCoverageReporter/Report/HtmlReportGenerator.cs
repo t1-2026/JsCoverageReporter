@@ -54,6 +54,7 @@ internal class HtmlReportGenerator
         "new", "in", "instanceof",
         "yield",  // ジェネレータ関数内: yield /regex/ のパターン
         "case",   // switch 文内: case /regex/.test(x) のパターン
+        "await",  // 非同期関数内: await /regex/ のパターン
     };
     /// <summary>
     /// ソースコードの各文字に対してカバレッジ値を記録した配列を作成する。
@@ -262,13 +263,36 @@ internal class HtmlReportGenerator
                         // パラメータリスト ')' のケース: async (x, y) => {}
                         if (backScan >= 0 && source[backScan] == ')')
                         {
-                            // 対応する '(' まで逆走査する（単純な深さカウント）
+                            // 対応する '(' まで逆走査する
+                            // 文字列リテラル内の括弧（例: async (x = ")") => {}）を除外するため
+                            // クォートに当たった場合は文字列全体を逆方向にスキップする
                             int parenDepth = 1;
                             backScan--;
                             while (backScan >= 0 && parenDepth > 0)
                             {
-                                if (source[backScan] == ')') { parenDepth++; }
-                                else if (source[backScan] == '(') { parenDepth--; }
+                                char bc = source[backScan];
+                                // 文字列リテラルの閉じクォートに当たった場合は開きクォートまで逆走査する
+                                if (bc == '"' || bc == '\'')
+                                {
+                                    char quote = bc;
+                                    backScan--;
+                                    while (backScan >= 0)
+                                    {
+                                        if (source[backScan] == quote)
+                                        {
+                                            // 直前の連続するバックスラッシュをカウントしてエスケープ判定する
+                                            int esc = 0;
+                                            int tmp = backScan - 1;
+                                            while (tmp >= 0 && source[tmp] == '\\') { esc++; tmp--; }
+                                            // 偶数個なら実際の開きクォート（文字列の先頭）
+                                            if (esc % 2 == 0) { break; }
+                                        }
+                                        backScan--;
+                                    }
+                                    // ループ末尾の backScan-- で開きクォートの前に進む
+                                }
+                                else if (bc == ')') { parenDepth++; }
+                                else if (bc == '(') { parenDepth--; }
                                 backScan--;
                             }
                             // ループ終了時 backScan は '(' の 1 つ前の位置にある

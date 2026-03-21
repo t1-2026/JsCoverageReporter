@@ -116,10 +116,11 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
 
             // 中間スナップショットタスクを開始して追跡リストに追加する
             // async void イベントハンドラのため、タスクを保存して StopAsync で待機する
+            // 注意: _stopped を二重チェックしない。タスクを開始した後は必ず _snapTasks に追加して
+            // StopAsync が待機できるようにする（孤立タスクによる scriptCache 競合を防ぐため）
             var snapTask = TakeIntermediateSnapshotAsync(targetPage, currentUrl);
             lock (_lock)
             {
-                if (_stopped) { return; } // もう一度チェック
                 _snapTasks.Add(snapTask);
             }
         };
@@ -221,6 +222,8 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
 
             // URL が空のスクリプト（内部スクリプトなど）はスキップする
             if (string.IsNullOrEmpty(url)) { continue; }
+            // scriptId が空の場合は Debugger.getScriptSource を呼べないためスキップする
+            if (string.IsNullOrEmpty(scriptId)) { continue; }
 
             // scriptFilters に一致するスクリプトのみ処理する
             if (_scriptFilters.Count > 0 && !_scriptFilters.Any(f => url.Contains(f, StringComparison.OrdinalIgnoreCase)))
