@@ -193,11 +193,20 @@ try
     await using var collector = new CoverageCollector(page);
     await collector.StartAsync(scenario.ScriptFilters, scenario.ScriptExcludes);
 
+    // timeoutMs が負値の場合は警告して null（Playwright デフォルト: 30秒）に変換する
+    // 負値をそのまま Playwright に渡すと ArgumentException が発生する可能性があるため
+    int? validTimeoutMs = scenario.TimeoutMs;
+    if (validTimeoutMs.HasValue && validTimeoutMs.Value < 0)
+    {
+        Console.Error.WriteLine($"[Warning] 'timeoutMs' is negative ({validTimeoutMs.Value}) — using Playwright default (30s).");
+        validTimeoutMs = null;
+    }
+
     // シナリオで指定されたURLに移動する
-    await page.GotoAsync(scenario.Url, new PageGotoOptions { Timeout = scenario.TimeoutMs });
+    await page.GotoAsync(scenario.Url, new PageGotoOptions { Timeout = validTimeoutMs });
 
     // シナリオで定義されたアクション（クリックなど）を順番に実行する
-    await ActionRunner.RunAsync(page, scenario.Actions, scenario.TimeoutMs, scenario.ContinueOnError);
+    await ActionRunner.RunAsync(page, scenario.Actions, validTimeoutMs, scenario.ContinueOnError);
 
     // カバレッジデータを収集して取得する
     Console.WriteLine("Collecting coverage...");
