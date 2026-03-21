@@ -493,6 +493,12 @@ internal class HtmlReportGenerator
         char prev = source[i];
         // 閉じ括弧・閉じ角括弧の後は除算演算子（式の末尾）
         if (prev == ')' || prev == ']') { return false; }
+        // 後置インクリメント（++）の直後の / は除算演算子（正規表現ではない）
+        // 例: x++ /2 の / は "x++ を評価した後に /2 で割る" 除算
+        // prev（i番目の文字）が + で、その直前（i-1番目）も + であれば ++ と判断する
+        if (prev == '+' && i > 0 && source[i - 1] == '+') { return false; }
+        // 後置デクリメント（--）の直後の / も同様に除算演算子
+        if (prev == '-' && i > 0 && source[i - 1] == '-') { return false; }
         // 識別子文字で終わる場合は、直前のトークン全体を確認する
         if (IsIdentifierChar(prev))
         {
