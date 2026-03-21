@@ -942,7 +942,8 @@ internal class HtmlReportGenerator
 
     /// <summary>
     /// カバレッジデータからHTMLレポートを生成してファイルに書き出す。
-    /// index.html（サマリーページ）と scripts/script-N.html（詳細ページ）を生成する。
+    /// 同じスクリプトURLのデータは OR 合成して1件にまとめる。
+    /// 複数タブで読み込まれた場合は合成ページに加え、タブ別の詳細ページも生成する。
     /// </summary>
     /// <param name="coverages">収集したスクリプトカバレッジデータのリスト</param>
     /// <param name="outputDir">レポートを出力するディレクトリのパス</param>
@@ -952,80 +953,120 @@ internal class HtmlReportGenerator
         Directory.CreateDirectory(outputDir);
         // スクリプト詳細ページを格納するサブディレクトリのパス
         var scriptsDir = Path.Combine(outputDir, "scripts");
-        // スクリプト詳細ページ用のサブディレクトリを作成する
         Directory.CreateDirectory(scriptsDir);
+
+        // スクリプト URL でグループ化する（同じ URL は OR 合成して1件にまとめる）
+        var scriptGroups = new Dictionary<string, List<ScriptCoverage>>();
+        foreach (var script in coverages)
+        {
+            if (!scriptGroups.ContainsKey(script.Url))
+            {
+                scriptGroups[script.Url] = new List<ScriptCoverage>();
+            }
+            scriptGroups[script.Url].Add(script);
+        }
 
         // インデックスページに表示するサマリー行のリスト
         var summaryRows = new List<(
             IReadOnlyList<(string pageUrl, string tabFilename)> tabs,
             string url, int covered, int partial, int total, string mergedFilename)>();
 
-        // 各スクリプトのカバレッジデータを処理して詳細ページを生成する
-        for (int i = 0; i < coverages.Count; i++)
+        int i = 0;
+        foreach (var (scriptUrl, group) in scriptGroups)
         {
-            // 現在処理中のスクリプトカバレッジデータ
-            var script = coverages[i];
-            // このスクリプトの詳細ページのファイル名（例: script-0-tab0.html）
-            var filename = $"script-{i}-tab{script.Page.Index}.html";
+            // カノニカル（基準）スクリプトは最初のエントリとする
+            var canonical = group[0];
 
-            // カバレッジマップ（各文字のカバレッジ値の配列）を生成する
-            var map = BuildCoverageMap(script.Source, script.Functions);
-            // カバレッジマップを基に行ごとのHTML・状態データを生成する
-            var lines = BuildLines(script.Source, map);
+            // 全タブ分のカバレッジマップを OR 合成する
+            var mergedMap = BuildCoverageMap(canonical.Source, canonical.Functions);
+            for (int g = 1; g < group.Count; g++)
+            {
+                var otherMap = BuildCoverageMap(group[g].Source, group[g].Functions);
+                mergedMap = MergeMaps(mergedMap, otherMap);
+            }
 
-            // 行の状態ごとに数を集計する変数を初期化する
-            // カバー済み行数
-            int covered = 0;
-            // 部分カバー行数
-            int partial = 0;
-            // カバレッジ対象行の合計数（Neutral は含まない）
-            int total = 0;
+            // OR 合成したマップから行データを生成する
+            var mergedLines = BuildLines(canonical.Source, mergedMap);
 
-            // 各行の状態を確認してカウントする
-            foreach (LineData line in lines)
+            // 合成ページのファイル名（全タブの OR 合成カバレッジを表示する）
+            var mergedFilename = $"script-{i}.html";
+
+            // 合成ページに表示するページ URL リスト（重複なし・空文字除外）
+            var pageUrls = new List<string>();
+            foreach (var s in group)
+            {
+                if (!string.IsNullOrEmpty(s.Page.Url) && !pageUrls.Contains(s.Page.Url))
+                {
+                    pageUrls.Add(s.Page.Url);
+                }
+            }
+
+            // 合成カバレッジの詳細ページを生成する
+            File.WriteAllText(
+                Path.Combine(scriptsDir, mergedFilename),
+                BuildScriptPage(pageUrls, scriptUrl, mergedLines),
+                Encoding.UTF8);
+
+            // タブ情報リストを構築する（展開 UI 用）
+            var tabs = new List<(string pageUrl, string tabFilename)>();
+            if (group.Count > 1)
+            {
+                // 複数タブの場合: 各タブ別の詳細ページも生成する
+                for (int g = 0; g < group.Count; g++)
+                {
+                    var script = group[g];
+                    // タブ別ページのファイル名（例: script-0-tab2.html）
+                    var tabFilename = $"script-{i}-tab{script.Page.Index}.html";
+
+                    // このタブ単独のカバレッジマップを生成する
+                    var tabMap = BuildCoverageMap(script.Source, script.Functions);
+                    var tabLines = BuildLines(script.Source, tabMap);
+
+                    // タブ別詳細ページを生成する
+                    var tabPageUrls = new List<string>();
+                    if (!string.IsNullOrEmpty(script.Page.Url))
+                    {
+                        tabPageUrls.Add(script.Page.Url);
+                    }
+                    File.WriteAllText(
+                        Path.Combine(scriptsDir, tabFilename),
+                        BuildScriptPage(tabPageUrls, scriptUrl, tabLines),
+                        Encoding.UTF8);
+
+                    tabs.Add((script.Page.Url, tabFilename));
+                }
+            }
+            else
+            {
+                // 単一タブの場合: タブ別ページは合成ページと同じ（別ファイルは生成しない）
+                tabs.Add((group[0].Page.Url, mergedFilename));
+            }
+
+            // 合成データの行数を集計する
+            int covered = 0, partial = 0, total = 0;
+            foreach (var line in mergedLines)
             {
                 if (line.Status == LineCoverageStatus.Covered)
                 {
-                    // 完全にカバーされた行をカウントする
                     covered++;
-                    // 対象行の合計にも加算する
                     total++;
                 }
                 else if (line.Status == LineCoverageStatus.Partial)
                 {
-                    // 部分的にカバーされた行をカウントする
                     partial++;
-                    // 対象行の合計にも加算する
                     total++;
                 }
                 else if (line.Status == LineCoverageStatus.Uncovered)
                 {
-                    // 未カバーの行は total のみ加算する（covered/partial には含めない）
                     total++;
                 }
-                // Neutral は total に含めない
             }
 
-            // スクリプト詳細ページのHTMLを生成してファイルに書き出す
-            var singlePageUrls = new List<string>();
-            if (!string.IsNullOrEmpty(script.Page.Url))
-            {
-                singlePageUrls.Add(script.Page.Url);
-            }
-            File.WriteAllText(
-                Path.Combine(scriptsDir, filename),
-                BuildScriptPage(singlePageUrls, script.Url, lines),
-                Encoding.UTF8);
-
-            // このスクリプトのサマリー情報をリストに追加する（単一タブとして追加）
-            var singleTab = new List<(string pageUrl, string tabFilename)>
-            {
-                (script.Page.Url, filename)
-            };
-            summaryRows.Add((singleTab, script.Url, covered, partial, total, filename));
+            summaryRows.Add((tabs, scriptUrl, covered, partial, total, mergedFilename));
+            i++;
         }
 
-        // インデックスページ（全スクリプトのサマリー表）のHTMLを生成してファイルに書き出す
+        // インデックスページを生成してファイルに書き出す
         File.WriteAllText(
             Path.Combine(outputDir, "index.html"),
             BuildIndexPage(summaryRows),
