@@ -1929,7 +1929,7 @@ public class CoverageMapTests
         // `${ function foo() { return `${x}`; } }`
         //  0 12           3          4       5
         //  01234567890123456789012345678901234567890
-        // function at 4, outer { at 19, inner template at 28-33, outer } at 35
+        // function at 4, outer { at 19, inner template at 28-33, outer } at 36
         const string source = "`${ function foo() { return `${x}`; } }`";
         //                     0         1         2         3         4
         //                     0123456789012345678901234567890123456789 0

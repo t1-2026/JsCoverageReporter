@@ -176,7 +176,7 @@ internal class HtmlReportGenerator
                     // 閉じ ` でテンプレートリテラル終了
                     if (t == '`') { i++; break; }
                     // ${ を発見したら、対応する } を FindMatchingBrace で探して再帰スキャンする
-                    if (t == '$' && i + 1 < source.Length && source[i + 1] == '{')
+                    if (t == '$' && i + 1 < end && source[i + 1] == '{')
                     {
                         int braceStart = i + 1; // { の位置
                         int braceEnd = FindMatchingBrace(source, braceStart);
@@ -342,7 +342,7 @@ internal class HtmlReportGenerator
     /// <param name="source">スクリプトのソースコード全文</param>
     /// <param name="map">BuildCoverageMap で作成したカバレッジマップ（内容を書き換える）</param>
     /// <param name="identStart">identifier の先頭インデックス</param>
-    /// <param name="len">ソースコードの長さ（source.Length）</param>
+    /// <param name="len">スキャン範囲の終端インデックス（含まない）</param>
     private static void TryMarkMethodShorthand(string source, int[] map, int identStart, int len)
     {
         // identifier 名を収集する
