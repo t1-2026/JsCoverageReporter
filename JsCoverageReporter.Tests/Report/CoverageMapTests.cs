@@ -1696,4 +1696,67 @@ public class CoverageMapTests
         // 外側の FindMatchingBrace が depth=2 を経由して outer } で終端し全体をマーク
         Assert.All(map, v => Assert.Equal(0, v));
     }
+
+    // -----------------------------------------------------------------------
+    // MergeMaps — OR 合成のテスト
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// 両方が実行済み（1）の場合、合成結果も実行済み（1）になることを確認する。
+    /// </summary>
+    [Fact]
+    public void MergeMaps_BothCovered_ReturnsCovered()
+    {
+        // 両方 1 → 合成も 1
+        var merged = HtmlReportGenerator.MergeMaps([1, 1, 1], [1, 1, 1]);
+        Assert.Equal([1, 1, 1], merged);
+    }
+
+    /// <summary>
+    /// 一方が実行済み（1）、他方が未実行（0）の場合、
+    /// OR 合成なので実行済み（1）になることを確認する。
+    /// </summary>
+    [Fact]
+    public void MergeMaps_OneCoveredOneUncovered_ReturnsCovered()
+    {
+        // OR 合成: どちらかが 1 なら 1
+        var merged = HtmlReportGenerator.MergeMaps([1, 0, -1], [0, 1, -1]);
+        Assert.Equal([1, 1, -1], merged);
+    }
+
+    /// <summary>
+    /// 両方が未実行（0）の場合、合成結果も未実行（0）になることを確認する。
+    /// </summary>
+    [Fact]
+    public void MergeMaps_BothUncovered_ReturnsUncovered()
+    {
+        var merged = HtmlReportGenerator.MergeMaps([0, 0], [0, 0]);
+        Assert.Equal([0, 0], merged);
+    }
+
+    /// <summary>
+    /// 一方が未実行（0）、他方が対象外（-1）の場合、未実行（0）になることを確認する。
+    /// 対象外ではなく未実行という情報を優先する。
+    /// </summary>
+    [Fact]
+    public void MergeMaps_OneUncoveredOneNeutral_ReturnsUncovered()
+    {
+        var merged = HtmlReportGenerator.MergeMaps([0, -1], [-1, 0]);
+        Assert.Equal([0, 0], merged);
+    }
+
+    /// <summary>
+    /// otherMap が baseMap より短い場合、はみ出た部分は -1（対象外）として扱い
+    /// baseMap の値をそのまま使うことを確認する。
+    /// </summary>
+    [Fact]
+    public void MergeMaps_OtherMapShorter_TreatedAsNeutral()
+    {
+        // baseMap = [0,0,0], otherMap = [1] (短い)
+        // index0: base=0, other=1 → 1
+        // index1: base=0, other=-1(範囲外) → 0
+        // index2: base=0, other=-1(範囲外) → 0
+        var merged = HtmlReportGenerator.MergeMaps([0, 0, 0], [1]);
+        Assert.Equal([1, 0, 0], merged);
+    }
 }

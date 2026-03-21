@@ -681,6 +681,52 @@ internal class HtmlReportGenerator
     }
 
     /// <summary>
+    /// <summary>
+    /// 2つのカバレッジマップを OR 合成して返す。
+    /// どちらかのマップで実行済み（1）なら合成結果も実行済み（1）にする。
+    /// baseMap の長さを基準とし、otherMap が短い場合は対象外（-1）として扱う。
+    /// </summary>
+    /// <param name="baseMap">基準となるカバレッジマップ（カノニカルソースの長さに合わせる）</param>
+    /// <param name="otherMap">OR 合成するカバレッジマップ</param>
+    /// <returns>OR 合成したカバレッジマップ（baseMap と同じ長さ）</returns>
+    internal static int[] MergeMaps(int[] baseMap, int[] otherMap)
+    {
+        // baseMap の長さを基準に合成結果の配列を作る
+        var merged = new int[baseMap.Length];
+        for (int i = 0; i < baseMap.Length; i++)
+        {
+            int v1 = baseMap[i];
+            // otherMap が baseMap より短い場合は対象外（-1）として扱う
+            int v2;
+            if (i < otherMap.Length)
+            {
+                v2 = otherMap[i];
+            }
+            else
+            {
+                v2 = -1;
+            }
+
+            // いずれかが実行済み（1）なら実行済みにする（OR 合成）
+            if (v1 == 1 || v2 == 1)
+            {
+                merged[i] = 1;
+            }
+            // いずれかが未実行（0）なら未実行にする（対象外より優先）
+            else if (v1 == 0 || v2 == 0)
+            {
+                merged[i] = 0;
+            }
+            // 両方が対象外（-1）なら対象外にする
+            else
+            {
+                merged[i] = -1;
+            }
+        }
+        return merged;
+    }
+
+    /// <summary>
     /// HTMLの特殊文字をエスケープする。
     /// ブラウザがHTMLタグとして解釈しないように変換する。
     /// </summary>
