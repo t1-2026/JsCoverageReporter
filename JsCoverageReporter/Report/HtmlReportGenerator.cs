@@ -1338,8 +1338,8 @@ internal class HtmlReportGenerator
         double overallPct;
         if (totalLines > 0)
         {
-            // (実行済み + 部分実行) / 全対象行数 × 100 でパーセントを計算する
-            overallPct = 100.0 * (totalCovered + totalPartial) / totalLines;
+            // Partial 行は 0.5 行換算 — 部分実行は完全実行より低く評価する
+            overallPct = 100.0 * (totalCovered + totalPartial * 0.5) / totalLines;
         }
         else
         {
@@ -1390,7 +1390,7 @@ internal class HtmlReportGenerator
               <p>このレポートは、JavaScript ファイルの各行が実際に実行されたかどうかを記録したカバレッジレポートです。<br>
               スクリプト名をクリックすると、行ごとの実行状況を色分け表示で確認できます。</p>
               <p><strong>カバレッジ率の計算式</strong><br>
-              <span class="formula">（実行済み行数 ＋ 部分実行行数）÷ 対象行数 × 100</span><br>
+              <span class="formula">（実行済み行数 ＋ 部分実行行数 × 0.5）÷ 対象行数 × 100</span><br>
               ※ 対象行数にはコメント・空行・宣言のみの行（対象外）は含みません。</p>
               <table class="legend-table">
                 <tr>
@@ -1419,7 +1419,7 @@ internal class HtmlReportGenerator
         // スクリプト一覧テーブルのヘッダー行を出力する
         sb.AppendLine("""
             <table class="data">
-            <tr><th>ページ URL</th><th>スクリプト</th><th class="num">実行済み</th><th class="num">部分実行</th><th class="num">対象行数</th><th class="num">カバレッジ率</th></tr>
+            <tr><th>ページ URL</th><th>スクリプト</th><th class="num">実行済み</th><th class="num">部分実行</th><th class="num">対象行数</th><th class="num">カバレッジ率<br><small style="font-weight:normal;font-size:11px">※部分実行は0.5行換算</small></th></tr>
             """);
 
         // スクリプトごとのデータ行を出力する
@@ -1429,7 +1429,8 @@ internal class HtmlReportGenerator
             double pct;
             if (total > 0)
             {
-                pct = 100.0 * (covered + partial) / total;
+                // Partial 行は 0.5 行換算 — 部分実行は完全実行より低く評価する
+                pct = 100.0 * (covered + partial * 0.5) / total;
             }
             else
             {
