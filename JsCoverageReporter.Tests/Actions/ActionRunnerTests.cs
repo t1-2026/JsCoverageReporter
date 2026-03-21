@@ -19,14 +19,37 @@ public class ActionRunnerTests
         public TestServer(string htmlContent)
         {
             _htmlContent = htmlContent;
-            // Generate a random high port
-            int port = new Random().Next(40000, 50000);
-            Url = $"http://localhost:{port}/";
-            
-            _listener = new HttpListener();
-            _listener.Prefixes.Add(Url);
-            _listener.Start();
-            
+            var rng = new Random();
+
+            // ポートが使用中の場合は別のポートでリトライする（最大10回）
+            int attempt = 0;
+            while (true)
+            {
+                int port = rng.Next(40000, 50000);
+                string url = $"http://localhost:{port}/";
+
+                var listener = new HttpListener();
+                listener.Prefixes.Add(url);
+                try
+                {
+                    listener.Start();
+                    // 起動成功 → フィールドに設定する
+                    _listener = listener;
+                    Url = url;
+                    break;
+                }
+                catch (HttpListenerException)
+                {
+                    // ポートが使用中 → リスナーを破棄してリトライする
+                    listener.Close();
+                    attempt++;
+                    if (attempt >= 10)
+                    {
+                        throw;
+                    }
+                }
+            }
+
             _listenTask = Task.Run(ListenLoop);
         }
 
