@@ -172,10 +172,9 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
         {
             _processedScriptIds.TryGetValue(targetPage, out processedIds);
         }
-        if (processedIds == null)
-        {
-            processedIds = new HashSet<string>();
-        }
+        // SetupPageAsync が完了する前に到達することは通常ないが、念のため早期リターンする
+        // （ローカルな HashSet を作ると _processedScriptIds と切り離されて二重集計になるため）
+        if (processedIds == null) { return; }
 
         // 新しいスクリプト（未収集のもの）を処理して中間リストに追加する
         var newScripts = await ProcessNewScriptsAsync(result.Value, cdp, pageInfo, processedIds);
@@ -321,9 +320,12 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
     /// <returns>収集したスクリプトカバレッジデータのリスト（全タブ・全ナビゲーション分）</returns>
     public async Task<IReadOnlyList<ScriptCoverage>> StopAsync()
     {
-        // 二重呼び出しを防ぐ
-        if (_stopped) { return []; }
-        _stopped = true;
+        // 二重呼び出しを防ぐ（lock 内でアトミックにチェック＆セットする）
+        lock (_lock)
+        {
+            if (_stopped) { return []; }
+            _stopped = true;
+        }
 
         // Context.Page イベントハンドラを解除する
         if (_pageEventHandler != null)
@@ -405,7 +407,13 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
                 continue;
             }
 
-            if (processedIds == null) { processedIds = new HashSet<string>(); }
+            // SetupPageAsync が完了する前に到達することは通常ないが、念のため早期スキップする
+            // （ローカルな HashSet を作ると _processedScriptIds と切り離されて二重集計になるため）
+            if (processedIds == null)
+            {
+                Console.Error.WriteLine($"[Warning] No processedIds for tab {i} ('{targetPage.Url}') — skipping.");
+                continue;
+            }
 
             // 最終収集（Profiler と Debugger を停止しながら残りのスクリプトを収集する）
             var scripts = await FinalCollectFromPageAsync(cdp, pageInfo, processedIds);
@@ -458,8 +466,12 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
     /// </summary>
     public async ValueTask DisposeAsync()
     {
-        if (_disposed) { return; }
-        _disposed = true;
+        // 二重呼び出しを防ぐ（lock 内でアトミックにチェック＆セットする）
+        lock (_lock)
+        {
+            if (_disposed) { return; }
+            _disposed = true;
+        }
 
         // Context.Page イベントハンドラを解除する
         if (_pageEventHandler != null)

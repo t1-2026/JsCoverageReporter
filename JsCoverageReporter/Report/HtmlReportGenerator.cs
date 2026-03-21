@@ -681,7 +681,6 @@ internal class HtmlReportGenerator
     }
 
     /// <summary>
-    /// <summary>
     /// 2つのカバレッジマップを OR 合成して返す。
     /// どちらかのマップで実行済み（1）なら合成結果も実行済み（1）にする。
     /// baseMap の長さを基準とし、otherMap が短い場合は対象外（-1）として扱う。

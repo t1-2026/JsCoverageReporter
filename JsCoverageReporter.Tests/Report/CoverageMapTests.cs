@@ -1759,4 +1759,30 @@ public class CoverageMapTests
         var merged = HtmlReportGenerator.MergeMaps([0, 0, 0], [1]);
         Assert.Equal([1, 0, 0], merged);
     }
+
+    /// <summary>
+    /// otherMap が baseMap より長い場合、超過部分は無視して baseMap の長さで結果を返すことを確認する。
+    /// CDN スクリプトのバリアント等で長さが異なる場合の仕様として明文化するテスト。
+    /// </summary>
+    [Fact]
+    public void MergeMaps_OtherMapLonger_ExtraElementsIgnored()
+    {
+        // baseMap = [0, 1], otherMap = [1, 0, 1, 1] (長い)
+        // index0: base=0, other=1 → 1
+        // index1: base=1, other=0 → 1
+        // index2以降: baseMap に存在しないため結果に含まれない（baseMap 長さが上限）
+        var merged = HtmlReportGenerator.MergeMaps([0, 1], [1, 0, 1, 1]);
+        Assert.Equal(2, merged.Length);
+        Assert.Equal([1, 1], merged);
+    }
+
+    /// <summary>
+    /// 両方が対象外（-1）の場合、結果も対象外（-1）になることを確認する。
+    /// </summary>
+    [Fact]
+    public void MergeMaps_BothNeutral_ReturnsNeutral()
+    {
+        var merged = HtmlReportGenerator.MergeMaps([-1, -1, -1], [-1, -1, -1]);
+        Assert.Equal([-1, -1, -1], merged);
+    }
 }
