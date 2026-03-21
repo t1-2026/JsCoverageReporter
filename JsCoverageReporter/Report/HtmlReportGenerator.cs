@@ -52,6 +52,8 @@ internal class HtmlReportGenerator
     {
         "return", "typeof", "void", "delete", "throw",
         "new", "in", "instanceof",
+        "yield",  // ジェネレータ関数内: yield /regex/ のパターン
+        "case",   // switch 文内: case /regex/.test(x) のパターン
     };
     /// <summary>
     /// ソースコードの各文字に対してカバレッジ値を記録した配列を作成する。

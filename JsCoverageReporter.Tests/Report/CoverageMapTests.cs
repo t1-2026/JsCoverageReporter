@@ -2187,13 +2187,12 @@ public class ScanRangeEdgeCaseTests
     // -----------------------------------------------------------------------
 
     /// <summary>
-    /// プライベートクラスメソッド構文（#method(){}）は、
-    /// '#' が IsIdentifierChar の対象外（IsLetterOrDigit でも '_' でも '$' でもない）のため
-    /// TryMarkMethodShorthand が呼ばれず、メソッド本体が -1（ニュートラル）のままになることを確認する。
-    /// これは既知の制限であり、将来の対応を検討するためにテストで文書化する。
+    /// プライベートクラスメソッド構文（#method(){}）が未実行の場合、
+    /// '#' は IsIdentifierChar に含まれるため TryMarkMethodShorthand が呼ばれ、
+    /// メソッド本体が 0（未実行）としてマークされることを確認する。
     /// </summary>
     [Fact]
-    public void BuildMap_UncalledPrivateClassMethod_NotDetected_RemainsNeutral()
+    public void BuildMap_UncalledPrivateClassMethod_MarkedAsUncovered()
     {
         // class Foo { #greet() { return 1; } }
         //  0         1         2         3
@@ -2203,11 +2202,11 @@ public class ScanRangeEdgeCaseTests
 
         var map = HtmlReportGenerator.BuildCoverageMap(source, []);
 
-        // '#' は識別子文字でないため TryMarkMethodShorthand が呼ばれず -1 のまま（既知制限）
-        Assert.Equal(-1, map[12]); // '#' of #greet
-        Assert.Equal(-1, map[13]); // 'g' of greet
-        Assert.Equal(-1, map[21]); // '{'
-        Assert.Equal(-1, map[33]); // '}'
+        // '#' は IsIdentifierChar に含まれるため TryMarkMethodShorthand が呼ばれ 0（未実行）になる
+        Assert.Equal(0, map[12]); // '#' of #greet
+        Assert.Equal(0, map[13]); // 'g' of greet
+        Assert.Equal(0, map[21]); // '{'
+        Assert.Equal(0, map[33]); // '}'
     }
 
     // -----------------------------------------------------------------------
@@ -2246,30 +2245,29 @@ public class ScanRangeEdgeCaseTests
     /// <summary>
     /// デストラクチャリングパラメータのデフォルト値として関数が指定された場合
     /// （例: function outer({ cb = function() {} } = {}) {}）、
-    /// SkipBalancedParens はパラメータリスト全体を読み飛ばすだけで ScanRange を再帰しないため、
-    /// 内側の function() {} は検出されず -1（ニュートラル）のままになる既知制限を確認する。
-    /// 外側の outer 本体は正しく 0（未実行）になる。
+    /// 外側の function outer のバルクマーキング（funcStart〜funcEnd）がパラメータリストも含む範囲を
+    /// 一括で 0 にするため、内側の function() も 0（未実行）としてマークされることを確認する。
     /// </summary>
     [Fact]
-    public void BuildMap_UncalledFunction_DestructuringDefaultFunction_InnerNotDetected()
+    public void BuildMap_UncalledFunction_DestructuringDefaultFunction_OuterAndInnerMarked()
     {
         // function outer({ cb = function() {} } = {}) { return 1; }
         //  0         1         2         3         4         5
         //  012345678901234567890123456789012345678901234567890123456789
-        // outer function at 0, outer { at 44, outer } at 57
-        // inner function at 22, inner { at 32, inner } at 34
+        // outer function at 0, outer { at 44, outer } at 56
+        // inner function at 22, inner { at 33, inner } at 34
         const string source = "function outer({ cb = function() {} } = {}) { return 1; }";
 
         var map = HtmlReportGenerator.BuildCoverageMap(source, []);
 
-        // 外側の outer 関数本体は 0（未実行）になる
+        // 外側の outer 関数全体が 0（未実行）になる
         Assert.Equal(0, map[0]);  // 'f' of outer function
         int outerBrace = source.LastIndexOf('}');
         Assert.Equal(0, map[outerBrace]); // '}' of outer body
 
-        // 内側の function() {} は SkipBalancedParens でスキップされるため -1 のまま（既知制限）
+        // 内側の function() も外側のバルクマーキングにより 0（未実行）になる
         int innerFuncIdx = source.IndexOf("function", 10); // 2番目の "function"
-        Assert.Equal(-1, map[innerFuncIdx]); // 'f' of inner function
+        Assert.Equal(0, map[innerFuncIdx]); // 'f' of inner function
     }
 
     // -----------------------------------------------------------------------
@@ -2297,5 +2295,61 @@ public class ScanRangeEdgeCaseTests
         Assert.Equal(0, map[18]); // '=' of =>
         Assert.Equal(0, map[21]); // '{'
         Assert.Equal(0, map[33]); // '}'
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue: IsRegexStart — yield/case キーワード後の正規表現誤認識
+    // yield と case は識別子文字で終わるが、後に / が来る場合は正規表現の開始である
+    // RegexPrecedingKeywords に含まれていないと IsRegexStart が false を返し
+    // FindMatchingBrace が正規表現内の } を関数終端と誤判定する
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// ジェネレータ関数内の yield /regex/ に含まれる } を関数終端と誤認識しないことを確認する。
+    /// yield が RegexPrecedingKeywords に含まれないと IsRegexStart が false を返し
+    /// FindMatchingBrace が正規表現内の } を関数終端と誤判定して、
+    /// 関数末尾の } が -1（ニュートラル）のまま残っていた。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledGenerator_YieldRegexWithBrace_FullBodyMarkedUncovered()
+    {
+        // function* gen() { yield /[}]/; }
+        //  0         1         2         3
+        //  01234567890123456789012345678901
+        // function*=0, {=17, yield=18, /[}]/=24, }=31
+        const string source = "function* gen() { yield /[}]/; }";
+
+        // カバレッジデータなし → V8 未コンパイル → 全文字が未実行(0)になるべき
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // 関数全体が未実行（0）になっているか確認する
+        Assert.Equal(0, map[0]);                     // 'f' of function*
+        Assert.Equal(0, map[17]);                    // '{'
+        // 修正前にここが -1（ニュートラル）になっていた: 正規表現内 } の直後以降
+        Assert.Equal(0, map[29]);                    // ';' after /[}]/
+        Assert.Equal(0, map[31]);                    // 最後の '}'
+    }
+
+    /// <summary>
+    /// switch 文内の case /regex/ に含まれる } を関数終端と誤認識しないことを確認する。
+    /// case が RegexPrecedingKeywords に含まれないと IsRegexStart が false を返す。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledFunction_CaseRegexWithBrace_FullBodyMarkedUncovered()
+    {
+        // function foo(x) { switch(x){ case /[}]/.test(x): break; } }
+        //  0         1         2         3         4         5
+        //  0123456789012345678901234567890123456789012345678901234567 8
+        // function=0, {=17, switch=18, case=29, /[}]/=34, }=58
+        const string source = "function foo(x) { switch(x){ case /[}]/.test(x): break; } }";
+
+        // カバレッジデータなし → V8 未コンパイル → 全文字が未実行(0)になるべき
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // 関数全体が未実行（0）になっているか確認する
+        Assert.Equal(0, map[0]);                     // 'f' of function
+        Assert.Equal(0, map[17]);                    // '{'
+        // 修正前にここが -1（ニュートラル）になっていた: 正規表現内 } の直後以降
+        Assert.Equal(0, map[source.Length - 1]);     // 最後の '}'
     }
 }
