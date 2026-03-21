@@ -189,8 +189,9 @@ try
     var page = await browser.NewPageAsync();
 
     // カバレッジ収集を開始する（CDPでV8 Profilerを有効にする）
+    // フィルターを StartAsync に渡すことで中間スナップショット時にも正しく適用される
     await using var collector = new CoverageCollector(page);
-    await collector.StartAsync();
+    await collector.StartAsync(scenario.ScriptFilters, scenario.ScriptExcludes);
 
     // シナリオで指定されたURLに移動する
     await page.GotoAsync(scenario.Url, new PageGotoOptions { Timeout = scenario.TimeoutMs });
@@ -200,8 +201,8 @@ try
 
     // カバレッジデータを収集して取得する
     Console.WriteLine("Collecting coverage...");
-    // scriptFilters に一致するスクリプトのカバレッジデータのリストを取得する
-    var coverages = await collector.StopAsync(scenario.ScriptFilters, scenario.ScriptExcludes);
+    // カバレッジデータを取得する（フィルターは StartAsync で渡し済み）
+    var coverages = await collector.StopAsync();
     // 取得したスクリプト数を表示する
     Console.WriteLine($"  {coverages.Count} script(s) captured.");
 

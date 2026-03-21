@@ -5,7 +5,9 @@ namespace JsCoverageReporter.Coverage;
 /// <summary>
 /// Playwright の CDP（Chrome DevTools Protocol）を使って JavaScript カバレッジを収集するクラス。
 /// StartAsync でカバレッジ収集を開始し、StopAsync でデータを取得して返す。
-/// 複数タブ（ページ）が開いた場合も Context.Page イベントで自動的に追跡する。
+/// 複数タブが開いた場合も Context.Page イベントで自動的に追跡する。
+/// page.Request イベントでナビゲーション直前にスナップショットを撮り、
+/// 各スクリプトに正確なページ URL を記録する。
 /// </summary>
 internal class CoverageCollector(IPage page) : IAsyncDisposable
 {
@@ -15,7 +17,7 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
     private readonly Dictionary<IPage, ICDPSession> _cdpSessions    = [];
     // 新しいタブの SetupPageAsync タスクを格納するリスト（StopAsync で待機する）
     private readonly List<Task>                     _pageSetupTasks = [];
-    // _trackedPages / _cdpSessions / _pageSetupTasks へのアクセスを同期するためのロックオブジェクト
+    // _trackedPages / _cdpSessions 等へのアクセスを同期するためのロックオブジェクト
     private readonly object                         _lock           = new();
     // DisposeAsync が既に呼ばれたかどうかを示すフラグ（二重解放を防ぐ）
     private bool _disposed = false;
@@ -24,22 +26,39 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
     // Context.Page イベントハンドラの参照（DisposeAsync / StopAsync で解除するために保持する）
     private EventHandler<IPage>? _pageEventHandler = null;
 
+    // スクリプトフィルター（StartAsync で設定。中間スナップショット時にも使う）
+    private IReadOnlyList<string> _scriptFilters  = [];
+    // スクリプト除外フィルター（StartAsync で設定。中間スナップショット時にも使う）
+    private IReadOnlyList<string> _scriptExcludes = [];
+
+    // ページごとの収集済みスクリプト ID セット（二重収集を防ぐ）
+    private readonly Dictionary<IPage, HashSet<string>>        _processedScriptIds  = [];
+    // 中間スナップショットで収集したスクリプトのリスト（最終的に StopAsync で返す）
+    private readonly List<ScriptCoverage>                       _intermediateScripts = [];
+    // 中間スナップショットタスクのリスト（StopAsync で待機する）
+    private readonly List<Task>                                 _snapTasks           = [];
+    // ページごとのリクエストイベントハンドラー（DisposeAsync / StopAsync で解除する）
+    private readonly Dictionary<IPage, EventHandler<IRequest>> _requestHandlers     = [];
+
     /// <summary>
     /// カバレッジ収集を開始する。
-    /// 初期ページのCDPセッションを開始し、新しいタブの自動検出を登録する。
+    /// フィルターを保存し、初期ページのCDPセッションを開始し、新しいタブの自動検出を登録する。
     /// </summary>
-    public async Task StartAsync()
+    /// <param name="scriptFilters">URLにいずれかの文字列を含むスクリプトだけを返す（空リストなら全部）</param>
+    /// <param name="scriptExcludes">URLにいずれかの文字列を含むスクリプトを除外する（空リストなら除外なし）</param>
+    public async Task StartAsync(IReadOnlyList<string> scriptFilters, IReadOnlyList<string> scriptExcludes)
     {
+        // フィルターをインスタンスフィールドに保存する（中間スナップショット時にも参照する）
+        _scriptFilters  = scriptFilters;
+        _scriptExcludes = scriptExcludes;
+
         // 最初のページ（コンストラクタで渡されたページ）のカバレッジを開始する
         await SetupPageAsync(page);
 
         // 新しいタブが開いたとき自動でカバレッジを開始するイベントハンドラを定義する
-        // ハンドラ参照を保持して StopAsync / DisposeAsync で解除できるようにする
         _pageEventHandler = (_, newPage) =>
         {
-            // 新タブのセットアップタスクを開始する（await はしない — イベントハンドラのため）
             var task = SetupPageAsync(newPage);
-            // _pageSetupTasks と _trackedPages / _cdpSessions は複数スレッドから触れるためロックする
             lock (_lock)
             {
                 _pageSetupTasks.Add(task);
@@ -52,201 +71,183 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
 
     /// <summary>
     /// 指定ページのCDPセッションを作成し、カバレッジ収集を開始する。
-    /// StartAsync（初期ページ）と Context.Page イベント（新タブ）の両方から呼ばれる。
+    /// また page.Request イベントを購読してナビゲーション直前のスナップショットを撮る準備をする。
     /// </summary>
     /// <param name="targetPage">カバレッジを開始するページ</param>
     private async Task SetupPageAsync(IPage targetPage)
     {
         // 追跡ページリストにこのページを追加する（追加順がタブ番号になる）
-        // Context.Page イベントハンドラから並行して呼ばれる可能性があるためロックする
         lock (_lock)
         {
             _trackedPages.Add(targetPage);
+            // このページの収集済みスクリプト ID セットを初期化する
+            _processedScriptIds[targetPage] = new HashSet<string>();
         }
 
-        // ページに接続したCDPセッションを作成する（await 中はロックを保持できないため lock の外で行う）
+        // ページに接続したCDPセッションを作成する
         var cdp = await targetPage.Context.NewCDPSessionAsync(targetPage);
 
-        // 作成したCDPセッションをページに対応させて保存する（Dictionary も lock で保護する）
         lock (_lock)
         {
             _cdpSessions[targetPage] = cdp;
         }
 
-        // V8 Profilerを有効にする（カバレッジ計測に必要）
+        // V8 Profilerを有効にする
         await cdp.SendAsync("Profiler.enable");
-
         // Debuggerを有効にする（ソースコード取得に必要）
         await cdp.SendAsync("Debugger.enable");
-
         // 精密カバレッジの記録を開始する
-        // callCount: 実行回数を記録する / detailed: 細かいブロック単位で記録する
         await cdp.SendAsync("Profiler.startPreciseCoverage", new Dictionary<string, object>
         {
-            // 各範囲の実行回数を記録するフラグ（true にするとカウント情報が得られる）
-            ["callCount"] = true,
-            // 関数レベルだけでなくブロック（if/else など）単位でも記録するフラグ
-            ["detailed"] = true,
-            // 自動トリガーによるカバレッジ更新を許可するフラグ
+            ["callCount"]            = true,
+            ["detailed"]             = true,
             ["allowTriggeredUpdates"] = true,
         });
-    }
 
-    /// <summary>
-    /// カバレッジ収集を停止してデータを返す。
-    /// 新タブのセットアップ完了を待ってから全ページのデータを収集する。
-    /// </summary>
-    /// <param name="scriptFilters">URLにいずれかの文字列を含むスクリプトだけを返す（空リストなら全部返す）</param>
-    /// <param name="scriptExcludes">URLにいずれかの文字列を含むスクリプトを除外する（空リストなら除外なし）</param>
-    /// <returns>収集したスクリプトカバレッジデータのリスト（全タブ分）</returns>
-    public async Task<IReadOnlyList<ScriptCoverage>> StopAsync(
-        IReadOnlyList<string> scriptFilters,
-        IReadOnlyList<string> scriptExcludes)
-    {
-        // 二重呼び出しを防ぐ（2回目以降は空リストを返す）
-        // _stopped フラグはメインスレッドからのみ操作されることを前提とする
-        if (_stopped)
+        // ナビゲーションリクエストを検出してスナップショットを撮るハンドラーを定義する
+        // （ページ遷移前の旧ページのスクリプトを正確なページ URL で記録するため）
+        EventHandler<IRequest> reqHandler = (_, req) =>
         {
-            return [];
-        }
-        _stopped = true;
+            // ナビゲーションリクエスト以外は無視する
+            if (!req.IsNavigationRequest) { return; }
 
-        // イベントハンドラをまず解除する（以降に開く新タブは追跡対象外にする）
-        if (_pageEventHandler != null)
-        {
-            page.Context.Page -= _pageEventHandler;
-            _pageEventHandler  = null;
-        }
+            // ナビゲーション開始直前の現在 URL を取得する（遷移後は変わるため）
+            string currentUrl = targetPage.Url;
 
-        // StartAsync が呼ばれていない場合（追跡ページなし）は空リストを返す
-        int trackedCount;
-        lock (_lock)
-        {
-            trackedCount = _trackedPages.Count;
-        }
-        if (trackedCount == 0)
-        {
-            return [];
-        }
-
-        // 新タブのセットアップタスクが完了するまで待機する
-        // lock の中では await できないので、先にリストのコピーを取得する
-        List<Task> setupTasks;
-        lock (_lock)
-        {
-            setupTasks = new List<Task>(_pageSetupTasks);
-        }
-        await Task.WhenAll(setupTasks);
-
-        // 全ページのカバレッジを収集してまとめる
-        var allScripts = new List<ScriptCoverage>();
-
-        // _trackedPages をスナップショットして反復する（反復中に別スレッドが変更しないよう保護）
-        List<IPage> pageSnapshot;
-        lock (_lock)
-        {
-            pageSnapshot = new List<IPage>(_trackedPages);
-        }
-
-        // スナップショットの順番がそのままタブ番号（Index）になる
-        for (int i = 0; i < pageSnapshot.Count; i++)
-        {
-            // このページ（タブ）の情報を作成する（Url は収集直前の値を使う）
-            var targetPage = pageSnapshot[i];
-            var pageInfo = new PageInfo(i, targetPage.Url);
-
-            // このページの CDP セッションが存在する場合のみ収集する
-            ICDPSession? cdp;
+            // 中間スナップショットタスクを開始して追跡リストに追加する
+            // async void イベントハンドラのため、タスクを保存して StopAsync で待機する
+            var snapTask = TakeIntermediateSnapshotAsync(targetPage, currentUrl);
             lock (_lock)
             {
-                _cdpSessions.TryGetValue(targetPage, out cdp);
+                _snapTasks.Add(snapTask);
             }
-            if (cdp == null)
-            {
-                // セットアップが失敗して CDP セッションが作れなかった場合はスキップする
-                Console.Error.WriteLine($"[Warning] No CDP session for tab {i} ('{targetPage.Url}') — skipping.");
-                continue;
-            }
+        };
 
-            // このページのカバレッジデータを収集する
-            var scripts = await CollectFromPageAsync(cdp, pageInfo, scriptFilters, scriptExcludes);
-            allScripts.AddRange(scripts);
+        targetPage.Request += reqHandler;
+        lock (_lock)
+        {
+            _requestHandlers[targetPage] = reqHandler;
         }
-
-        return allScripts;
     }
 
     /// <summary>
-    /// 1ページ分のCDPセッションからカバレッジデータを収集して返す。
+    /// ナビゲーション直前に CDP スナップショットを取り、未収集スクリプトを現在の URL で記録する。
+    /// Profiler は停止しない（収集は継続する）。
     /// </summary>
-    /// <param name="cdp">対象ページのCDPセッション</param>
-    /// <param name="pageInfo">対象ページのタブ情報（ファイル名とレポートのページ列に使う）</param>
-    /// <param name="scriptFilters">包含フィルタ</param>
-    /// <param name="scriptExcludes">除外フィルタ</param>
-    /// <returns>このページで収集したスクリプトカバレッジのリスト</returns>
-    private static async Task<List<ScriptCoverage>> CollectFromPageAsync(
-        ICDPSession cdp,
-        PageInfo pageInfo,
-        IReadOnlyList<string> scriptFilters,
-        IReadOnlyList<string> scriptExcludes)
+    /// <param name="targetPage">スナップショット対象のページ</param>
+    /// <param name="pageUrl">スナップショット時点のページ URL（ナビゲーション前の URL）</param>
+    private async Task TakeIntermediateSnapshotAsync(IPage targetPage, string pageUrl)
     {
-        // CDPからカバレッジデータを取得する（null は未取得を示す）
+        // このページの CDP セッションとタブ番号を取得する
+        ICDPSession? cdp;
+        int tabIndex;
+        lock (_lock)
+        {
+            _cdpSessions.TryGetValue(targetPage, out cdp);
+            tabIndex = _trackedPages.IndexOf(targetPage);
+        }
+        if (cdp == null) { return; }
+
+        // スナップショットを取得する（Profiler は停止しない）
         System.Text.Json.JsonElement? result = null;
         try
         {
-            // 精密カバレッジのスナップショットを取得する
             result = await cdp.SendAsync("Profiler.takePreciseCoverage");
         }
-        finally
+        catch (Exception ex)
         {
-            // 成功・失敗どちらでも必ずProfilerを停止・無効化する
-            await cdp.SendAsync("Profiler.stopPreciseCoverage");
-            await cdp.SendAsync("Profiler.disable");
+            // ナビゲーション中の CDP エラーは警告として記録してスキップする
+            Console.Error.WriteLine($"[Warning] Intermediate snapshot failed for tab {tabIndex}: {ex.Message}");
+            return;
         }
 
-        // データが取得できなかった場合は空リストを返す
-        if (result is null)
+        if (result == null) { return; }
+
+        // この時点でのページ情報（ナビゲーション前の URL）でスクリプトを記録する
+        var pageInfo = new PageInfo(tabIndex, pageUrl);
+
+        // このページの収集済みIDセットを取得する
+        HashSet<string>? processedIds;
+        lock (_lock)
         {
-            return [];
+            _processedScriptIds.TryGetValue(targetPage, out processedIds);
+        }
+        if (processedIds == null)
+        {
+            processedIds = new HashSet<string>();
         }
 
-        // CDPレスポンスのJSONから "result" 配列を取り出す
-        var root = result.Value;
-        // "result" プロパティが存在しない場合は空リストを返す
-        if (!root.TryGetProperty("result", out var resultArray))
+        // 新しいスクリプト（未収集のもの）を処理して中間リストに追加する
+        var newScripts = await ProcessNewScriptsAsync(result.Value, cdp, pageInfo, processedIds);
+        lock (_lock)
         {
-            return [];
+            _intermediateScripts.AddRange(newScripts);
         }
+    }
 
-        // 各スクリプトのカバレッジデータを処理してリストに格納する
+    /// <summary>
+    /// CDP スナップショット結果から未収集スクリプトのみを処理して返す。
+    /// processedIds に含まれるスクリプト ID はスキップし、新規のものは processedIds に追加する。
+    /// Profiler や Debugger の停止は行わない（最終収集時のみ停止する）。
+    /// </summary>
+    private async Task<List<ScriptCoverage>> ProcessNewScriptsAsync(
+        System.Text.Json.JsonElement root,
+        ICDPSession cdp,
+        PageInfo pageInfo,
+        HashSet<string> processedIds)
+    {
         var scripts = new List<ScriptCoverage>();
 
-        // ループ中に例外が起きても必ず Debugger.disable を呼ぶために try/finally で囲む
-        try
+        // CDP レスポンスの "result" 配列を取り出す
+        if (!root.TryGetProperty("result", out var resultArray))
         {
+            return scripts;
+        }
 
-        // CDPから返されたスクリプトエントリを1件ずつ処理する
         foreach (var entry in resultArray.EnumerateArray())
         {
-            // スクリプトの URL を取得する（プロパティがない場合は空文字にする）
-            var url = entry.TryGetProperty("url", out var urlProp) ? urlProp.GetString() ?? "" : "";
-            // スクリプトIDを取得する（ソースコード取得に使う）
-            var scriptId = entry.TryGetProperty("scriptId", out var sidProp) ? sidProp.GetString() ?? "" : "";
+            // スクリプトの URL と ID を取得する
+            string url;
+            if (entry.TryGetProperty("url", out var urlProp))
+            {
+                string? urlTmp = urlProp.GetString();
+                if (urlTmp == null) { url = ""; } else { url = urlTmp; }
+            }
+            else
+            {
+                url = "";
+            }
+            string scriptId;
+            if (entry.TryGetProperty("scriptId", out var sidProp))
+            {
+                string? sidTmp = sidProp.GetString();
+                if (sidTmp == null) { scriptId = ""; } else { scriptId = sidTmp; }
+            }
+            else
+            {
+                scriptId = "";
+            }
 
             // URL が空のスクリプト（内部スクリプトなど）はスキップする
-            if (string.IsNullOrEmpty(url))
+            if (string.IsNullOrEmpty(url)) { continue; }
+
+            // 収集済みスクリプト ID はスキップする（二重収集防止）
+            // lock の中で Add を呼ぶことでスレッドセーフに「初回のみ処理」を保証する
+            bool isNew;
+            lock (_lock)
+            {
+                isNew = processedIds.Add(scriptId);
+            }
+            if (!isNew) { continue; }
+
+            // scriptFilters に一致するスクリプトのみ処理する
+            if (_scriptFilters.Count > 0 && !_scriptFilters.Any(f => url.Contains(f, StringComparison.OrdinalIgnoreCase)))
             {
                 continue;
             }
 
-            // scriptFilters が指定されている場合、いずれかのフィルタ文字列を URL に含むスクリプトのみ収集する
-            if (scriptFilters.Count > 0 && !scriptFilters.Any(f => url.Contains(f, StringComparison.OrdinalIgnoreCase)))
-            {
-                continue;
-            }
-
-            // scriptExcludes に一致する URL のスクリプトは除外する
-            if (scriptExcludes.Any(e => url.Contains(e, StringComparison.OrdinalIgnoreCase)))
+            // scriptExcludes に一致するスクリプトは除外する
+            if (_scriptExcludes.Any(e => url.Contains(e, StringComparison.OrdinalIgnoreCase)))
             {
                 continue;
             }
@@ -261,83 +262,225 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
                 });
                 if (srcResult.HasValue && srcResult.Value.TryGetProperty("scriptSource", out var srcProp))
                 {
-                    source = srcProp.GetString() ?? "";
+                    string? srcTmp = srcProp.GetString();
+                    if (srcTmp == null) { source = ""; } else { source = srcTmp; }
                 }
             }
             catch (PlaywrightException)
             {
-                // ソースコードの取得に失敗した場合は警告を出してこのスクリプトをスキップする
                 Console.Error.WriteLine($"[Warning] Could not retrieve source for '{url}' — skipping.");
                 continue;
             }
 
-            // ソースコードが空のスクリプトはスキップする
-            if (string.IsNullOrEmpty(source))
-            {
-                continue;
-            }
+            if (string.IsNullOrEmpty(source)) { continue; }
 
-            // functions 配列から関数カバレッジデータを組み立てる
+            // 関数カバレッジデータを組み立てる
             var functions = new List<FunctionCoverage>();
-
             if (entry.TryGetProperty("functions", out var funcsArray))
             {
                 foreach (var func in funcsArray.EnumerateArray())
                 {
-                    // 関数名を取得する（無名関数は空文字になることがある）
-                    var funcName = func.TryGetProperty("functionName", out var fnProp) ? fnProp.GetString() ?? "" : "";
+                    string funcName;
+                    if (func.TryGetProperty("functionName", out var fnProp))
+                    {
+                        string? fnTmp = fnProp.GetString();
+                        if (fnTmp == null) { funcName = ""; } else { funcName = fnTmp; }
+                    }
+                    else
+                    {
+                        funcName = "";
+                    }
                     var ranges = new List<CoverageRange>();
-
                     if (func.TryGetProperty("ranges", out var rangesArray))
                     {
                         foreach (var r in rangesArray.EnumerateArray())
                         {
-                            // 範囲の開始位置・終了位置・実行回数を取得する
-                            var start = r.TryGetProperty("startOffset", out var sProp) ? sProp.GetInt32() : 0;
-                            var end = r.TryGetProperty("endOffset", out var eProp) ? eProp.GetInt32() : 0;
-                            var count = r.TryGetProperty("count", out var cProp) ? cProp.GetInt32() : 0;
+                            int start;
+                            if (r.TryGetProperty("startOffset", out var sProp)) { start = sProp.GetInt32(); } else { start = 0; }
+                            int end;
+                            if (r.TryGetProperty("endOffset",   out var eProp)) { end   = eProp.GetInt32(); } else { end   = 0; }
+                            int count;
+                            if (r.TryGetProperty("count",       out var cProp)) { count = cProp.GetInt32(); } else { count = 0; }
                             ranges.Add(new CoverageRange(start, end, count));
                         }
                     }
-
                     functions.Add(new FunctionCoverage(funcName, ranges));
                 }
             }
 
-            // スクリプトカバレッジデータをリストに追加する（pageInfo でどのタブのスクリプトかを記録する）
             scripts.Add(new ScriptCoverage(pageInfo, url, source, functions));
         }
 
-        } // try ブロックの終わり
+        return scripts;
+    }
+
+    /// <summary>
+    /// カバレッジ収集を停止してデータを返す。
+    /// 中間スナップショットのデータと最終収集のデータを合わせて返す。
+    /// </summary>
+    /// <returns>収集したスクリプトカバレッジデータのリスト（全タブ・全ナビゲーション分）</returns>
+    public async Task<IReadOnlyList<ScriptCoverage>> StopAsync()
+    {
+        // 二重呼び出しを防ぐ
+        if (_stopped) { return []; }
+        _stopped = true;
+
+        // Context.Page イベントハンドラを解除する
+        if (_pageEventHandler != null)
+        {
+            page.Context.Page -= _pageEventHandler;
+            _pageEventHandler  = null;
+        }
+
+        // リクエストイベントハンドラをすべて解除する（新たな中間スナップショットを防ぐ）
+        List<(IPage p, EventHandler<IRequest> handler)> reqPairs = [];
+        lock (_lock)
+        {
+            foreach (var kv in _requestHandlers)
+            {
+                reqPairs.Add((kv.Key, kv.Value));
+            }
+            _requestHandlers.Clear();
+        }
+        foreach (var (p, handler) in reqPairs)
+        {
+            p.Request -= handler;
+        }
+
+        // 追跡ページがない場合は空リストを返す
+        int trackedCount;
+        lock (_lock)
+        {
+            trackedCount = _trackedPages.Count;
+        }
+        if (trackedCount == 0) { return []; }
+
+        // 新しいタブのセットアップタスクが完了するまで待機する
+        List<Task> setupTasks;
+        lock (_lock)
+        {
+            setupTasks = new List<Task>(_pageSetupTasks);
+        }
+        await Task.WhenAll(setupTasks);
+
+        // 中間スナップショットタスクが完了するまで待機する
+        List<Task> snapTasks;
+        lock (_lock)
+        {
+            snapTasks = new List<Task>(_snapTasks);
+        }
+        await Task.WhenAll(snapTasks);
+
+        // 中間スナップショットで収集済みのスクリプトをまとめリストに追加する
+        var allScripts = new List<ScriptCoverage>();
+        lock (_lock)
+        {
+            allScripts.AddRange(_intermediateScripts);
+        }
+
+        // 全ページの最終カバレッジを収集する（中間スナップショット以降の新規スクリプトのみ）
+        List<IPage> pageSnapshot;
+        lock (_lock)
+        {
+            pageSnapshot = new List<IPage>(_trackedPages);
+        }
+
+        for (int i = 0; i < pageSnapshot.Count; i++)
+        {
+            var targetPage = pageSnapshot[i];
+            // StopAsync 時点の URL を最終ページ URL として使用する
+            var pageInfo = new PageInfo(i, targetPage.Url);
+
+            ICDPSession? cdp;
+            HashSet<string>? processedIds;
+            lock (_lock)
+            {
+                _cdpSessions.TryGetValue(targetPage, out cdp);
+                _processedScriptIds.TryGetValue(targetPage, out processedIds);
+            }
+
+            if (cdp == null)
+            {
+                Console.Error.WriteLine($"[Warning] No CDP session for tab {i} ('{targetPage.Url}') — skipping.");
+                continue;
+            }
+
+            if (processedIds == null) { processedIds = new HashSet<string>(); }
+
+            // 最終収集（Profiler と Debugger を停止しながら残りのスクリプトを収集する）
+            var scripts = await FinalCollectFromPageAsync(cdp, pageInfo, processedIds);
+            allScripts.AddRange(scripts);
+        }
+
+        return allScripts;
+    }
+
+    /// <summary>
+    /// 1ページ分の最終カバレッジ収集。Profiler と Debugger を停止しながら未収集スクリプトを取得する。
+    /// </summary>
+    private async Task<List<ScriptCoverage>> FinalCollectFromPageAsync(
+        ICDPSession cdp,
+        PageInfo pageInfo,
+        HashSet<string> processedIds)
+    {
+        // スナップショットを取得する
+        System.Text.Json.JsonElement? result = null;
+        try
+        {
+            result = await cdp.SendAsync("Profiler.takePreciseCoverage");
+        }
+        finally
+        {
+            // 成功・失敗どちらでも必ず Profiler を停止・無効化する
+            await cdp.SendAsync("Profiler.stopPreciseCoverage");
+            await cdp.SendAsync("Profiler.disable");
+        }
+
+        if (result is null) { return []; }
+
+        // 未収集スクリプトを処理する（Debugger は ProcessNewScriptsAsync の後に無効化する）
+        List<ScriptCoverage> scripts;
+        try
+        {
+            scripts = await ProcessNewScriptsAsync(result.Value, cdp, pageInfo, processedIds);
+        }
         finally
         {
             // 成功・失敗どちらでも必ず Debugger を無効化する
             await cdp.SendAsync("Debugger.disable");
         }
 
-        // 収集したスクリプトのカバレッジデータリストを返す
         return scripts;
     }
 
     /// <summary>
-    /// 保持している全リソース（CDP セッション）を解放する。
-    /// IAsyncDisposable の実装。using await 構文で自動的に呼ばれる。
+    /// 保持している全リソース（CDP セッション・イベントハンドラ）を解放する。
     /// </summary>
     public async ValueTask DisposeAsync()
     {
-        // 既に解放済みの場合は何もしない（二重解放を防ぐ）
-        if (_disposed)
-        {
-            return;
-        }
+        if (_disposed) { return; }
         _disposed = true;
 
-        // StopAsync が呼ばれずに Dispose された場合でもイベントハンドラを解除する
-        // （コンテキストが長命な場合のハンドラリークを防ぐ）
+        // Context.Page イベントハンドラを解除する
         if (_pageEventHandler != null)
         {
             page.Context.Page -= _pageEventHandler;
             _pageEventHandler  = null;
+        }
+
+        // StopAsync を経由せずに Dispose された場合もリクエストハンドラーを解除する
+        List<(IPage p, EventHandler<IRequest> handler)> reqPairs = [];
+        lock (_lock)
+        {
+            foreach (var kv in _requestHandlers)
+            {
+                reqPairs.Add((kv.Key, kv.Value));
+            }
+            _requestHandlers.Clear();
+        }
+        foreach (var (p, handler) in reqPairs)
+        {
+            p.Request -= handler;
         }
 
         // すべての CDP セッションを解放する
