@@ -802,10 +802,10 @@ public class CoverageMapTests
     }
 
     /// <summary>
-    /// アロー関数のマーク範囲に関するオフバイワンバグの確認テスト。
-    /// FindMatchingBrace は } の次のインデックスを返すが、
-    /// アロー関数のマーク処理で "m &lt;= braceEnd" としているため
-    /// } の直後の文字（; など）も誤って 0（赤）にマークされる。
+    /// アロー関数のマーク範囲のオフバイワン回帰テスト。
+    /// FindMatchingBrace は } の次のインデックスを返す（例: } が index 28 なら戻り値は 29）。
+    /// マーク処理のループを "m &lt; braceEnd" とすることで } 自体（index 28）までをマークし、
+    /// } の直後の文字（index 29 の ; など）をニュートラル（-1）のまま保つことを確認する。
     /// </summary>
     [Fact]
     public void BuildMap_UncalledArrowFunction_CharAfterClosingBraceRemainsNeutral()
@@ -820,8 +820,8 @@ public class CoverageMapTests
         // } 自体は 0（未実行）でなければならない
         Assert.Equal(0, map[28]); // }
 
-        // } の直後の ; は arrow function の外側 → -1（ニュートラル）であるべき
-        // 現在の実装は m <= braceEnd（= 29）でループするため map[29] = 0 になってしまう
+        // } の直後の ; は arrow function の外側 → -1（ニュートラル）でなければならない
+        // ループを m <= braceEnd にすると map[29] = 0（赤）になってしまうため、回帰防止のアサート
         Assert.Equal(-1, map[29]); // ';' after '}'
     }
 
@@ -1784,5 +1784,30 @@ public class CoverageMapTests
     {
         var merged = HtmlReportGenerator.MergeMaps([-1, -1, -1], [-1, -1, -1]);
         Assert.Equal([-1, -1, -1], merged);
+    }
+
+    /// <summary>
+    /// `function` をオブジェクトプロパティの「キー名」として使った場合（{ function: 1 }）、
+    /// function キーワードとして誤検知せず、マップが変化しないことを確認する。
+    /// JavaScript では `function` はプロパティ名として合法であり、関数本体を持たない。
+    /// 検出ロジックは function の直後に '(' がなければスキップするため誤検知しない。
+    /// </summary>
+    [Fact]
+    public void BuildMap_FunctionUsedAsPropertyKey_NoFalsePositive()
+    {
+        // const o = { function: 1 };
+        //  0         1         2
+        //  0123456789012345678901234
+        // 'function' は index 12 から始まるが、直後に ':' が来るため関数として検出しない
+        const string source = "const o = { function: 1 };";
+
+        var map = HtmlReportGenerator.BuildCoverageMap(source, []);
+
+        // function キーワード部分は -1（ニュートラル）のままであること
+        // （誤って 0（赤）にマークされてはならない）
+        Assert.Equal(-1, map[12]); // 'f' of 'function'
+        Assert.Equal(-1, map[19]); // 'n' (end of 'function')
+        // コロンの直後の値部分も -1 のまま
+        Assert.Equal(-1, map[22]); // '1'
     }
 }

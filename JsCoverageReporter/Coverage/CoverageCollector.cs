@@ -366,12 +366,26 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
         await Task.WhenAll(setupTasks);
 
         // 中間スナップショットタスクが完了するまで待機する
+        // 【注意】ハンドラ解除とスナップタスクのコピーは別のロック区間になるため、
+        // 解除直前に発火したハンドラが _snapTasks に追加するタイミングが前後する可能性がある。
+        // セットアップ完了後に再コピーすることで、その間に追加されたタスクも確実に待機する。
         List<Task> snapTasks;
         lock (_lock)
         {
             snapTasks = new List<Task>(_snapTasks);
         }
         await Task.WhenAll(snapTasks);
+
+        // セットアップ待機中に追加されたスナップタスクを二段階目として確認する
+        List<Task> snapTasks2;
+        lock (_lock)
+        {
+            snapTasks2 = new List<Task>(_snapTasks);
+        }
+        if (snapTasks2.Count > snapTasks.Count)
+        {
+            await Task.WhenAll(snapTasks2);
+        }
 
         // 中間スナップショットで収集済みのスクリプトをまとめリストに追加する
         var allScripts = new List<ScriptCoverage>();
@@ -440,8 +454,12 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
         finally
         {
             // 成功・失敗どちらでも必ず Profiler を停止・無効化する
-            await cdp.SendAsync("Profiler.stopPreciseCoverage");
-            await cdp.SendAsync("Profiler.disable");
+            // ページがクラッシュしている場合など CDP 側でも例外が出ることがあるため
+            // try/catch で囲み、元の例外を飲み込まないようにする
+            try { await cdp.SendAsync("Profiler.stopPreciseCoverage"); }
+            catch (Exception ex) { Console.Error.WriteLine($"[Warning] Profiler.stopPreciseCoverage failed: {ex.Message}"); }
+            try { await cdp.SendAsync("Profiler.disable"); }
+            catch (Exception ex) { Console.Error.WriteLine($"[Warning] Profiler.disable failed: {ex.Message}"); }
         }
 
         if (result is null) { return []; }
@@ -455,7 +473,10 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
         finally
         {
             // 成功・失敗どちらでも必ず Debugger を無効化する
-            await cdp.SendAsync("Debugger.disable");
+            // ページがクラッシュしている場合など CDP 側でも例外が出ることがあるため
+            // try/catch で囲み、元の例外を飲み込まないようにする
+            try { await cdp.SendAsync("Debugger.disable"); }
+            catch (Exception ex) { Console.Error.WriteLine($"[Warning] Debugger.disable failed: {ex.Message}"); }
         }
 
         return scripts;
