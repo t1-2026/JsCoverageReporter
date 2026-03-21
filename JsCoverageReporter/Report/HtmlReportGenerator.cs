@@ -11,7 +11,7 @@ internal enum LineCoverageStatus
 {
     /// <summary>カバレッジ対象外（空行・コメントなど実行されないコード）</summary>
     Neutral,
-    /// <summary>完全に実行された行（行内のすべての文字がカバー済み）</summary>
+    /// <summary>完全に実行された行（行内のすべての文字が実行済み）</summary>
     Covered,
     /// <summary>全く実行されなかった行（行内のすべての文字が未実行）</summary>
     Uncovered,
@@ -519,6 +519,102 @@ internal class HtmlReportGenerator
     }
 
     /// <summary>
+    /// 単一引用符の文字列 '...' をスキップして閉じ ' の直後の位置を返す。
+    /// バックスラッシュによるエスケープを考慮する。
+    /// </summary>
+    /// <param name="source">ソースコード全文</param>
+    /// <param name="start">開き ' のインデックス</param>
+    /// <returns>閉じ ' の直後のインデックス（閉じ ' が見つからない場合はソース末尾）</returns>
+    private static int SkipSingleQuotedString(string source, int start)
+    {
+        int i = start + 1; // 開き ' の次の文字から走査する
+        int len = source.Length;
+        while (i < len && source[i] != '\'')
+        {
+            // バックスラッシュエスケープの次の文字を読み飛ばす
+            if (source[i] == '\\') { i++; }
+            i++;
+        }
+        // 閉じ ' をスキップする（見つからない場合は末尾のまま）
+        if (i < len) { i++; }
+        return i;
+    }
+
+    /// <summary>
+    /// 二重引用符の文字列 "..." をスキップして閉じ " の直後の位置を返す。
+    /// バックスラッシュによるエスケープを考慮する。
+    /// </summary>
+    /// <param name="source">ソースコード全文</param>
+    /// <param name="start">開き " のインデックス</param>
+    /// <returns>閉じ " の直後のインデックス（閉じ " が見つからない場合はソース末尾）</returns>
+    private static int SkipDoubleQuotedString(string source, int start)
+    {
+        int i = start + 1; // 開き " の次の文字から走査する
+        int len = source.Length;
+        while (i < len && source[i] != '"')
+        {
+            // バックスラッシュエスケープの次の文字を読み飛ばす
+            if (source[i] == '\\') { i++; }
+            i++;
+        }
+        // 閉じ " をスキップする（見つからない場合は末尾のまま）
+        if (i < len) { i++; }
+        return i;
+    }
+
+    /// <summary>
+    /// テンプレートリテラル `...` をスキップして閉じ ` の直後の位置を返す。
+    /// ${ } 内の {} ネスト・文字列・ネストされたテンプレートリテラルを再帰的に処理する。
+    /// これにより `${ {key: 'val'} }` や `${ `inner` }` のような複雑なケースも正しく処理できる。
+    /// </summary>
+    /// <param name="source">ソースコード全文</param>
+    /// <param name="start">開き ` のインデックス</param>
+    /// <returns>閉じ ` の直後のインデックス（閉じ ` が見つからない場合はソース末尾）</returns>
+    private static int SkipTemplateLiteralFull(string source, int start)
+    {
+        int i = start + 1; // 開き ` の次の文字から走査する
+        int len = source.Length;
+        while (i < len)
+        {
+            char c = source[i];
+            // バックスラッシュエスケープの次の文字を読み飛ばす
+            if (c == '\\') { i += 2; continue; }
+            // 閉じ ` でテンプレートリテラル終了
+            if (c == '`') { return i + 1; }
+            // ${ の開始 → 式部分を深さカウントでスキップする
+            if (c == '$' && i + 1 < len && source[i + 1] == '{')
+            {
+                i += 2; // ${ の2文字をスキップする
+                int depth = 1; // ${ の { を深さ1として開始する
+                while (i < len && depth > 0)
+                {
+                    char t = source[i];
+                    // バックスラッシュエスケープをスキップする
+                    if (t == '\\') { i += 2; continue; }
+                    // 文字列リテラルをスキップする（中の } が深さカウントを狂わせないようにする）
+                    if (t == '\'') { i = SkipSingleQuotedString(source, i); continue; }
+                    if (t == '"')  { i = SkipDoubleQuotedString(source, i); continue; }
+                    // ネストされたテンプレートリテラルを再帰的にスキップする
+                    if (t == '`')  { i = SkipTemplateLiteralFull(source, i); continue; }
+                    // { で深さが増える、} で深さが減る
+                    if (t == '{') { depth++; }
+                    else if (t == '}')
+                    {
+                        depth--;
+                        // 深さが 0 になったら ${ } の閉じ } を消費して次へ進む
+                        if (depth == 0) { i++; continue; }
+                    }
+                    i++;
+                }
+                continue;
+            }
+            i++;
+        }
+        // 閉じ ` が見つからなかった場合（構文エラーのソース）はソース末尾を返す
+        return i;
+    }
+
+    /// <summary>
     /// '/' から始まる正規表現リテラル /pattern/flags をスキップして直後の位置を返す。
     /// 文字クラス [] の中では '/' をエスケープなしに使える点を考慮する。
     /// </summary>
@@ -781,9 +877,9 @@ internal class HtmlReportGenerator
             // 行のHTMLを構築するための文字列ビルダー
             var sb = new StringBuilder();
 
-            // 行内でカバー済みの文字数（行の状態判定に使う）
+            // 行内で実行済みの文字数（行の状態判定に使う）
             int coveredCount = 0;
-            // 行内で未カバーの文字数（行の状態判定に使う）
+            // 行内で未実行の文字数（行の状態判定に使う）
             int uncoveredCount = 0;
 
             // 現在開いている <span> のカバレッジ状態（-2 = まだ <span> を開いていない）
@@ -887,7 +983,7 @@ internal class HtmlReportGenerator
                     sb.Append(ch.ToString());
                 }
 
-                // カバー済み・未カバーの文字数を集計する（行の状態判定に使う）
+                // 実行済み・未実行の文字数を集計する（行の状態判定に使う）
                 if (coverage == 1)
                 {
                     // 実行済み文字のカウントを増やす
@@ -1160,15 +1256,15 @@ internal class HtmlReportGenerator
             }
             pageDisplay = string.Join(", ", parts);
         }
-        // 画面情報とスクリプト URL をページ見出しとして出力する
-        sb.AppendLine($"<h1>{pageDisplay} / {HtmlEncode(scriptUrl)}</h1>");
+        // 画面情報とスクリプトファイル名をページ見出しとして出力する
+        sb.AppendLine($"<h1>{pageDisplay} / {HtmlEncode(GetFileName(scriptUrl))}</h1>");
 
         // 各色の意味を説明する凡例バーを出力する
         sb.AppendLine("""
             <div class="legend">
               <a class="back-link" href="../index.html">← 一覧に戻る</a>
-              <span class="legend-item"><span class="swatch" style="background:#c6efc6"></span>カバー済み — 行内すべてのブロックが実行された</span>
-              <span class="legend-item"><span class="swatch" style="background:#f0e8a0"></span>部分カバー — 実行済みと未実行が混在（if/else の片側など）</span>
+              <span class="legend-item"><span class="swatch" style="background:#c6efc6"></span>実行済み — 行内すべてのブロックが実行された</span>
+              <span class="legend-item"><span class="swatch" style="background:#f0e8a0"></span>部分実行 — 実行済みと未実行が混在（if/else の片側など）</span>
               <span class="legend-item"><span class="swatch" style="background:#f0c6c6"></span>未実行 — 一度も実行されなかった</span>
               <span class="legend-item"><span class="swatch" style="background:#e8e8e8"></span>対象外 — コメント・空行・変数宣言のみの行など</span>
             </div>
@@ -1187,17 +1283,17 @@ internal class HtmlReportGenerator
             string cls;
             if (line.Status == LineCoverageStatus.Covered)
             {
-                // 完全カバー行は緑色の行番号を表示する
+                // 完全実行行は緑色の行番号を表示する
                 cls = "line line-covered";
             }
             else if (line.Status == LineCoverageStatus.Uncovered)
             {
-                // 未カバー行は赤色の行番号を表示する
+                // 未実行行は赤色の行番号を表示する
                 cls = "line line-uncovered";
             }
             else if (line.Status == LineCoverageStatus.Partial)
             {
-                // 部分カバー行は黄色の行番号を表示する
+                // 部分実行行は黄色の行番号を表示する
                 cls = "line line-partial";
             }
             else
@@ -1225,9 +1321,9 @@ internal class HtmlReportGenerator
         List<(IReadOnlyList<(string label, string pageUrl, string tabFilename)> tabs,
               string url, int covered, int partial, int total, string mergedFilename)> rows)
     {
-        // 全スクリプトのカバー済み行数の合計
+        // 全スクリプトの実行済み行数の合計
         int totalCovered = 0;
-        // 全スクリプトの部分カバー行数の合計
+        // 全スクリプトの部分実行行数の合計
         int totalPartial = 0;
         // 全スクリプトのカバレッジ対象行数の合計
         int totalLines = 0;
@@ -1244,7 +1340,7 @@ internal class HtmlReportGenerator
         double overallPct;
         if (totalLines > 0)
         {
-            // (カバー済み + 部分カバー) / 全対象行数 × 100 でパーセントを計算する
+            // (実行済み + 部分実行) / 全対象行数 × 100 でパーセントを計算する
             overallPct = 100.0 * (totalCovered + totalPartial) / totalLines;
         }
         else
@@ -1296,15 +1392,15 @@ internal class HtmlReportGenerator
               <p>このレポートは、JavaScript ファイルの各行が実際に実行されたかどうかを記録したカバレッジレポートです。<br>
               スクリプト名をクリックすると、行ごとの実行状況を色分け表示で確認できます。</p>
               <p><strong>カバレッジ率の計算式</strong><br>
-              <span class="formula">（カバー済み行数 ＋ 部分カバー行数）÷ 対象行数 × 100</span><br>
+              <span class="formula">（実行済み行数 ＋ 部分実行行数）÷ 対象行数 × 100</span><br>
               ※ 対象行数にはコメント・空行・宣言のみの行（対象外）は含みません。</p>
               <table class="legend-table">
                 <tr>
-                  <td><span class="swatch" style="background:#c6efc6"></span><strong>カバー済み</strong></td>
+                  <td><span class="swatch" style="background:#c6efc6"></span><strong>実行済み</strong></td>
                   <td>行内のすべてのブロックが実行された</td>
                 </tr>
                 <tr>
-                  <td><span class="swatch" style="background:#f0e8a0"></span><strong>部分カバー</strong></td>
+                  <td><span class="swatch" style="background:#f0e8a0"></span><strong>部分実行</strong></td>
                   <td>if / else など、実行された部分と未実行の部分が混在する（分岐の片側だけ通った場合など）</td>
                 </tr>
                 <tr>
@@ -1319,46 +1415,13 @@ internal class HtmlReportGenerator
             </div>
             """);
 
-        // 制約・計測対象外パターンのセクションを出力する
-        sb.AppendLine("""
-            <div class="guide">
-              <h2>制約・計測対象外パターン</h2>
-              <ul style="margin:4px 0 0;padding-left:20px;line-height:1.9">
-                <li>
-                  <strong>eval() / new Function() で動的生成されるコード</strong> —
-                  V8 がこれらのスクリプトに URL を付与しないためスキップされます。
-                </li>
-                <li>
-                  <strong>Web Worker 内のスクリプト</strong> —
-                  Worker は別スレッドで動作するため、このツールの CDP セッションの対象外です。
-                </li>
-                <li>
-                  <strong>ソースマップ非対応</strong> —
-                  TypeScript や webpack などでバンドルされた JavaScript は、変換後のコードがそのまま計測対象になります。
-                  元のソースファイルへのマッピングは行いません。
-                </li>
-                <li>
-                  <strong>外側関数が実行された場合の内側未実行関数</strong> —
-                  V8 は外側関数の実行範囲を CDP で報告するため、その範囲内に定義された内側の未実行関数が
-                  「カバー済み（緑）」として表示されることがあります。
-                </li>
-                <li>
-                  <strong>インラインスクリプト（&lt;script&gt; ブロック）の取得条件</strong> —
-                  インラインスクリプトの URL はページ URL と同じになります。
-                  scriptFilters が空の場合はキャプチャされます。
-                  scriptFilters を指定する場合は、ページ URL に含まれるキーワード（例: ページのファイル名）を追加してください。
-                </li>
-              </ul>
-            </div>
-            """);
-
         // 全体カバレッジ率のサマリー行を出力する（小数点以下1桁で表示）
-        sb.AppendLine($"<p>全体カバレッジ: <strong>{overallPct:F1}%</strong>（カバー済み {totalCovered} 行、部分カバー {totalPartial} 行 / 対象 {totalLines} 行）</p>");
+        sb.AppendLine($"<p>全体カバレッジ: <strong>{overallPct:F1}%</strong>（実行済み {totalCovered} 行、部分実行 {totalPartial} 行 / 対象 {totalLines} 行）</p>");
 
         // スクリプト一覧テーブルのヘッダー行を出力する
         sb.AppendLine("""
             <table class="data">
-            <tr><th>ページ URL</th><th>スクリプト</th><th class="num">カバー済み</th><th class="num">部分カバー</th><th class="num">対象行数</th><th class="num">カバレッジ率</th></tr>
+            <tr><th>ページ URL</th><th>スクリプト</th><th class="num">実行済み</th><th class="num">部分実行</th><th class="num">対象行数</th><th class="num">カバレッジ率</th></tr>
             """);
 
         // スクリプトごとのデータ行を出力する
@@ -1424,15 +1487,119 @@ internal class HtmlReportGenerator
                 pageUrlCell = sbDetails.ToString();
             }
 
-            // ページ URL・スクリプト URL（合成ページへのリンク付き）・各行数・カバレッジ率を出力する
+            // ページ URL・スクリプトファイル名（合成ページへのリンク付き）・各行数・カバレッジ率を出力する
             sb.AppendLine($"<tr><td>{pageUrlCell}</td>" +
-                          $"<td><a href=\"scripts/{mergedFilename}\">{HtmlEncode(url)}</a></td>" +
+                          $"<td><a href=\"scripts/{mergedFilename}\">{HtmlEncode(GetFileName(url))}</a></td>" +
                           $"<td class=\"num\">{covered}</td><td class=\"num\">{partial}</td>" +
                           $"<td class=\"num\">{total}</td><td class=\"num\">{pct:F1}%</td></tr>");
         }
 
-        // テーブルとページの閉じタグを出力する
-        sb.AppendLine("</table></body></html>");
+        // テーブルの閉じタグを出力する
+        sb.AppendLine("</table>");
+
+        // 制約・計測対象外パターンのセクションを出力する（レポート末尾に配置）
+        sb.AppendLine("""
+            <div class="guide">
+              <h2>制約・計測対象外パターン</h2>
+              <ul style="margin:4px 0 0;padding-left:20px;line-height:1.9">
+                <li>
+                  <strong>eval() / new Function() で動的生成されるコード</strong> —
+                  V8 がこれらのスクリプトに URL を付与しないためスキップされます。
+                </li>
+                <li>
+                  <strong>Web Worker 内のスクリプト</strong> —
+                  Worker は別スレッドで動作するため、このツールの CDP セッションの対象外です。
+                </li>
+                <li>
+                  <strong>ソースマップ非対応</strong> —
+                  TypeScript や webpack などでバンドルされた JavaScript は、変換後のコードがそのまま計測対象になります。
+                  元のソースファイルへのマッピングは行いません。
+                </li>
+                <li>
+                  <strong>外側関数が実行された場合の内側未実行関数</strong> —
+                  V8 は外側関数の実行範囲を CDP で報告するため、その範囲内に定義された内側の未実行関数が
+                  「実行済み（緑）」として表示されることがあります。
+                </li>
+                <li>
+                  <strong>インラインスクリプト（&lt;script&gt; ブロック）の取得条件</strong> —
+                  インラインスクリプトの URL はページ URL と同じになります。
+                  scriptFilters が空の場合はキャプチャされます。
+                  scriptFilters を指定する場合は、ページ URL に含まれるキーワード（例: ページのファイル名）を追加してください。
+                </li>
+              </ul>
+            </div>
+            </body></html>
+            """);
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// URLのパスからファイル名部分を取得する。
+    /// 例: http://localhost:3000/js/app.js    → app.js
+    ///     file:///C:/work/demo/app.js        → app.js
+    /// http:// / https:// / file:// で始まる URL のみパス解析を行い、それ以外はそのまま返す。
+    /// これにより、XSS テスト用の偽 URL（"&lt;evil&gt;name&lt;/evil&gt;" など）も安全に扱える。
+    /// </summary>
+    /// <param name="url">スクリプトのURL</param>
+    /// <returns>URLの最後のパスセグメント（取得できない場合はurlそのものを返す）</returns>
+    internal static string GetFileName(string url)
+    {
+        // HTTP / HTTPS / FILE URL のみパス解析を行う。それ以外はそのまま返す。
+        bool isHttp  = url.StartsWith("http://",  StringComparison.OrdinalIgnoreCase);
+        bool isHttps = url.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
+        bool isFile  = url.StartsWith("file://",  StringComparison.OrdinalIgnoreCase);
+        if (!isHttp && !isHttps && !isFile)
+        {
+            return url;
+        }
+
+        // スキーム部分の長さ（"http://" = 7, "https://" = 8, "file://" = 7）
+        int schemeLength;
+        if (isHttps)
+        {
+            schemeLength = 8;
+        }
+        else
+        {
+            schemeLength = 7;
+        }
+
+        // ホスト部の後のパス開始スラッシュを探す
+        int pathStart = url.IndexOf('/', schemeLength);
+        if (pathStart < 0)
+        {
+            // パス部分がない場合はホスト名部分を返す
+            return url.Substring(schemeLength);
+        }
+
+        // パス部分を取り出す
+        string path = url.Substring(pathStart);
+
+        // クエリ文字列（? 以降）を除去する
+        int queryIndex = path.IndexOf('?');
+        if (queryIndex >= 0)
+        {
+            path = path.Substring(0, queryIndex);
+        }
+
+        // フラグメント（# 以降）を除去する
+        int hashIndex = path.IndexOf('#');
+        if (hashIndex >= 0)
+        {
+            path = path.Substring(0, hashIndex);
+        }
+
+        // 末尾のスラッシュを除去する
+        path = path.TrimEnd('/');
+
+        // 最後の '/' 以降をファイル名として返す
+        int lastSlash = path.LastIndexOf('/');
+        if (lastSlash >= 0 && lastSlash < path.Length - 1)
+        {
+            return path.Substring(lastSlash + 1);
+        }
+
+        // ルートパスのみ（/ だけ）の場合は path をそのまま返す
+        return path;
     }
 }
