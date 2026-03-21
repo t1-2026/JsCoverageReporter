@@ -1982,14 +1982,16 @@ public class CoverageMapTests
     public void BuildMap_PostDecrementBeforeDivision_FunctionAfterCorrectlyDetected()
     {
         // "count-- /x/ function bar() { }"
-        // x was chosen to make /x/ a valid regex, so it actually consumes the closing /
+        // 0-5: count--, 6: space, 7-9: /x/, 10: space, 12-19: function, 20: space
+        // 修正後: IsRegexStart が false を返し（-- の直後なので / は除算）
+        //         function が正常に検出される → map[12] = 0
         const string source = "count-- /x/ function bar() { }";
         //                     0123456789012345678901234567890
 
         var map = HtmlReportGenerator.BuildCoverageMap(source, []);
 
         // function キーワードが 0（未実行）になっているか確認する
-        Assert.Equal(0, map[17]); // 'f' of function
-        Assert.Equal(0, map[24]); // 'n' of function
+        Assert.Equal(0, map[12]); // 'f' of function
+        Assert.Equal(0, map[19]); // 'n' (最後の文字) of function
     }
 }
