@@ -1,0 +1,37 @@
+{
+  "url": "http://localhost:8080/demo/index.html",
+  "scriptFilter": "app.js",
+  "actions": [
+    { "type": "wait", "milliseconds": 500 },
+
+    { "type": "fill",  "selector": "#new-todo", "value": "Buy groceries" },
+    { "type": "press", "selector": "#new-todo", "value": "Enter" },
+    { "type": "wait",  "milliseconds": 200 },
+
+    { "type": "fill",  "selector": "#new-todo", "value": "Write tests" },
+    { "type": "press", "selector": "#new-todo", "value": "Enter" },
+    { "type": "wait",  "milliseconds": 200 },
+
+    { "type": "fill",  "selector": "#new-todo", "value": "Fix bugs" },
+    { "type": "press", "selector": "#new-todo", "value": "Enter" },
+    { "type": "wait",  "milliseconds": 200 },
+
+    { "type": "click", "selector": "#todo-list li:nth-child(1) input[type=checkbox]" },
+    { "type": "wait",  "milliseconds": 200 },
+
+    { "type": "click", "selector": "#btn-active" },
+    { "type": "wait",  "milliseconds": 200 },
+
+    { "type": "click", "selector": "#btn-completed" },
+    { "type": "wait",  "milliseconds": 200 },
+
+    { "type": "click", "selector": "#btn-all" },
+    { "type": "wait",  "milliseconds": 200 },
+
+    { "type": "click", "selector": "#clear-completed" },
+    { "type": "wait",  "milliseconds": 200 },
+
+    { "type": "click", "selector": "#todo-list li:nth-child(1) button" },
+    { "type": "wait",  "milliseconds": 200 }
+  ]
+}

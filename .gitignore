@@ -10,3 +10,15 @@ dist/
 /sample-report/
 /dist-report/
 .worktrees/
+
+# AI エージェントのローカル設定（公開不要）
+.claude/
+
+# テスト結果・ローカル実行ログ（環境固有情報を含むため公開不要）
+*.trx
+TestResults/
+test_out.txt
+
+# 開発中の内部設計ドキュメント（公開不要）
+docs/plans/
+docs/superpowers/

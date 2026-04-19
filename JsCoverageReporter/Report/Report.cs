@@ -1,40 +1,16 @@
+#nullable disable
+
 using System.Text;
 using JsCoverageReporter.Coverage;
 
 namespace JsCoverageReporter.Report;
 
 /// <summary>
-/// 行のカバレッジ状態を表す列挙型。
-/// HTML出力時のCSSクラス選択やカウント集計に使用する。
+/// V8のカバレッジデータを処理し、文字単位のカバレッジマップを構築するASTパーサークラス。
 /// </summary>
-internal enum LineCoverageStatus
-{
-    /// <summary>カバレッジ対象外（空行・コメントなど実行されないコード）</summary>
-    Neutral,
-    /// <summary>完全に実行された行（行内のすべての文字が実行済み）</summary>
-    Covered,
-    /// <summary>全く実行されなかった行（行内のすべての文字が未実行）</summary>
-    Uncovered,
-    /// <summary>実行された部分と未実行の部分が混在する行（if/else の分岐など）</summary>
-    Partial,
-}
-
-/// <summary>
-/// 1行分のHTMLと状態をまとめるレコード型。
-/// BuildLines メソッドが生成し、BuildScriptPage メソッドが利用する。
-/// </summary>
-/// <param name="Html">行のHTMLコンテンツ（span タグでカバレッジ状態を色付けしたもの）</param>
-/// <param name="Status">行全体のカバレッジ状態</param>
-internal record LineData(string Html, LineCoverageStatus Status);
-
-/// <summary>
-/// HTMLカバレッジレポートを生成するクラス。
-/// index.html（サマリー）と scripts/script-N.html（詳細）を生成する。
-/// </summary>
-internal class HtmlReportGenerator
+internal static class CoverageParser
 {
     /// <summary>
-    /// メソッド短縮構文の検出対象から除外するコントロールフローキーワードの集合。
     /// これらのキーワードは identifier(...) { } の形でも関数定義ではないため除外する。
     /// 例: if (cond) { } や for (;;) { } を誤検出しないようにする。
     /// </summary>
@@ -55,6 +31,7 @@ internal class HtmlReportGenerator
         "yield",  // ジェネレータ関数内: yield /regex/ のパターン
         "case",   // switch 文内: case /regex/.test(x) のパターン
         "await",  // 非同期関数内: await /regex/ のパターン
+        "else",   // else /regex/.test(x) のパターン
     };
     /// <summary>
     /// ソースコードの各文字に対してカバレッジ値を記録した配列を作成する。
@@ -67,15 +44,23 @@ internal class HtmlReportGenerator
     /// <returns>各文字のカバレッジ値を格納した配列（インデックス = 文字位置）</returns>
     internal static int[] BuildCoverageMap(string source, IEnumerable<FunctionCoverage> functions)
     {
+        // null ソースは空配列を返す（BuildLines と同様の防衛処理）
+        if (source == null) { return []; }
+
         // まず全文字を「カバレッジ対象外(-1)」で初期化する
         var map = new int[source.Length];
         Array.Fill(map, -1);
+
+        // functions が null の場合は空として扱う（#nullable disable 環境の防衛処理）
+        if (functions == null) { return map; }
 
         // 全関数の範囲を1つのリストにまとめる
         var allRanges = new List<CoverageRange>();
         // 各関数のカバレッジ範囲を走査してリストに追加する
         foreach (FunctionCoverage func in functions)
         {
+            // func または func.Ranges が null の場合はスキップする（不正な CDP データへの防衛処理）
+            if (func == null || func.Ranges == null) { continue; }
             // 各関数が持つすべての範囲をまとめてリストに追加する
             foreach (CoverageRange range in func.Ranges)
             {
@@ -162,10 +147,12 @@ internal class HtmlReportGenerator
             char c = source[i];
 
             // 単一引用符の文字列をスキップする（中の function は無視する）
-            if (c == '\'') { i = SkipSingleQuotedString(source, i); continue; }
+            // サブレンジ再帰時に end を超えた場合はクランプして安全に終了する
+            if (c == '\'') { i = SkipSingleQuotedString(source, i); if (i > end) { i = end; } continue; }
 
             // 二重引用符の文字列をスキップする（中の function は無視する）
-            if (c == '"') { i = SkipDoubleQuotedString(source, i); continue; }
+            // サブレンジ再帰時に end を超えた場合はクランプして安全に終了する
+            if (c == '"') { i = SkipDoubleQuotedString(source, i); if (i > end) { i = end; } continue; }
 
             // テンプレートリテラルをスキップし、${ } の中は再帰スキャンする
             if (c == '`')
@@ -178,9 +165,6 @@ internal class HtmlReportGenerator
                     if (t == '\\') { i += 2; continue; }
                     // 閉じ ` でテンプレートリテラル終了
                     if (t == '`') { i++; break; }
-                    // ネストされたテンプレートリテラル（${ } 内の `...`）を SkipTemplateLiteralFull で完全スキップする
-                    // （以前のインライン実装では ${}内のバッククォートを i++ するだけで、
-                    //   内部の ${ } が外側の深さカウントを狂わせる問題があった）
                     // ${ を発見したら、対応する } を FindMatchingBrace で探して再帰スキャンする
                     if (t == '$' && i + 1 < end && source[i + 1] == '{')
                     {
@@ -188,15 +172,15 @@ internal class HtmlReportGenerator
                         int braceEnd = FindMatchingBrace(source, braceStart);
                         if (braceEnd > braceStart)
                         {
-                            // ${ と } の間（braceStart+1 から braceEnd-1 を含まない）を再帰的にスキャンする
-                            // FindMatchingBrace は } の直後の位置を返すため braceEnd-1 が } の位置
+                            // ${ と } の間を再帰的にスキャンする（braceEnd は } の直後）
                             ScanRange(source, map, braceStart + 1, braceEnd - 1);
                             i = braceEnd; // } の直後へ進む
+                            // サブレンジ再帰時に end を超えた場合はクランプして安全に終了する
+                            if (i > end) { i = end; }
                         }
                         else
                         {
-                            // 対応する } が見つからない場合は ${ の2文字をスキップして続ける
-                            i += 2;
+                            i += 2; // 対応する } が見つからない場合は ${ をスキップして続ける
                         }
                         continue;
                     }
@@ -204,7 +188,6 @@ internal class HtmlReportGenerator
                 }
                 continue;
             }
-
 
             // 行コメント // をスキップする（改行まで読み飛ばす）
             if (c == '/' && i + 1 < end && source[i + 1] == '/')
@@ -223,202 +206,35 @@ internal class HtmlReportGenerator
             }
 
             // 正規表現リテラルをスキップして function キーワードを誤検出しないようにする
+            // サブレンジ再帰時に end を超えた場合はクランプして安全に終了する
             if (c == '/' && IsRegexStart(source, i))
             {
                 i = SkipRegexLiteral(source, i);
+                if (i > end) { i = end; }
                 continue;
             }
 
-            // アロー関数 => の検出（ブロック本体 {} を持つ場合のみ）
+            // アロー関数 => の検出（ブロック本体 {} を持つ場合のみ）— 詳細は TryMarkArrowFunction を参照
             if (c == '=' && i + 1 < end && source[i + 1] == '>')
             {
-                // => の開始位置を記録する
-                int arrowStart = i;
-                // => の後の空白をスキップする
-                int afterArrow = i + 2;
-                while (afterArrow < end && char.IsWhiteSpace(source[afterArrow])) { afterArrow++; }
-                // 次の文字が { であり、このアロー関数がカバレッジデータにない場合のみ処理する
-                if (afterArrow < end && source[afterArrow] == '{' && map[arrowStart] == -1)
-                {
-                    int braceEnd = FindMatchingBrace(source, afterArrow);
-                    if (braceEnd > afterArrow)
-                    {
-                        // => から } まで（braceEnd の直前）を未実行（0）にマークする
-                        for (int m = arrowStart; m < braceEnd; m++)
-                        {
-                            if (map[m] == -1) { map[m] = 0; }
-                        }
-
-                        // async アロー関数 (async () => {} / async x => {}) の
-                        // async キーワードも未実行（0）としてマークする。
-                        // => の直前を逆走査して ) または識別子を探し、その前の async を検出する。
-                        int backScan = arrowStart - 1;
-
-                        // arrowStart 直前の空白をスキップする
-                        while (backScan >= 0 && char.IsWhiteSpace(source[backScan]))
-                        {
-                            backScan--;
-                        }
-
-                        // パラメータリスト ')' のケース: async (x, y) => {}
-                        if (backScan >= 0 && source[backScan] == ')')
-                        {
-                            // 対応する '(' まで逆走査する
-                            // 文字列リテラル内の括弧（例: async (x = ")") => {}）を除外するため
-                            // クォートに当たった場合は文字列全体を逆方向にスキップする
-                            int parenDepth = 1;
-                            backScan--;
-                            while (backScan >= 0 && parenDepth > 0)
-                            {
-                                char bc = source[backScan];
-                                // 文字列リテラルの閉じクォートに当たった場合は開きクォートまで逆走査する
-                                if (bc == '"' || bc == '\'')
-                                {
-                                    char quote = bc;
-                                    backScan--;
-                                    while (backScan >= 0)
-                                    {
-                                        if (source[backScan] == quote)
-                                        {
-                                            // 直前の連続するバックスラッシュをカウントしてエスケープ判定する
-                                            int esc = 0;
-                                            int tmp = backScan - 1;
-                                            while (tmp >= 0 && source[tmp] == '\\') { esc++; tmp--; }
-                                            // 偶数個なら実際の開きクォート（文字列の先頭）
-                                            if (esc % 2 == 0) { break; }
-                                        }
-                                        backScan--;
-                                    }
-                                    // ループ末尾の backScan-- で開きクォートの前に進む
-                                }
-                                else if (bc == ')') { parenDepth++; }
-                                else if (bc == '(') { parenDepth--; }
-                                backScan--;
-                            }
-                            // ループ終了時 backScan は '(' の 1 つ前の位置にある
-                        }
-                        else if (backScan >= 0 && IsIdentifierChar(source[backScan]))
-                        {
-                            // 単一パラメータ識別子のケース: async x => {}
-                            while (backScan >= 0 && IsIdentifierChar(source[backScan]))
-                            {
-                                backScan--;
-                            }
-                            // ループ終了時 backScan は識別子の 1 つ前の位置にある
-                        }
-
-                        // '(' または識別子の直前の空白をスキップする
-                        while (backScan >= 0 && char.IsWhiteSpace(source[backScan]))
-                        {
-                            backScan--;
-                        }
-
-                        // "async" キーワードを確認する（backScan が 'c' の位置を指しているはず）
-                        if (backScan >= 4)
-                        {
-                            string asyncCandid = source.Substring(backScan - 4, 5);
-                            if (asyncCandid == "async")
-                            {
-                                // async の前が識別子文字でないことを確認する（notasync などを除外する）
-                                bool asyncStandalone;
-                                if (backScan - 5 < 0)
-                                {
-                                    // ファイル先頭なので前に文字がない → standalone async
-                                    asyncStandalone = true;
-                                }
-                                else
-                                {
-                                    asyncStandalone = !IsIdentifierChar(source[backScan - 5]);
-                                }
-
-                                if (asyncStandalone)
-                                {
-                                    // async キーワードの先頭位置（'a' のインデックス）
-                                    int asyncStart = backScan - 4;
-                                    // async から => の直前まで（arrowStart は '=' の位置）をマークする
-                                    for (int a = asyncStart; a < arrowStart; a++)
-                                    {
-                                        if (map[a] == -1) { map[a] = 0; }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                // => の 2 文字目（>）をスキップして次の文字へ進む
-                i += 2;
+                i = TryMarkArrowFunction(source, map, i, end);
                 continue;
             }
 
-            // function キーワードの検出を試みる（'f' 以外の文字は確実にスキップする）
-            if (c == 'f' && i + 8 <= end && source.Substring(i, 8) == "function")
+            // function キーワードの検出— 詳細は TryMarkFunctionKeyword を参照
+            if (c == 'f' && i + 8 <= end && source.AsSpan(i, 8).SequenceEqual("function"))
             {
-                // function の前が識別子文字でないことを確認する（別の単語の一部を誤検出しない）
-                bool prevOk = i == 0 || !IsIdentifierChar(source[i - 1]);
-                // function の直後が識別子文字でないことを確認する（例: functionCall を除外する）
-                bool nextOk = i + 8 >= end || !IsIdentifierChar(source[i + 8]);
+                i = TryMarkFunctionKeyword(source, map, i, end);
+                continue;
+            }
 
-                if (prevOk && nextOk && map[i] == -1)
-                {
-                    int funcStart = i;
-
-                    // async function の場合、async キーワードも未実行（赤）としてマークする
-                    int scanBack = funcStart - 1;
-                    while (scanBack >= 0 && char.IsWhiteSpace(source[scanBack])) { scanBack--; }
-                    if (scanBack >= 4)
-                    {
-                        string candidate = source.Substring(scanBack - 4, 5);
-                        if (candidate == "async")
-                        {
-                            bool isStandaloneAsync;
-                            if (scanBack - 5 < 0)
-                            {
-                                isStandaloneAsync = true;
-                            }
-                            else
-                            {
-                                isStandaloneAsync = !IsIdentifierChar(source[scanBack - 5]);
-                            }
-                            if (isStandaloneAsync)
-                            {
-                                int asyncStart = scanBack - 4;
-                                for (int a = asyncStart; a <= scanBack; a++)
-                                {
-                                    if (map[a] == -1) { map[a] = 0; }
-                                }
-                            }
-                        }
-                    }
-
-                    int j = i + 8; // "function" の次の文字へ進む
-                    // ジェネレータ関数の * をスキップする
-                    if (j < end && source[j] == '*') { j++; }
-                    // 空白をスキップする
-                    while (j < end && char.IsWhiteSpace(source[j])) { j++; }
-                    // 関数名（識別子）をスキップする（無名関数の場合はスキップなし）
-                    while (j < end && IsIdentifierChar(source[j])) { j++; }
-                    // 空白をスキップする
-                    while (j < end && char.IsWhiteSpace(source[j])) { j++; }
-                    // パラメータリスト ( ... ) をスキップする
-                    if (j < end && source[j] == '(') { j = SkipBalancedParens(source, j); }
-                    // 空白をスキップする
-                    while (j < end && char.IsWhiteSpace(source[j])) { j++; }
-
-                    if (j < end && source[j] == '{')
-                    {
-                        int funcEnd = FindMatchingBrace(source, j);
-                        if (funcEnd > 0)
-                        {
-                            // 関数本体内でカバレッジ対象外(-1)の部分を未実行(0)としてマークする
-                            for (int k = funcStart; k < funcEnd; k++)
-                            {
-                                if (map[k] == -1) { map[k] = 0; }
-                            }
-                            i = funcEnd;
-                            continue;
-                        }
-                    }
-                }
+            // computed property key ([...](){}) の検出— 詳細は TryMarkComputedMethod を参照
+            // 識別子文字でない文字の直後に '[' が来た場合のみ処理する（配列アクセス arr[0] は除外）
+            // ')' や ']' の直後は呼び出し・添字アクセス後の続き（foo()[0]() {} など）なので除外する
+            if (c == '[' && (i == 0 || (!IsIdentifierChar(source[i - 1]) && source[i - 1] != ')' && source[i - 1] != ']')))
+            {
+                i = TryMarkComputedMethod(source, map, i, end);
+                continue;
             }
 
             // メソッド短縮構文（例: greet() { }）の検出
@@ -428,11 +244,317 @@ internal class HtmlReportGenerator
 
             if (IsIdentifierChar(c) && !prevIsIdentChar)
             {
-                TryMarkMethodShorthand(source, map, i, end);
+                // TryMarkMethodShorthand がメソッド本体直後のインデックスを返すため
+                // 本体内の二重スキャンを避けてそこから走査を再開する
+                i = TryMarkMethodShorthand(source, map, i, end);
+                continue;
             }
 
             i++;
         }
+    }
+
+    /// <summary>
+    /// アロー関数 =&gt; の検出と未実行マーク処理。
+    /// ブロック本体 {} を持つ場合のみ =&gt; から } まで 0（未実行）にマークする。
+    /// async アロー関数の場合は async キーワードもマークする。
+    /// </summary>
+    /// <param name="source">スクリプトのソースコード全文</param>
+    /// <param name="map">BuildCoverageMap で作成したカバレッジマップ（内容を書き換える）</param>
+    /// <param name="arrowStart">=&gt; の '=' のインデックス</param>
+    /// <param name="end">スキャン範囲の終端インデックス（含まない）</param>
+    /// <returns>処理後の次のスキャン位置（処理しない場合は arrowStart + 2）</returns>
+    private static int TryMarkArrowFunction(string source, int[] map, int arrowStart, int end)
+    {
+        // => の後の空白・コメントをスキップする
+        int afterArrow = SkipWhitespaceAndCommentsForward(source, arrowStart + 2, end);
+        // 次の文字が { でない、またはカバレッジデータがある場合はスキップ（式本体やカバー済みは対象外）
+        if (afterArrow >= end || source[afterArrow] != '{' || map[arrowStart] != -1)
+        {
+            return arrowStart + 2; // => の次の位置へ進む
+        }
+
+        int braceEnd = FindMatchingBrace(source, afterArrow);
+        if (braceEnd <= afterArrow)
+        {
+            return arrowStart + 2; // 対応する } が見つからない場合はスキップ
+        }
+
+        // => から } まで未実行（0）にマークする
+        for (int m = arrowStart; m < braceEnd; m++)
+        {
+            if (map[m] == -1) { map[m] = 0; }
+        }
+
+        // async アロー関数の async キーワード未実行マーク
+        // arrowStart の直前を逆走査してパラメータリストまたは単一識別子を飛ばし、
+        // さらに前に async キーワードがあればそこからマークする
+        int backScan = SkipWhitespaceAndCommentsBackward(source, arrowStart - 1);
+
+        // パラメータリスト ')' のケース: async (x, y) => {}
+        if (backScan >= 0 && source[backScan] == ')')
+        {
+            // 対応する '(' まで逆走査する
+            // 文字列リテラル内の括弧（例: async (x = ")") => {}）を除外するため
+            // クォートに当たった場合は文字列全体を逆方向にスキップする
+            int parenDepth = 1;
+            backScan--;
+            while (backScan >= 0 && parenDepth > 0)
+            {
+                char bc = source[backScan];
+                // 文字列リテラルの閉じクォートに当たった場合は開きクォートまで逆走査する
+                // バッククォート（テンプレートリテラル）も同様にスキップする
+                if (bc == '"' || bc == '\'' || bc == '`')
+                {
+                    char quote = bc;
+                    backScan--;
+                    while (backScan >= 0)
+                    {
+                        if (source[backScan] == quote)
+                        {
+                            // 直前の連続するバックスラッシュをカウントしてエスケープ判定する
+                            int esc = 0;
+                            int tmp = backScan - 1;
+                            while (tmp >= 0 && source[tmp] == '\\') { esc++; tmp--; }
+                            if (esc % 2 == 0) { break; } // 偶数個なら実際の開きクォート
+                        }
+                        backScan--;
+                    }
+                    // ループ末尾の backScan-- で開きクォートの前に進む
+                }
+                else if (bc == '/')
+                {
+                    // '/' は正規表現リテラルの終端の可能性がある
+                    // [] 文字クラスと \ エスケープを考慮しながら逆走査して開始 '/' を探す
+                    bool inClass  = false;
+                    int savedScan = backScan;
+                    backScan--;
+                    bool foundOpen = false;
+                    while (backScan >= 0)
+                    {
+                        char rc = source[backScan];
+                        if (rc == ']')
+                        {
+                            // \] はエスケープされた ] のため文字クラスの終端ではない
+                            // 直前の連続するバックスラッシュ数が奇数ならエスケープ済み
+                            int escB = 0; int tmpB = backScan - 1;
+                            while (tmpB >= 0 && source[tmpB] == '\\') { escB++; tmpB--; }
+                            if (escB % 2 == 0) { inClass = true; }
+                        }
+                        else if (rc == '[' && inClass)
+                        {
+                            // \[ はエスケープされた [ のため文字クラスの開始ではない
+                            // 直前のバックスラッシュ数が偶数のときだけクラス開始と判定する
+                            int escL = 0; int tmpL = backScan - 1;
+                            while (tmpL >= 0 && source[tmpL] == '\\') { escL++; tmpL--; }
+                            if (escL % 2 == 0) { inClass = false; }
+                        }
+                        else if (rc == '/')
+                        {
+                            int esc = 0;
+                            int tmp = backScan - 1;
+                            while (tmp >= 0 && source[tmp] == '\\') { esc++; tmp--; }
+                            if (esc % 2 == 0 && !inClass) { foundOpen = true; break; }
+                        }
+                        backScan--;
+                    }
+                    if (!foundOpen) { backScan = savedScan; } // ロールバック
+                }
+                else if (bc == ')') { parenDepth++; }
+                else if (bc == '(') { parenDepth--; }
+                backScan--;
+            }
+            // ループ終了時 backScan は '(' の 1 つ前の位置にある
+        }
+        else if (backScan >= 0 && IsIdentifierChar(source[backScan]))
+        {
+            // 単一パラメータ識別子のケース: async x => {}
+            while (backScan >= 0 && IsIdentifierChar(source[backScan])) { backScan--; }
+            // ループ終了時 backScan は識別子の 1 つ前の位置にある
+        }
+
+        // '(' または識別子の直前の空白やコメントをスキップする
+        backScan = SkipWhitespaceAndCommentsBackward(source, backScan);
+
+        // "async" キーワードを確認する（backScan が 'c' の位置を指しているはず）
+        if (backScan >= 4 && source.AsSpan(backScan - 4, 5).SequenceEqual("async"))
+        {
+            bool asyncStandalone;
+            if (backScan - 5 < 0) { asyncStandalone = true; }
+            else { asyncStandalone = !IsIdentifierChar(source[backScan - 5]); }
+
+            if (asyncStandalone)
+            {
+                // async キーワードの先頭（'a' の位置）から => の直前までをマークする
+                int asyncStart = backScan - 4;
+                for (int a = asyncStart; a < arrowStart; a++)
+                {
+                    if (map[a] == -1) { map[a] = 0; }
+                }
+            }
+        }
+
+        return braceEnd;
+    }
+
+    /// <summary>
+    /// function キーワードの検出と未実行マーク処理。
+    /// async function の場合は async キーワードもマークする。
+    /// </summary>
+    /// <param name="source">スクリプトのソースコード全文</param>
+    /// <param name="map">BuildCoverageMap で作成したカバレッジマップ（内容を書き換える）</param>
+    /// <param name="funcStart">function キーワードの 'f' のインデックス</param>
+    /// <param name="end">スキャン範囲の終端インデックス（含まない）</param>
+    /// <returns>処理後の次のスキャン位置（処理しない場合は funcStart + 1）</returns>
+    private static int TryMarkFunctionKeyword(string source, int[] map, int funcStart, int end)
+    {
+        // function の前が識別子文字でないことを確認する（別の単語の一部を誤検出しない）
+        bool prevOk = funcStart == 0 || !IsIdentifierChar(source[funcStart - 1]);
+        // function の直後が識別子文字でないことを確認する（例: functionCall を除外する）
+        bool nextOk = funcStart + 8 >= end || !IsIdentifierChar(source[funcStart + 8]);
+
+        if (!prevOk || !nextOk || map[funcStart] != -1)
+        {
+            return funcStart + 1; // 条件を満たさない場合は 1 文字進む
+        }
+
+        // async function の場合、async キーワードも未実行（赤）としてマークする
+        int scanBack = SkipWhitespaceAndCommentsBackward(source, funcStart - 1);
+        if (scanBack >= 4 && source.AsSpan(scanBack - 4, 5).SequenceEqual("async"))
+        {
+            bool isStandaloneAsync;
+            if (scanBack - 5 < 0) { isStandaloneAsync = true; }
+            else { isStandaloneAsync = !IsIdentifierChar(source[scanBack - 5]); }
+            if (isStandaloneAsync)
+            {
+                // async キーワード先頭から function キーワード直前（空白・コメント含む）を未実行としてマークする
+                int asyncStart = scanBack - 4;
+                for (int a = asyncStart; a < funcStart; a++)
+                {
+                    if (map[a] == -1) { map[a] = 0; }
+                }
+            }
+        }
+
+        int j = funcStart + 8; // "function" の次の文字へ進む
+        // 空白・コメントをスキップする（function * gen や function /* c */ * gen のケース）
+        j = SkipWhitespaceAndCommentsForward(source, j, end);
+        // ジェネレータ関数の * をスキップする（function* / function * どちらも対応）
+        if (j < end && source[j] == '*') { j++; }
+        // * の後の空白・コメントをスキップする（function* gen や function * /* c */ gen のケース）
+        j = SkipWhitespaceAndCommentsForward(source, j, end);
+        // 関数名（識別子）をスキップする（無名関数の場合はスキップなし）
+        while (j < end && IsIdentifierChar(source[j])) { j++; }
+        // 空白・コメントをスキップする（function foo /* c */ () のケースも含む）
+        j = SkipWhitespaceAndCommentsForward(source, j, end);
+        // パラメータリスト ( ... ) をスキップする
+        if (j < end && source[j] == '(') { j = SkipBalancedParens(source, j); }
+        // 空白・コメントをスキップする（function foo() /* c */ {} や function foo() // c\n{} のケース）
+        j = SkipWhitespaceAndCommentsForward(source, j, end);
+
+        if (j < end && source[j] == '{')
+        {
+            int funcEnd = FindMatchingBrace(source, j);
+            if (funcEnd > j) // j は '{' の位置なので funcEnd > j で有効な対応 '}' を確認する
+            {
+                // 関数本体内でカバレッジ対象外(-1)の部分を未実行(0)としてマークする
+                for (int k = funcStart; k < funcEnd; k++)
+                {
+                    if (map[k] == -1) { map[k] = 0; }
+                }
+                return funcEnd;
+            }
+        }
+
+        return funcStart + 1; // 関数本体が見つからない場合は 1 文字進む
+    }
+
+    /// <summary>
+    /// computed property key（[...](){}）の検出と未実行マーク処理。
+    /// async / static / * などのプレフィックスキーワードも含めてマークする。
+    /// </summary>
+    /// <param name="source">スクリプトのソースコード全文</param>
+    /// <param name="map">BuildCoverageMap で作成したカバレッジマップ（内容を書き換える）</param>
+    /// <param name="bracketStart">'[' のインデックス</param>
+    /// <param name="end">スキャン範囲の終端インデックス（含まない）</param>
+    /// <returns>処理後の次のスキャン位置（処理しない場合は bracketStart + 1）</returns>
+    private static int TryMarkComputedMethod(string source, int[] map, int bracketStart, int end)
+    {
+        int bracketEnd   = SkipBalancedBrackets(source, bracketStart);
+        int afterBracket = SkipWhitespaceAndCommentsForward(source, bracketEnd, end);
+
+        // [...]() { } の形でなければメソッドではない。map[bracketStart] が -1 でなければカバー済み
+        if (afterBracket >= end || source[afterBracket] != '(' || map[bracketStart] != -1)
+        {
+            return bracketStart + 1;
+        }
+
+        int afterParens = SkipBalancedParens(source, afterBracket);
+        int afterBody   = SkipWhitespaceAndCommentsForward(source, afterParens, end);
+
+        if (afterBody >= end || source[afterBody] != '{')
+        {
+            return bracketStart + 1;
+        }
+
+        int braceEnd = FindMatchingBrace(source, afterBody);
+        if (braceEnd <= afterBody)
+        {
+            return bracketStart + 1;
+        }
+
+        // プレフィックスキーワード（get/set / async / * / static）を含めたマーク開始位置を決定する
+        // TryMarkMethodShorthand と同じロジックで bracketStart の直前を逆走査する
+        int markStart = bracketStart;
+        int scanBack  = SkipWhitespaceAndCommentsBackward(source, bracketStart - 1);
+
+        // get / set の確認（例: get [Symbol.toPrimitive]() {} / set [Symbol.toPrimitive](v) {}）
+        // TryMarkMethodShorthand と同様に * / async より先に確認する（get/set は * や async と共存不可）
+        if (scanBack >= 2)
+        {
+            string maybeGetOrSet = source.Substring(scanBack - 2, 3);
+            if (maybeGetOrSet == "get" || maybeGetOrSet == "set")
+            {
+                bool getSetOk;
+                if (scanBack - 3 < 0) { getSetOk = true; }
+                else { getSetOk = !IsIdentifierChar(source[scanBack - 3]); }
+                if (getSetOk)
+                {
+                    markStart = scanBack - 2; // get/set の先頭 'g'/'s' の位置からマークする
+                    scanBack  = SkipWhitespaceAndCommentsBackward(source, scanBack - 3);
+                }
+            }
+        }
+
+        // * ジェネレーター記号の確認（例: *['key']() {}）
+        if (scanBack >= 0 && source[scanBack] == '*')
+        {
+            markStart = scanBack; // * の位置からマークを開始する
+            scanBack  = SkipWhitespaceAndCommentsBackward(source, scanBack - 1);
+        }
+
+        // async キーワードの確認（例: async ['key']() {}）
+        if (scanBack >= 4 && source.AsSpan(scanBack - 4, 5).SequenceEqual("async"))
+        {
+            bool asyncPrevOk;
+            if (scanBack - 5 < 0) { asyncPrevOk = true; }
+            else { asyncPrevOk = !IsIdentifierChar(source[scanBack - 5]); }
+            if (asyncPrevOk) { markStart = scanBack - 4; } // async の 'a' の位置からマーク
+        }
+
+        // static キーワードの確認（例: static async ['key']() {}）
+        int staticScan = SkipWhitespaceAndCommentsBackward(source, markStart - 1);
+        if (staticScan >= 5 && source.AsSpan(staticScan - 5, 6).SequenceEqual("static"))
+        {
+            bool staticPrevOk;
+            if (staticScan - 6 < 0) { staticPrevOk = true; }
+            else { staticPrevOk = !IsIdentifierChar(source[staticScan - 6]); }
+            if (staticPrevOk) { markStart = staticScan - 5; } // static の 's' の位置からマーク
+        }
+
+        // markStart（static先頭 または async先頭 または * または bracketStart）から } までを未実行（0）にマークする
+        for (int m = markStart; m < braceEnd; m++) { if (map[m] == -1) { map[m] = 0; } }
+        return braceEnd;
     }
 
     /// <summary>
@@ -444,7 +566,7 @@ internal class HtmlReportGenerator
     /// <param name="map">BuildCoverageMap で作成したカバレッジマップ（内容を書き換える）</param>
     /// <param name="identStart">identifier の先頭インデックス</param>
     /// <param name="len">スキャン範囲の終端インデックス（含まない）</param>
-    private static void TryMarkMethodShorthand(string source, int[] map, int identStart, int len)
+    private static int TryMarkMethodShorthand(string source, int[] map, int identStart, int len)
     {
         // identifier 名を収集する
         int identEnd = identStart;
@@ -475,37 +597,30 @@ internal class HtmlReportGenerator
 
         if (isExcluded)
         {
-            // 除外対象なので何もしない
-            return;
+            // 除外対象なので何もしない（識別子の次の位置を返して ScanRange を1文字進める）
+            return identStart + 1;
         }
 
-        // identifier の後の空白をスキップする
-        int afterIdent = identEnd;
-        while (afterIdent < len && char.IsWhiteSpace(source[afterIdent]))
-        {
-            afterIdent++;
-        }
+        // identifier の後の空白・コメントをスキップする（function と同様に SkipWhitespaceAndCommentsForward を使う）
+        int afterIdent = SkipWhitespaceAndCommentsForward(source, identEnd, len);
 
         // 次の文字が ( でなければメソッド短縮構文でない
         if (afterIdent >= len || source[afterIdent] != '(')
         {
-            return;
+            return identStart + 1;
         }
 
         // SkipBalancedParens でパラメータ括弧をスキップする
         // SkipBalancedParens は閉じ括弧 ) の直後のインデックスを返す
         int afterParens = SkipBalancedParens(source, afterIdent);
 
-        // パラメータの後の空白をスキップする
-        while (afterParens < len && char.IsWhiteSpace(source[afterParens]))
-        {
-            afterParens++;
-        }
+        // パラメータの後の空白・コメントをスキップする（greet() /* c */ {} / greet() // c\n{} のケース）
+        afterParens = SkipWhitespaceAndCommentsForward(source, afterParens, len);
 
         // 次の文字が { であり、かつカバレッジデータにない場合のみ処理する
         if (afterParens >= len || source[afterParens] != '{' || map[identStart] != -1)
         {
-            return;
+            return identStart + 1;
         }
 
         // 対応する } を探す（FindMatchingBrace は } の直後のインデックスを返す）
@@ -513,26 +628,58 @@ internal class HtmlReportGenerator
         if (braceEnd <= afterParens)
         {
             // 対応する } が見つからなかった場合は何もしない
-            return;
+            return identStart + 1;
         }
 
         // FindMatchingBrace は } の次の位置を返すため、} 自体は braceEnd - 1
-        // async メソッド短縮構文の場合、async キーワードも未実行（赤）としてマークする
-        // 例: async greet() { } → async の先頭からマークする
+        // async / ジェネレーター（*）メソッド短縮構文の場合、これらのキーワードも未実行（赤）としてマークする
+        // 例: async greet() {} → async の先頭からマークする
+        // 例: *gen() {}        → * からマークする
+        // 例: async *gen() {}  → async の先頭からマークする
         // まず identStart を基準のマーク開始位置として設定する
         int markStart = identStart;
-        // identStart の直前を逆走査して async キーワードを探す
-        int asyncScanBack = identStart - 1;
-        // 空白をスキップする（async と識別子の間にスペースがある）
-        while (asyncScanBack >= 0 && char.IsWhiteSpace(source[asyncScanBack]))
+        // identStart の直前を逆走査して * や async や get/set キーワードを探す
+        int asyncScanBack = SkipWhitespaceAndCommentsBackward(source, identStart - 1);
+
+        // get / set プロパティ構文の確認 (例: get myProp() {})
+        if (asyncScanBack >= 2)
         {
-            asyncScanBack--;
+            string maybeGetSet = source.Substring(asyncScanBack - 2, 3);
+            if (maybeGetSet == "get" || maybeGetSet == "set")
+            {
+                bool prefixOk = asyncScanBack - 3 < 0 || !IsIdentifierChar(source[asyncScanBack - 3]);
+                if (prefixOk)
+                {
+                    markStart = asyncScanBack - 2;
+                    // asyncScanBack - 3 が負になる場合（get/set がファイル先頭）は
+                    // -1 を直接設定して SkipWhitespaceAndCommentsBackward を不要に呼ばない
+                    if (asyncScanBack - 3 >= 0)
+                    {
+                        asyncScanBack = SkipWhitespaceAndCommentsBackward(source, asyncScanBack - 3);
+                    }
+                    else
+                    {
+                        asyncScanBack = -1;
+                    }
+                }
+            }
         }
+
+        // ジェネレーターメソッドの * プレフィックスを確認する（例: *gen() {} / async *gen() {}）
+        bool hasStar = false;
+        int starPos = -1;
+        if (asyncScanBack >= 0 && source[asyncScanBack] == '*')
+        {
+            hasStar = true;
+            starPos = asyncScanBack;
+            // * を消費してさらに後ろを走査する（async *gen の 'async' を検出するため）
+            asyncScanBack = SkipWhitespaceAndCommentsBackward(source, asyncScanBack - 1);
+        }
+
         // 5文字以上あり "async" であれば async キーワードとして検出する
         if (asyncScanBack >= 4)
         {
-            string asyncCandidate = source.Substring(asyncScanBack - 4, 5);
-            if (asyncCandidate == "async")
+            if (source.AsSpan(asyncScanBack - 4, 5).SequenceEqual("async"))
             {
                 // async の前が識別子文字でないことを確認する（notasync などを除外する）
                 bool asyncPrevOk;
@@ -553,14 +700,37 @@ internal class HtmlReportGenerator
             }
         }
 
-        // markStart（async先頭 または identStart）から } までを未実行（0）にマークする
-        for (int m = markStart; m <= braceEnd - 1; m++)
+        // ジェネレーターの * があり、かつ markStart より前にある場合は * まで延ばす
+        // 例: *gen() {}       → markStart = starPos
+        // 例: async *gen() {} → async の 'a' が markStart のため延ばさない（* は async より後ろ）
+        if (hasStar && starPos < markStart)
+        {
+            markStart = starPos;
+        }
+
+        // "static" キーワードを確認する（markStart の直前に static があるかチェック）
+        // 例: static run() {}       → static の先頭からマークする
+        // 例: static async run() {} → static の先頭からマークする
+        // 例: static get value() {} → static の先頭からマークする
+        int staticScan = SkipWhitespaceAndCommentsBackward(source, markStart - 1);
+        if (staticScan >= 5 && source.AsSpan(staticScan - 5, 6).SequenceEqual("static"))
+        {
+            bool staticPrevOk;
+            if (staticScan - 6 < 0) { staticPrevOk = true; }
+            else { staticPrevOk = !IsIdentifierChar(source[staticScan - 6]); }
+            if (staticPrevOk) { markStart = staticScan - 5; }
+        }
+
+        // markStart（static先頭 または async先頭 または * または identStart）から } までを未実行（0）にマークする
+        for (int m = markStart; m < braceEnd; m++)
         {
             if (map[m] == -1)
             {
                 map[m] = 0;
             }
         }
+        // メソッド本体の直後（braceEnd）を返し、ScanRange がメソッド本体内を二重スキャンしないようにする
+        return braceEnd;
     }
 
     /// <summary>
@@ -588,14 +758,13 @@ internal class HtmlReportGenerator
     /// <returns>正規表現リテラルの開始なら true、除算演算子なら false</returns>
     private static bool IsRegexStart(string source, int pos)
     {
-        // pos の直前の非空白文字を探す
-        int i = pos - 1;
-        while (i >= 0 && char.IsWhiteSpace(source[i])) { i--; }
+        // pos の直前の非空白・非コメント文字を探す（ブロックコメントもスキップする）
+        int i = SkipWhitespaceAndCommentsBackward(source, pos - 1);
         // ファイル先頭または文の先頭なら正規表現
         if (i < 0) { return true; }
         char prev = source[i];
-        // 閉じ括弧・閉じ角括弧の後は除算演算子（式の末尾）
-        if (prev == ')' || prev == ']') { return false; }
+        // 閉じ括弧・閉じ角括弧・テンプレートリテラル閉じの後は除算演算子（式の末尾）
+        if (prev == ')' || prev == ']' || prev == '`') { return false; }
         // 後置インクリメント（++）の直後の / は除算演算子（正規表現ではない）
         // 例: x++ /2 の / は "x++ を評価した後に /2 で割る" 除算
         // prev（i番目の文字）が + で、その直前（i-1番目）も + であれば ++ と判断する
@@ -692,6 +861,20 @@ internal class HtmlReportGenerator
                     char t = source[i];
                     // バックスラッシュエスケープをスキップする
                     if (t == '\\') { i += 2; continue; }
+                    // 行コメント // をスキップする（コメント内の } が深さカウントを狂わせないようにする）
+                    if (t == '/' && i + 1 < len && source[i + 1] == '/')
+                    {
+                        while (i < len && source[i] != '\n') { i++; }
+                        continue;
+                    }
+                    // ブロックコメント /* */ をスキップする（コメント内の } が深さカウントを狂わせないようにする）
+                    if (t == '/' && i + 1 < len && source[i + 1] == '*')
+                    {
+                        i += 2;
+                        while (i + 1 < len && !(source[i] == '*' && source[i + 1] == '/')) { i++; }
+                        if (i + 1 < len) { i += 2; }
+                        continue;
+                    }
                     // 文字列リテラルをスキップする（中の } が深さカウントを狂わせないようにする）
                     if (t == '\'') { i = SkipSingleQuotedString(source, i); continue; }
                     if (t == '"')  { i = SkipDoubleQuotedString(source, i); continue; }
@@ -786,7 +969,9 @@ internal class HtmlReportGenerator
             else if (c == '/' && i + 1 < len && source[i + 1] == '/')
             {
                 // 行コメントをスキップする（コメント内の ( ) が深さカウントに影響しないようにする）
+                // FindMatchingBrace と同様に continue で外側の i++ をスキップする
                 while (i < len && source[i] != '\n') { i++; }
+                continue;
             }
             else if (c == '/' && i + 1 < len && source[i + 1] == '*')
             {
@@ -798,12 +983,54 @@ internal class HtmlReportGenerator
             else if (c == '/' && IsRegexStart(source, i))
             {
                 // 正規表現リテラルをスキップして括弧のカウントがずれないようにする
-                i = SkipRegexLiteral(source, i) - 1;
+                i = SkipRegexLiteral(source, i);
+                continue;
             }
             i++;
         }
 
         // depth が 0 になった時点で i は ')' の次の位置を指している
+        return i;
+    }
+
+    /// <summary>
+    /// 開き角括弧 '[' の位置から対応する閉じ角括弧 ']' の直後の位置を返す。
+    /// 文字列リテラル・ネストした角括弧を考慮する（computed property key のスキップに使用）。
+    /// </summary>
+    private static int SkipBalancedBrackets(string source, int start)
+    {
+        int i = start + 1;
+        int depth = 1;
+        int len = source.Length;
+        while (i < len && depth > 0)
+        {
+            char c = source[i];
+            if      (c == '[')  { depth++; }
+            else if (c == ']')  { depth--; }
+            else if (c == '\'') { i = SkipSingleQuotedString(source, i); continue; }
+            else if (c == '"')  { i = SkipDoubleQuotedString(source, i); continue; }
+            else if (c == '`')  { i = SkipTemplateLiteralFull(source, i); continue; }
+            else if (c == '/' && i + 1 < len && source[i + 1] == '/')
+            {
+                // 行コメントをスキップする（コメント内の ] が深さカウントに影響しないようにする）
+                while (i < len && source[i] != '\n') { i++; }
+                continue;
+            }
+            else if (c == '/' && i + 1 < len && source[i + 1] == '*')
+            {
+                // ブロックコメントをスキップする（コメント内の ] が深さカウントに影響しないようにする）
+                i += 2;
+                while (i + 1 < len && !(source[i] == '*' && source[i + 1] == '/')) { i++; }
+                i++; // '*' をスキップする（直後の '/' は外側の i++ で処理される）
+            }
+            else if (c == '/' && IsRegexStart(source, i))
+            {
+                // 正規表現リテラルをスキップする（正規表現内の ] が深さカウントを狂わせないようにする）
+                i = SkipRegexLiteral(source, i);
+                continue;
+            }
+            i++;
+        }
         return i;
     }
 
@@ -923,6 +1150,154 @@ internal class HtmlReportGenerator
     }
 
     /// <summary>
+    /// 指定された位置から前方に向かって、空白文字・ブロックコメント・行コメントを読み飛ばす。
+    /// </summary>
+    private static int SkipWhitespaceAndCommentsForward(string source, int pos, int end)
+    {
+        while (pos < end)
+        {
+            if (char.IsWhiteSpace(source[pos])) { pos++; continue; }
+            if (pos + 1 < end && source[pos] == '/' && source[pos + 1] == '*')
+            {
+                pos += 2;
+                while (pos + 1 < end && !(source[pos] == '*' && source[pos + 1] == '/')) { pos++; }
+                // */ がサブレンジ境界を跨いでいる場合（pos が * で pos+1 が end 外）は end まで進める
+                if (pos + 1 < end) { pos += 2; } else { pos = end; }
+                continue;
+            }
+            if (pos + 1 < end && source[pos] == '/' && source[pos + 1] == '/')
+            {
+                while (pos < end && source[pos] != '\n') { pos++; }
+                continue;
+            }
+            break;
+        }
+        return pos;
+    }
+
+    /// <summary>
+    /// 指定された位置から逆方向（前）に向かって、空白文字・ブロックコメント (/* ... */)・行コメント (//) を読み飛ばす。
+    /// </summary>
+    private static int SkipWhitespaceAndCommentsBackward(string source, int pos)
+    {
+        while (pos >= 0)
+        {
+            if (char.IsWhiteSpace(source[pos]))
+            {
+                pos--;
+            }
+            else if (pos - 1 >= 0 && source[pos] == '/' && source[pos - 1] == '*')
+            {
+                // ブロックコメントの終端 */ を検出した → 開始 /* まで逆走査する
+                pos -= 2;
+                while (pos - 1 >= 0 && !(source[pos] == '*' && source[pos - 1] == '/'))
+                {
+                    pos--;
+                }
+                // 開始 /* が見つかった場合は /* の2文字をスキップする
+                // 見つからなかった場合（壊れたソース）は pos を -1 にして終了する
+                if (pos - 1 >= 0)
+                {
+                    pos -= 2;
+                }
+                else
+                {
+                    pos = -1;
+                }
+            }
+            else
+            {
+                // 行コメント（//）の末尾にいるかチェックする
+                // LastIndexOf で行頭を O(1) に近い速さで取得する（SIMD 最適化が効く）
+                int prevNl = -1;
+                if (pos > 0) { prevNl = source.LastIndexOf('\n', pos - 1); }
+                int lp = 0;
+                if (prevNl >= 0) { lp = prevNl + 1; }
+                bool inLineComment = false;
+                int k = lp;
+                while (k < pos)
+                {
+                    char kc = source[k];
+                    // 文字列リテラル（シングル・ダブルクォート）をスキップする
+                    if (kc == '\'' || kc == '"')
+                    {
+                        k++;
+                        while (k < pos && source[k] != kc)
+                        {
+                            if (source[k] == '\\') { k++; }
+                            k++;
+                        }
+                        if (k < pos) { k++; }
+                        continue;
+                    }
+                    // テンプレートリテラル（バッククォート）をスキップする
+                    // SkipTemplateLiteralFull はネストした ${ `...` } も正確に処理する
+                    if (kc == '`')
+                    {
+                        k = SkipTemplateLiteralFull(source, k);
+                        continue;
+                    }
+                    // ブロックコメント /* */ をスキップする（コメント内の // を行コメントと誤判定しないようにする）
+                    if (kc == '/' && k + 1 < source.Length && source[k + 1] == '*')
+                    {
+                        k += 2;
+                        while (k + 1 < source.Length && !(source[k] == '*' && source[k + 1] == '/')) { k++; }
+                        if (k + 1 < source.Length) { k += 2; }
+                        continue;
+                    }
+                    // 正規表現リテラルをスキップする（/\/\// のような正規表現内の // を行コメントと誤判定しないようにする）
+                    if (kc == '/' && IsRegexStart(source, k))
+                    {
+                        k = SkipRegexLiteral(source, k);
+                        continue;
+                    }
+                    if (source[k] == '/' && k + 1 < source.Length && source[k + 1] == '/')
+                    {
+                        pos = k - 1;
+                        inLineComment = true;
+                        break;
+                    }
+                    k++;
+                }
+                if (!inLineComment) { break; }
+            }
+        }
+        return pos;
+    }
+}
+
+
+/// <summary>
+/// 行のカバレッジ状態を表す列挙型。
+/// HTML出力時のCSSクラス選択やカウント集計に使用する。
+/// </summary>
+internal enum LineCoverageStatus
+{
+    /// <summary>カバレッジ対象外（空行・コメントなど実行されないコード）</summary>
+    Neutral,
+    /// <summary>完全に実行された行（行内のすべての文字が実行済み）</summary>
+    Covered,
+    /// <summary>全く実行されなかった行（行内のすべての文字が未実行）</summary>
+    Uncovered,
+    /// <summary>実行された部分と未実行の部分が混在する行（if/else の分岐など）</summary>
+    Partial,
+}
+
+/// <summary>
+/// 1行分のHTMLと状態をまとめるレコード型。
+/// BuildLines メソッドが生成し、BuildScriptPage メソッドが利用する。
+/// </summary>
+/// <param name="Html">行のHTMLコンテンツ（span タグでカバレッジ状態を色付けしたもの）</param>
+/// <param name="Status">行全体のカバレッジ状態</param>
+internal record LineData(string Html, LineCoverageStatus Status);
+
+/// <summary>
+/// HTMLカバレッジレポートを生成するクラス。
+/// index.html（サマリー）と scripts/script-N.html（詳細）を生成する。
+/// </summary>
+internal class HtmlReportGenerator
+{
+    /// <summary>
     /// HTMLの特殊文字をエスケープする。
     /// ブラウザがHTMLタグとして解釈しないように変換する。
     /// </summary>
@@ -976,13 +1351,15 @@ internal class HtmlReportGenerator
         // 行データを格納する結果リスト
         var result = new List<LineData>();
 
+        // 空文字列・null ソースは空リストを返す（CDP データ取得失敗などで null になった場合の防衛）
+        if (string.IsNullOrEmpty(source)) { return result; }
+
         // ソースコードを改行文字 \n で行に分割する
         var rawLines = source.Split('\n');
 
-        // ソースが \n で終わる場合、末尾に空の要素が生まれるので除く
+        // ソースが \n で終わる場合、末尾に必ず空の要素が生まれるので除く
         int lineCount = rawLines.Length;
-        // 最後の要素が空行（\r のみを除去すると長さ0になる）かどうか確認する
-        if (lineCount > 0 && rawLines[lineCount - 1].TrimEnd('\r').Length == 0)
+        if (lineCount > 0 && source.EndsWith('\n'))
         {
             // 末尾の空要素を処理対象から除外するためカウントを1減らす
             lineCount--;
@@ -1010,7 +1387,9 @@ internal class HtmlReportGenerator
             // 行内の各文字を順番に処理する
             for (int i = 0; i < rawLine.Length; i++)
             {
-                // \r（CRLF 改行の CR 部分）と \0（ヌル文字）はカバレッジカウントに含めない
+                // \r（CRLF 改行の CR 部分）はカバレッジカウントに含めない（オフセット値には含まれるので idx の計算に影鈷しない）。
+                // \0（ヌル文字）は理論上 JS ソースに含まれる可能性があるが、
+                // HTML 出力時にブラウザが無視するため表示上の問題がなく、カバレッジカウントに含めない。
                 char chSkip = rawLine[i];
                 if (chSkip == '\r' || chSkip == '\0')
                 {
@@ -1068,8 +1447,7 @@ internal class HtmlReportGenerator
                     sb.Append($"<span class=\"{cls}\">");
                 }
 
-                // 文字をHTMLエスケープして追加する
-                // \r（Windowsの改行コードの一部）は表示不要なので空文字に変換する
+                // 文字をHTMLエスケープして追加する（\r・\0 は上の continue で既にスキップ済み）
                 char ch = rawLine[i];
                 if (ch == '&')
                 {
@@ -1091,18 +1469,10 @@ internal class HtmlReportGenerator
                     // ダブルクォートをエスケープする
                     sb.Append("&quot;");
                 }
-                else if (ch == '\r')
-                {
-                    // \r は出力しない（Windowsの CRLF 対応）
-                }
-                else if (ch == '\0')
-                {
-                    // NUL 文字は出力しない（一部ブラウザで表示が壊れるため）
-                }
                 else
                 {
-                    // その他の文字はそのまま文字列に追加する
-                    sb.Append(ch.ToString());
+                    // その他の文字はそのまま文字列に追加する（' はテキストノード内でエスケープ不要）
+                    sb.Append(ch);
                 }
 
                 // 実行済み・未実行の文字数を集計する（行の状態判定に使う）
@@ -1151,6 +1521,8 @@ internal class HtmlReportGenerator
             result.Add(new LineData(sb.ToString(), status));
 
             // 次の行の offset を計算する（rawLine.Length + 1 は分割に使った \n の1文字分を加える）
+            // CRLF ファイルの場合 rawLine には末尾の \r が含まれるため rawLine.Length は "\r" 込みの長さになる。
+            // よって offset += rawLine.Length + 1 = (本文字数 + 1) + 1 で \r\n の2文字分が正しく加算される。
             offset += rawLine.Length + 1;
         }
 
@@ -1172,15 +1544,26 @@ internal class HtmlReportGenerator
         var scriptsDir = Path.Combine(outputDir, "scripts");
         Directory.CreateDirectory(scriptsDir);
 
-        // スクリプト URL でグループ化する（同じ URL は OR 合成して1件にまとめる）
-        var scriptGroups = new Dictionary<string, List<ScriptCoverage>>();
+        // スクリプト URL と Source でグループ化する（同じ URL かつ同じソースコードのものを OR 合成する）
+        // URL だけでなく Source もキーに含める理由: 同じ URL でもサーバーがわずかに異なるソースを返した
+        // 場合（タイムスタンプコメント等）に誤って結合するのを防ぐ。Dictionary で O(1) 検索する。
+        // BOM（U+FEFF）をグループキーから除去する（ここで一元管理することで、BOM 有無で同一スクリプトが別グループになる問題を防ぐ）
+        var scriptGroupMap = new Dictionary<(string url, string source), List<ScriptCoverage>>();
+        var scriptGroups = new List<List<ScriptCoverage>>();
         foreach (var script in coverages)
         {
-            if (!scriptGroups.ContainsKey(script.Url))
+            var key = (script.Url, script.Source.TrimStart('\uFEFF'));
+            List<ScriptCoverage> existingGroup;
+            if (scriptGroupMap.TryGetValue(key, out existingGroup))
             {
-                scriptGroups[script.Url] = new List<ScriptCoverage>();
+                existingGroup.Add(script);
             }
-            scriptGroups[script.Url].Add(script);
+            else
+            {
+                var newGroup = new List<ScriptCoverage> { script };
+                scriptGroupMap[key] = newGroup;
+                scriptGroups.Add(newGroup);
+            }
         }
 
         // インデックスページに表示するサマリー行のリスト
@@ -1189,21 +1572,32 @@ internal class HtmlReportGenerator
             string url, int covered, int partial, int total, string mergedFilename)>();
 
         int i = 0;
-        foreach (var (scriptUrl, group) in scriptGroups)
+        foreach (var group in scriptGroups)
         {
+            if (group.Count == 0) continue;
+            string scriptUrl = group[0].Url;
+
             // カノニカル（基準）スクリプトは最初のエントリとする
             var canonical = group[0];
 
+            // BOM（U+FEFF）をソースから除去する
+            // V8 は BOM を JavaScript の文字としてカウントしないため、CDP のオフセット値は
+            // BOM 除去後の位置を指している。BOM を除去せずに渡すとオフセットが1ずれて
+            // 末尾の文字がカバレッジ対象外（neutral）になるバグが発生する。
+            string canonicalSource = canonical.Source.TrimStart('\uFEFF');
+
             // 全タブ分のカバレッジマップを OR 合成する
-            var mergedMap = BuildCoverageMap(canonical.Source, canonical.Functions);
+            var mergedMap = CoverageParser.BuildCoverageMap(canonicalSource, canonical.Functions);
             for (int g = 1; g < group.Count; g++)
             {
-                var otherMap = BuildCoverageMap(group[g].Source, group[g].Functions);
-                mergedMap = MergeMaps(mergedMap, otherMap);
+                // タブごとのソースも BOM を除去してから BuildCoverageMap に渡す
+                string otherSource = group[g].Source.TrimStart('\uFEFF');
+                var otherMap = CoverageParser.BuildCoverageMap(otherSource, group[g].Functions);
+                mergedMap = CoverageParser.MergeMaps(mergedMap, otherMap);
             }
 
-            // OR 合成したマップから行データを生成する
-            var mergedLines = BuildLines(canonical.Source, mergedMap);
+            // OR 合成したマップから行データを生成する（BOM 除去済みのソースを使う）
+            var mergedLines = BuildLines(canonicalSource, mergedMap);
 
             // 合成ページのファイル名（全タブの OR 合成カバレッジを表示する）
             var mergedFilename = $"script-{i}.html";
@@ -1238,13 +1632,14 @@ internal class HtmlReportGenerator
                 for (int g = 0; g < group.Count; g++)
                 {
                     var script = group[g];
-                    // タブ別ページのファイル名（例: script-0-tab2.html）
-                    var tabFilename = $"script-{i}-tab{script.Page.Index}.html";
+                    // タブ別ページのファイル名（グループ内インデックス g を使用して衝突を防ぐ）
+                    var tabFilename = $"script-{i}-tab{g}.html";
                     string tabLabel = $"画面{script.Page.Index + 1}";
 
-                    // このタブ単独のカバレッジマップを生成する
-                    var tabMap = BuildCoverageMap(script.Source, script.Functions);
-                    var tabLines = BuildLines(script.Source, tabMap);
+                    // このタブ単独のカバレッジマップを生成する（BOM を除去してから渡す）
+                    string tabSource = script.Source.TrimStart('\uFEFF');
+                    var tabMap = CoverageParser.BuildCoverageMap(tabSource, script.Functions);
+                    var tabLines = BuildLines(tabSource, tabMap);
 
                     // タブ別詳細ページを生成する（このタブの画面ラベルと URL を渡す）
                     var tabPageInfos = new List<(string label, string url)>();
@@ -1546,6 +1941,11 @@ internal class HtmlReportGenerator
     /// <returns>URLの最後のパスセグメント（取得できない場合はurlそのものを返す）</returns>
     internal static string GetFileName(string url)
     {
+        // null は空文字として扱う（呼び出し元は CDP データ経由でガード済みだが念のため）
+        if (url == null) { return ""; }
+        // data: URL は巨大な Base64 文字列になりうるため表示用ラベルを返す
+        if (url.StartsWith("data:", StringComparison.OrdinalIgnoreCase)) { return "(data URL)"; }
+
         // HTTP / HTTPS / FILE URL のみパス解析を行う。それ以外はそのまま返す。
         bool isHttp  = url.StartsWith("http://",  StringComparison.OrdinalIgnoreCase);
         bool isHttps = url.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
@@ -1570,8 +1970,16 @@ internal class HtmlReportGenerator
         int pathStart = url.IndexOf('/', schemeLength);
         if (pathStart < 0)
         {
-            // パス部分がない場合はホスト名部分を返す
-            return url.Substring(schemeLength);
+            // パス部分がない場合はホスト名部分を返す（認証情報・クエリ・フラグメントは除去する）
+            string hostOnly = url.Substring(schemeLength);
+            // user:pass@ のような認証情報が含まれる場合は @ 以降のホスト名だけを使う
+            int atIdx = hostOnly.IndexOf('@');
+            if (atIdx >= 0) { hostOnly = hostOnly.Substring(atIdx + 1); }
+            int qIdx2 = hostOnly.IndexOf('?');
+            if (qIdx2 >= 0) { hostOnly = hostOnly.Substring(0, qIdx2); }
+            int hIdx2 = hostOnly.IndexOf('#');
+            if (hIdx2 >= 0) { hostOnly = hostOnly.Substring(0, hIdx2); }
+            return hostOnly;
         }
 
         // パス部分を取り出す
@@ -1605,6 +2013,9 @@ internal class HtmlReportGenerator
             if (qIdx >= 0) { hostPortion = hostPortion.Substring(0, qIdx); }
             int hIdx = hostPortion.IndexOf('#');
             if (hIdx >= 0) { hostPortion = hostPortion.Substring(0, hIdx); }
+            // user:pass@ のような認証情報が含まれる場合は @ 以降のホスト名だけを使う
+            int atIdx2 = hostPortion.IndexOf('@');
+            if (atIdx2 >= 0) { hostPortion = hostPortion.Substring(atIdx2 + 1); }
             return hostPortion;
         }
 
@@ -1621,7 +2032,145 @@ internal class HtmlReportGenerator
             rawName = path;
         }
 
-        // パーセントエンコード（%20 など）をデコードして返す
-        return Uri.UnescapeDataString(rawName);
+        // パーセントエンコード（%20 など）をデコードして返す（不正シーケンスは例外なくそのまま返す）
+        try { return Uri.UnescapeDataString(rawName); }
+        catch (UriFormatException) { return rawName; }
     }
+}
+
+/// <summary>
+/// HTMLレポート生成に使用するテンプレート文字列を管理する静的クラス。
+/// </summary>
+internal static class HtmlTemplates
+{
+    public const string ScriptPageHeader = """
+        <!DOCTYPE html><html><head><meta charset="utf-8">
+        <title>JS カバレッジ</title>
+        <style>
+        body{font-family:monospace;font-size:13px;margin:0;background:#fff}
+        h1{padding:8px 12px;background:#2d2d2d;color:#fff;margin:0;font-size:13px;word-break:break-all}
+        .legend{display:flex;flex-wrap:wrap;gap:8px 24px;padding:8px 12px;
+                background:#f7f7f7;border-bottom:1px solid #ddd;
+                font-size:12px;font-family:sans-serif;align-items:center}
+        .legend-item{display:inline-flex;align-items:center;gap:5px;color:#444}
+        .swatch{display:inline-block;width:16px;height:12px;
+                border:1px solid rgba(0,0,0,.18);border-radius:2px;flex-shrink:0}
+        .back-link{color:#1a7a4a;text-decoration:none;white-space:nowrap}
+        .back-link:hover{text-decoration:underline}
+        .source{white-space:pre}
+        .line{display:flex;line-height:1.6}
+        .gutter{min-width:48px;padding:0 8px;text-align:right;user-select:none;
+                background:#f5f5f5;color:#aaa;border-right:2px solid #e0e0e0}
+        .code{padding:0 8px;flex:1;overflow-x:auto}
+        .line-covered   .gutter{background:#c6efc6;color:#3a7d3a;border-color:#8fc98f}
+        .line-uncovered .gutter{background:#f0c6c6;color:#7d3a3a;border-color:#c98f8f}
+        .line-partial   .gutter{background:#f0e8a0;color:#6b6000;border-color:#c9b800}
+        span.covered  {background:#d4f8d4}
+        span.uncovered{background:#f8d4d4}
+        span.neutral  {}
+        </style></head><body>
+        """;
+
+    public const string ScriptPageLegend = """
+        <div class="legend">
+          <a class="back-link" href="../index.html">← 一覧に戻る</a>
+          <span class="legend-item"><span class="swatch" style="background:#c6efc6"></span>実行済み — 行内すべてのブロックが実行された</span>
+          <span class="legend-item"><span class="swatch" style="background:#f0e8a0"></span>部分実行 — 実行済みと未実行が混在（if/else の片側など）</span>
+          <span class="legend-item"><span class="swatch" style="background:#f0c6c6"></span>未実行 — 一度も実行されなかった</span>
+          <span class="legend-item"><span class="swatch" style="background:#e8e8e8"></span>対象外 — コメント・空行・変数宣言のみの行など</span>
+        </div>
+        """;
+
+    public const string IndexPageHeader = """
+        <!DOCTYPE html><html><head><meta charset="utf-8">
+        <title>JS カバレッジレポート</title>
+        <style>
+        body{font-family:sans-serif;padding:24px;color:#333}
+        h1{font-size:20px;margin-bottom:16px}
+        .guide{background:#f9f9f9;border:1px solid #e0e0e0;border-radius:6px;
+               padding:16px 20px;margin-bottom:24px;font-size:14px;color:#444}
+        .guide h2{font-size:15px;margin:0 0 10px;color:#222}
+        .guide p{margin:4px 0 10px;line-height:1.6}
+        .guide .formula{display:inline-block;background:#fff;border:1px solid #ddd;
+                        border-radius:4px;padding:4px 12px;font-family:monospace;font-size:13px;color:#333}
+        .legend-table{border-collapse:collapse;margin-top:4px}
+        .legend-table td{padding:5px 12px 5px 0;vertical-align:middle;font-size:13px;border:none}
+        .swatch{display:inline-block;width:18px;height:13px;
+                border:1px solid rgba(0,0,0,.18);border-radius:2px;
+                vertical-align:middle;margin-right:6px}
+        table.data{border-collapse:collapse;width:100%;margin-top:16px}
+        table.data th,table.data td{border:1px solid #ddd;padding:8px 12px;text-align:left}
+        table.data th{background:#f5f5f5;font-weight:600}
+        td.num{text-align:right;font-variant-numeric:tabular-nums}
+        a{color:#1a7a4a;text-decoration:none}
+        a:hover{text-decoration:underline}
+        details > summary { cursor:pointer; color:#1a7a4a; list-style:none }
+        details > summary::before { content:"▶ " }
+        details[open] > summary::before { content:"▼ " }
+        details ul { margin:4px 0 0;padding-left:16px;list-style:disc;font-size:12px }
+        details ul li { margin:2px 0 }
+        </style></head><body>
+        <h1>JS カバレッジレポート</h1>
+        """;
+
+    public const string IndexPageGuide = """
+        <div class="guide">
+          <h2>レポートの見方</h2>
+          <p>このレポートは、JavaScript ファイルの各行が実際に実行されたかどうかを記録したカバレッジレポートです。<br>
+          スクリプト名をクリックすると、行ごとの実行状況を色分け表示で確認できます。</p>
+          <p><strong>カバレッジ率の計算式</strong><br>
+          <span class="formula">（実行済み行数 ＋ 部分実行行数 × 0.5）÷ 対象行数 × 100</span><br>
+          ※ 対象行数にはコメント・空行・実装を持たない行など（対象外）は含みません。</p>
+          <table class="legend-table">
+            <tr>
+              <td><span class="swatch" style="background:#c6efc6"></span><strong>実行済み</strong></td>
+              <td>行内のすべてのブロックが実行された</td>
+            </tr>
+            <tr>
+              <td><span class="swatch" style="background:#f0e8a0"></span><strong>部分実行</strong></td>
+              <td>if / else など、実行された部分と未実行の部分が混在する（分岐の片側だけ通った場合など）</td>
+            </tr>
+            <tr>
+              <td><span class="swatch" style="background:#f0c6c6"></span><strong>未実行</strong></td>
+              <td>行内のコードが一度も実行されなかった</td>
+            </tr>
+            <tr>
+              <td><span class="swatch" style="background:#e8e8e8;border-color:#ccc"></span><strong>対象外</strong></td>
+              <td>コメント・空行・実装を持たない行など（カバレッジ計測の対象外）</td>
+            </tr>
+          </table>
+        </div>
+        """;
+
+    public const string IndexPageConstraints = """
+        <div class="guide">
+          <h2>制約・計測対象外パターン</h2>
+          <ul style="margin:4px 0 0;padding-left:20px;line-height:1.9">
+            <li>
+              <strong>eval() / new Function() で動的生成されるコード</strong> —
+              V8 がこれらのスクリプトに URL を付与しないためスキップされます。
+            </li>
+            <li>
+              <strong>Web Worker 内のスクリプト</strong> —
+              Worker は別スレッドで動作するため、このツールの CDP セッションの対象外です。
+            </li>
+            <li>
+              <strong>ソースマップ非対応</strong> —
+              TypeScript や webpack などでバンドルされた JavaScript は、変換後のコードがそのまま計測対象になります。
+              元のソースファイルへのマッピングは行いません。
+            </li>
+            <li>
+              <strong>外側関数が実行された場合の内側未実行関数</strong> —
+              V8 は外側関数の実行範囲を CDP で報告するため、その範囲内に定義された内側の未実行関数が
+              「実行済み（緑）」として表示されることがあります。
+            </li>
+            <li>
+              <strong>インラインスクリプト（&lt;script&gt; ブロック）の取得条件</strong> —
+              インラインスクリプトの URL はページ URL と同じになります。
+              scriptFilters が空の場合はキャプチャされます。
+              scriptFilters を指定する場合は、ページ URL に含まれるキーワード（例: ページのファイル名）を追加してください。
+            </li>
+          </ul>
+        </div>
+        """;
 }

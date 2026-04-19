@@ -1,0 +1,27 @@
+{
+  "url": "https://tastejs.github.io/todomvc/examples/vanilla-es6/",
+  "scriptFilter": "",
+  "actions": [
+    { "type": "wait", "milliseconds": 2000 },
+    { "type": "waitForSelector", "selector": ".new-todo" },
+    { "type": "fill", "selector": ".new-todo", "value": "Buy groceries" },
+    { "type": "click", "selector": ".new-todo" },
+    { "type": "wait", "milliseconds": 500 },
+    { "type": "fill", "selector": ".new-todo", "value": "Write tests" },
+    { "type": "click", "selector": ".new-todo" },
+    { "type": "wait", "milliseconds": 500 },
+    { "type": "fill", "selector": ".new-todo", "value": "Fix bugs" },
+    { "type": "click", "selector": ".new-todo" },
+    { "type": "wait", "milliseconds": 500 },
+    { "type": "click", "selector": ".todo-list li:first-child .toggle" },
+    { "type": "wait", "milliseconds": 500 },
+    { "type": "click", "selector": "a[href='#/active']" },
+    { "type": "wait", "milliseconds": 500 },
+    { "type": "click", "selector": "a[href='#/completed']" },
+    { "type": "wait", "milliseconds": 500 },
+    { "type": "click", "selector": "a[href='#/']" },
+    { "type": "wait", "milliseconds": 500 },
+    { "type": "click", "selector": ".clear-completed" },
+    { "type": "wait", "milliseconds": 500 }
+  ]
+}

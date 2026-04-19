@@ -1,4 +1,4 @@
-﻿using JsCoverageReporter.Coverage;
+using JsCoverageReporter.Coverage;
 using JsCoverageReporter.Report;
 
 namespace JsCoverageReporter.Tests;
@@ -411,5 +411,59 @@ public class SampleReportTests
         Assert.True(File.Exists(Path.Combine(outputDir, "scripts", "script-1-tab0.html")));
         Assert.True(File.Exists(Path.Combine(outputDir, "scripts", "script-2-tab0.html")));
         Assert.True(File.Exists(Path.Combine(outputDir, "scripts", "script-3-tab0.html")));
+    }
+
+    /// <summary>
+    /// 同一のURLを持つがソースコードが異なる複数のインラインスクリプトが、
+    /// Generate メソッドで誤ってマージされず、別々のファイルとして出力されることを確認する。
+    /// （以前はすべて同一グループにまとめられデータロストが発生していた致命的バグの修正確認）
+    /// </summary>
+    [Fact]
+    [Trait("Category", "Regression")]
+    public void Generate_MultipleInlineScripts_GroupedSeparately()
+    {
+        // ユニークな一時ディレクトリを作成する
+        var tempDir = Path.Combine(Path.GetTempPath(), "JsCov_InlineTest_" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var pageInfo = new PageInfo(0, "https://example.com/index.html");
+
+            // 同一URLだが内容が異なる2つのインラインスクリプト
+            var script1 = new ScriptCoverage(
+                pageInfo,
+                "https://example.com/index.html", // 同一URL
+                "console.log('inline 1');",
+                new List<FunctionCoverage>()
+            );
+
+            var script2 = new ScriptCoverage(
+                pageInfo,
+                "https://example.com/index.html", // 同一URL
+                "let x = 1;\nconsole.log('inline 2');",
+                new List<FunctionCoverage>()
+            );
+
+            var coverages = new List<ScriptCoverage> { script1, script2 };
+
+            // レポート生成
+            new HtmlReportGenerator().Generate(coverages, tempDir);
+
+            // scripts ディレクトリに別々のレポート（script-0 と script-1）が生成されていることを確認する
+            var scriptsDir = Path.Combine(tempDir, "scripts");
+            Assert.True(Directory.Exists(scriptsDir), "scripts dir should be created");
+
+            var files = Directory.GetFiles(scriptsDir, "script-*.html").Select(Path.GetFileName).ToList();
+            
+            // 2つの別々のスクリプトグループ（script-0 と script-1）が生成されているはず
+            Assert.Contains("script-0.html", files);
+            Assert.Contains("script-1.html", files);
+        }
+        finally
+        {
+            if (Directory.Exists(tempDir))
+            {
+                Directory.Delete(tempDir, true);
+            }
+        }
     }
 }

@@ -24,6 +24,7 @@ if (Array.IndexOf(args, "--help") >= 0 || Array.IndexOf(args, "-h") >= 0)
         任意オプション:
           --output <dir>      レポートの出力先ディレクトリ（デフォルト: ./report）
           --headed            ブラウザウィンドウを表示して実行する（デフォルト: 非表示）
+          --channel <name>    ブラウザチャンネルを指定する（例: msedge, chrome）
           --verbose           エラー発生時に詳細なスタックトレースを表示する
           --help, -h          このヘルプを表示する
 
@@ -62,8 +63,20 @@ bool outputSet = false;
 // --headed が指定された場合は false（ブラウザを表示）、それ以外は true（非表示）
 bool headless = true;
 
+// --headed が既に指定済みかどうかを示すフラグ（重複指定の検知に使う）
+bool headedSet = false;
+
 // --verbose が指定された場合は true（スタックトレースを表示）
 bool verbose = false;
+
+// --verbose が既に指定済みかどうかを示すフラグ（重複指定の検知に使う）
+bool verboseSet = false;
+
+// --channel で指定されたブラウザチャンネル名（例: "msedge", "chrome"）。未指定なら null
+string? channel = null;
+
+// --channel が既に指定済みかどうかを示すフラグ（重複指定の検知に使う）
+bool channelSet = false;
 
 // コマンドライン引数を1つずつ走査する
 for (int i = 0; i < args.Length; i++)
@@ -77,6 +90,8 @@ for (int i = 0; i < args.Length; i++)
             Console.Error.WriteLine("[Warning] --config が複数回指定されました。最後の値を使用します。");
         }
         // 値が存在しない、または次の引数が別のオプション（--で始まる）の場合はエラーにする
+        // 制限: "--" で始まるファイルパス（例: --scenario.json）は値として指定できない
+        // （実用上そのようなファイル名はほぼ使われないため許容する）
         if (i + 1 >= args.Length || args[i + 1].StartsWith("--"))
         {
             Console.Error.WriteLine("エラー: --config オプションには値が必要です。例: --config scenario.json");
@@ -99,6 +114,7 @@ for (int i = 0; i < args.Length; i++)
             Console.Error.WriteLine("[Warning] --output が複数回指定されました。最後の値を使用します。");
         }
         // 値が存在しない、または次の引数が別のオプション（--で始まる）の場合はエラーにする
+        // 制限: "--" で始まるディレクトリパスは値として指定できない
         if (i + 1 >= args.Length || args[i + 1].StartsWith("--"))
         {
             Console.Error.WriteLine("エラー: --output オプションには値が必要です。例: --output ./report");
@@ -115,13 +131,47 @@ for (int i = 0; i < args.Length; i++)
     // --headed オプションを検出する（値なし・ブラウザを表示して実行する）
     else if (args[i] == "--headed")
     {
-        headless = false;
+        // 同じオプションが複数回指定された場合は警告する
+        if (headedSet)
+        {
+            Console.Error.WriteLine("[Warning] --headed が複数回指定されました。");
+        }
+        headless   = false;
+        headedSet  = true;
     }
 
     // --verbose オプションを検出する（値なし・エラー時にスタックトレースを表示する）
     else if (args[i] == "--verbose")
     {
-        verbose = true;
+        // 同じオプションが複数回指定された場合は警告する
+        if (verboseSet)
+        {
+            Console.Error.WriteLine("[Warning] --verbose が複数回指定されました。");
+        }
+        verbose    = true;
+        verboseSet = true;
+    }
+
+    // --channel オプションを検出する（ブラウザチャンネルを指定する: msedge, chrome など）
+    else if (args[i] == "--channel")
+    {
+        // 同じオプションが複数回指定された場合は警告する
+        if (channelSet)
+        {
+            Console.Error.WriteLine("[Warning] --channel が複数回指定されました。最後の値を使用します。");
+        }
+        // 値が存在しない、または次の引数が別のオプション（--で始まる）の場合はエラーにする
+        if (i + 1 >= args.Length || args[i + 1].StartsWith("--"))
+        {
+            Console.Error.WriteLine("エラー: --channel オプションには値が必要です。例: --channel msedge");
+            return 1;
+        }
+        // 次の引数をチャンネル名として取得する
+        channel = args[i + 1];
+        // 設定済みフラグを立てる
+        channelSet = true;
+        // 値として消費した次の引数をスキップする
+        i++;
     }
 }
 
@@ -154,6 +204,12 @@ try
     // null でないことが確認できたので scenario に代入する
     scenario = deserializedScenario;
 }
+catch (FileNotFoundException)
+{
+    // ファイルが見つからない場合は日本語でパスを明示する
+    Console.Error.WriteLine($"設定ファイルが見つかりません: {configPath}");
+    return 1;
+}
 catch (Exception ex)
 {
     // ファイル読み込みや JSON 解析に失敗した場合はエラーメッセージを出力して終了する（終了コード 1 = 設定エラー）
@@ -179,10 +235,13 @@ try
     using var playwright = await Playwright.CreateAsync();
 
     // Chromiumブラウザを起動する（headless=true: 画面なし / false: ウィンドウ表示）
+    // --channel msedge を指定すると Edge が起動する。null の場合は Playwright 組み込みの Chromium を使う
     await using var browser = await playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
     {
         // --headed が指定された場合は false になり、ブラウザウィンドウが表示される
         Headless = headless,
+        // --channel が指定された場合はそのチャンネルを使う（例: "msedge", "chrome"）
+        Channel = channel,
     });
 
     // 新しいページ（タブ）を開く

@@ -1,0 +1,12 @@
+{
+  "url": "http://localhost:8080/demo/inline.html",
+  "scriptFilter": "",
+  "actions": [
+    { "type": "wait",  "milliseconds": 500 },
+    { "type": "click", "selector": "#btn-add" },
+    { "type": "click", "selector": "#btn-add" },
+    { "type": "click", "selector": "#btn-add" },
+    { "type": "click", "selector": "#btn-reset" },
+    { "type": "wait",  "milliseconds": 200 }
+  ]
+}

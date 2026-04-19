@@ -1,0 +1,20 @@
+{
+  "url": "http://localhost:8080/multipage-demo/page1.html",
+  "scriptFilters": ["cart.js", "detail.js"],
+  "continueOnError": true,
+  "actions": [
+    { "type": "wait", "milliseconds": 300 },
+
+    { "type": "click", "selector": ".product-card:nth-child(1) button" },
+    { "type": "wait",  "milliseconds": 200 },
+
+    { "type": "click", "selector": ".product-card:nth-child(2) button" },
+    { "type": "wait",  "milliseconds": 200 },
+
+    { "type": "click", "selector": ".product-card:nth-child(2) button" },
+    { "type": "wait",  "milliseconds": 200 },
+
+    { "type": "click", "selector": ".product-card:nth-child(1) a" },
+    { "type": "wait",  "milliseconds": 3500 }
+  ]
+}

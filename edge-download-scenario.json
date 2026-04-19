@@ -1,0 +1,9 @@
+{
+  "url": "https://nodejs.org/en/download/prebuilt-installer",
+  "continueOnError": true,
+  "actions": [
+    { "type": "waitForSelector", "selector": "a[href*='.msi']" },
+    { "type": "click", "selector": "a[href*='.msi']" },
+    { "type": "wait", "milliseconds": 10000 }
+  ]
+}

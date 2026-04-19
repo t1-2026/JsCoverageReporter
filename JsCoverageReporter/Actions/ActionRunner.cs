@@ -26,6 +26,9 @@ internal static class ActionRunner
         // すべてのアクションを順番に実行する
         foreach (var action in actions)
         {
+            // リスト内の null 要素はスキップする
+            if (action == null) { continue; }
+
             // continueOnError が true のときは Playwright の例外をキャッチして次へ進む
             try
             {
@@ -212,17 +215,10 @@ internal static class ActionRunner
 
                 // 要素またはページをスクロールする
                 case "scroll":
-                    // selector が指定されている場合はその要素をビューポートにスクロールする
-                    if (action.Selector is not null)
+                    // selector がない場合は x/y のデルタ量だけページをホイールスクロールする
+                    if (action.Selector is null)
                     {
-                        await page.Locator(action.Selector).ScrollIntoViewIfNeededAsync(
-                            new LocatorScrollIntoViewIfNeededOptions { Timeout = timeoutMs });
-                    }
-                    else
-                    {
-                        // selector がない場合は x/y のデルタ量だけページをホイールスクロールする
                         // X または Y が null の場合は 0 として扱う
-                        // x/y が null の場合は 0 として扱う
                         int deltaX;
                         if (action.X == null)
                         {
@@ -242,19 +238,35 @@ internal static class ActionRunner
                             deltaY = action.Y.Value;
                         }
                         // window.scrollBy を使うとヘッドレスモードでも確実にスクロール位置が変わる
-                        await page.EvaluateAsync($"() => window.scrollBy({deltaX}, {deltaY})");
+                        // 引数をパラメータ化して渡す（文字列補間による潜在的な注入リスクを排除する）
+                        await page.EvaluateAsync("([dx, dy]) => window.scrollBy(dx, dy)", new[] { deltaX, deltaY });
+                    }
+                    else
+                    {
+                        // selector が指定されている場合はその要素をビューポートにスクロールする
+                        await page.Locator(action.Selector).ScrollIntoViewIfNeededAsync(
+                            new LocatorScrollIntoViewIfNeededOptions { Timeout = timeoutMs });
                     }
                     break;
 
                 // 未知のアクション種別はスキップして警告する
                 default:
-                    Console.Error.WriteLine($"[Warning] Unknown action type '{action.Type}' — skipping.");
+                    string actionTypeLabel;
+                    if (action.Type == null) { actionTypeLabel = "(null)"; } else { actionTypeLabel = action.Type; }
+                    Console.Error.WriteLine($"[Warning] Unknown action type '{actionTypeLabel}' — skipping.");
                     break;
             }
 
             } // try ブロックの終わり
             catch (Exception ex)
             {
+                // OperationCanceledException（TaskCanceledException を含む）は
+                // continueOnError に関わらず必ず再スローする。
+                // キャンセルシグナルやタイムアウトを握りつぶすとプロセスが正しく停止できなくなるため。
+                if (ex is OperationCanceledException)
+                {
+                    throw;
+                }
                 // continueOnError が false の場合は例外を再スローして処理を止める
                 if (!continueOnError)
                 {

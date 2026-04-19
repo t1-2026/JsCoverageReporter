@@ -606,7 +606,7 @@ public class HtmlOutputTests
                 new CoverageRange(1, 2, 1),
             }),
         };
-        var map = HtmlReportGenerator.BuildCoverageMap(source, functions);
+        var map = CoverageParser.BuildCoverageMap(source, functions);
         var lines = HtmlReportGenerator.BuildLines(source, map);
 
         // \r をスキップすれば、行の実コードは x のみ → count=0 → Uncovered
@@ -632,7 +632,7 @@ public class HtmlOutputTests
                 new CoverageRange(1, 2, 0),
             }),
         };
-        var map = HtmlReportGenerator.BuildCoverageMap(source, functions);
+        var map = CoverageParser.BuildCoverageMap(source, functions);
         var lines = HtmlReportGenerator.BuildLines(source, map);
 
         // \0 をスキップすれば、行の実コードは x のみ → count=1 → Covered
@@ -654,7 +654,7 @@ public class HtmlOutputTests
         // ソースコード内の <script> タグが HTML エンコードされて出力されることを確認する（XSS 防止）
         const string source = "var x = \"<script>alert(1)</script>\";";
         var functions = new List<FunctionCoverage>();
-        var map = HtmlReportGenerator.BuildCoverageMap(source, functions);
+        var map = CoverageParser.BuildCoverageMap(source, functions);
         var lines = HtmlReportGenerator.BuildLines(source, map);
 
         // BuildScriptPage を呼び出して HTML 出力を確認する
@@ -696,7 +696,7 @@ public class HtmlOutputTests
         // スクリプト URL 内の < > が HTML エンコードされて出力されることを確認する（XSS 防止）
         const string source = "var x = 1;";
         var functions = new List<FunctionCoverage>();
-        var map = HtmlReportGenerator.BuildCoverageMap(source, functions);
+        var map = CoverageParser.BuildCoverageMap(source, functions);
         var lines = HtmlReportGenerator.BuildLines(source, map);
         // スクリプト URL に XSS ペイロードを埋め込む
         var scriptPage = HtmlReportGenerator.BuildScriptPage(
@@ -1028,6 +1028,17 @@ public class HtmlOutputTests
     }
 
     /// <summary>
+    /// スキームのみの不正 URL（"http://"）の場合、空文字列が返されることを確認する。
+    /// ホスト部が空のためホスト名抽出結果も空文字列になる。
+    /// </summary>
+    [Fact]
+    public void GetFileName_SchemeOnly_ReturnsEmptyString()
+    {
+        // "http://" はホスト名がない不正 URL — 空文字列を返す
+        Assert.Equal("", HtmlReportGenerator.GetFileName("http://"));
+    }
+
+    /// <summary>
     /// パスがルートスラッシュのみの URL（http://example.com/）の場合、
     /// ホスト名（example.com）が返されることを確認する。
     /// </summary>
@@ -1045,8 +1056,20 @@ public class HtmlOutputTests
     [Fact]
     public void GetFileName_NonHttpUrl_ReturnsAsIs()
     {
-        const string url = "data:text/javascript,var x=1";
+        // http/https/file/data 以外のスキームはそのまま返す
+        const string url = "app://some/path.js";
         Assert.Equal(url, HtmlReportGenerator.GetFileName(url));
+    }
+
+    /// <summary>
+    /// data: URL は巨大な Base64 文字列になりうるため、表示用ラベル "(data URL)" を返すことを確認する。
+    /// </summary>
+    [Fact]
+    public void GetFileName_DataUrl_ReturnsDataUrlLabel()
+    {
+        // data: URL はそのまま表示すると <h1> が巨大になるため短縮表示する
+        Assert.Equal("(data URL)", HtmlReportGenerator.GetFileName("data:text/javascript,var x=1"));
+        Assert.Equal("(data URL)", HtmlReportGenerator.GetFileName("DATA:text/javascript;base64," + new string('A', 500)));
     }
 
     /// <summary>
@@ -1118,6 +1141,53 @@ public class HtmlOutputTests
         Assert.Contains("画面1", html);
         // URL が空のとき括弧や区切り文字が付かないことを確認する
         Assert.DoesNotContain("画面1 (", html);
+    }
+
+    /// <summary>
+    /// 複数の pageInfos がある場合、すべてのラベルと URL がカンマ区切りで表示されることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildScriptPage_MultiplePageInfos_ShowsAllLabelsAndUrls()
+    {
+        var html = HtmlReportGenerator.BuildScriptPage(
+            [("画面1", "http://example.com/page1"), ("画面2", "http://example.com/page2")],
+            "app.js",
+            []);
+
+        // 両方のラベルが含まれているか確認する
+        Assert.Contains("画面1", html);
+        Assert.Contains("画面2", html);
+        // URL も含まれているか確認する
+        Assert.Contains("http://example.com/page1", html);
+        Assert.Contains("http://example.com/page2", html);
+        // カンマ区切りで複数エントリが並んでいるか確認する
+        Assert.Contains(",", html);
+    }
+
+    /// <summary>
+    /// 3つ以上の pageInfos がある場合、すべてのラベルと URL がカンマ区切りで表示されることを確認する。
+    /// 2件テストは既にあるが、3件以上のループ動作を明示的に確認する。
+    /// </summary>
+    [Fact]
+    public void BuildScriptPage_ThreePageInfos_AllLabelsAndUrlsIncluded()
+    {
+        var html = HtmlReportGenerator.BuildScriptPage(
+            [("画面1", "http://example.com/page1"),
+             ("画面2", "http://example.com/page2"),
+             ("画面3", "http://example.com/page3")],
+            "app.js",
+            []);
+
+        // すべてのラベルが含まれているか確認する
+        Assert.Contains("画面1", html);
+        Assert.Contains("画面2", html);
+        Assert.Contains("画面3", html);
+        // すべての URL も含まれているか確認する
+        Assert.Contains("http://example.com/page1", html);
+        Assert.Contains("http://example.com/page2", html);
+        Assert.Contains("http://example.com/page3", html);
+        // カンマ区切りで複数エントリが並んでいるか確認する
+        Assert.Contains(",", html);
     }
 
     // -----------------------------------------------------------------------
@@ -1301,6 +1371,115 @@ public class HtmlOutputTests
         var result = HtmlReportGenerator.GetFileName("http://example.com/lib%2Butils.js");
         Assert.Equal("lib+utils.js", result);
     }
+
+    // -----------------------------------------------------------------------
+    // テストA: 除算演算子 / を含むソースで BuildCoverageMap がクラッシュしないことを確認する
+    // SkipWhitespaceAndCommentsBackward の source[k+1] 境界値の煙幕テスト
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// 除算演算子（a / b）を含むソースで BuildCoverageMap が例外なく完了することを確認する。
+    /// SkipWhitespaceAndCommentsBackward の行コメント検出ロジックで source[k+1] にアクセスする際、
+    /// 境界チェックが正しく行われることを検証する煙幕テスト。
+    /// </summary>
+    [Fact]
+    public void BuildMap_SourceWithDivisionOperator_NoException()
+    {
+        // async アロー関数の本体に除算演算子が含まれる場合
+        const string source = "const f = async () => { return a / b; }";
+        var ex = Record.Exception(() => CoverageParser.BuildCoverageMap(source, []));
+        Assert.Null(ex);
+    }
+
+    // -----------------------------------------------------------------------
+    // テストF: %25（パーセント記号のエンコード）を含む URL の GetFileName
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// %25（= '%' のパーセントエンコード）を含む URL の GetFileName を確認する。
+    /// Uri.UnescapeDataString は %25 を '%' にデコードするため、
+    /// 結果は "app%.js" になることを確認する。
+    /// </summary>
+    [Fact]
+    public void GetFileName_UrlWithPercentEncodedPercent_ReturnsDecodedFilename()
+    {
+        // %25 → '%' にデコードされる（Uri.UnescapeDataString の動作）
+        var result = HtmlReportGenerator.GetFileName("http://example.com/app%25.js");
+        Assert.Equal("app%.js", result);
+    }
+
+    /// <summary>
+    /// %25 を含む URL（%25 自体がパーセントエンコードされた場合: %2525）の GetFileName を確認する。
+    /// Uri.UnescapeDataString は1回だけデコードするため %2525 → %25 になる（スペースにはならない）。
+    /// </summary>
+    [Fact]
+    public void GetFileName_DoubleEncodedPercent_DecodesOnce()
+    {
+        // %2525 = '%' + '2' + '5' のエンコード。Uri.UnescapeDataString は一段階だけデコードする
+        // %25 → '%' なので %2525 → %25 になる（二重デコードして ' ' にはならない）
+        var result = HtmlReportGenerator.GetFileName("http://example.com/app%2525.js");
+        Assert.Equal("app%25.js", result);
+    }
+
+    /// <summary>
+    /// blob: URL は http/https/file/data のいずれでもないため、そのまま返されることを確認する。
+    /// ブラウザが生成する blob URL はスクリプト URL として現れる場合がある。
+    /// </summary>
+    [Fact]
+    public void GetFileName_BlobUrl_ReturnsAsIs()
+    {
+        const string blobUrl = "blob:https://example.com/550e8400-e29b-41d4-a716-446655440000";
+        // blob: は http/https/file/data に該当しないためそのまま返す
+        Assert.Equal(blobUrl, HtmlReportGenerator.GetFileName(blobUrl));
+    }
+
+    /// <summary>
+    /// chrome-extension:// URL は http/https/file/data のいずれでもないため、そのまま返されることを確認する。
+    /// ブラウザ拡張機能由来のスクリプトはこのスキームで現れる場合がある。
+    /// </summary>
+    [Fact]
+    public void GetFileName_ChromeExtensionUrl_ReturnsAsIs()
+    {
+        const string extUrl = "chrome-extension://abcdefghijklmnop/content_script.js";
+        // chrome-extension:// は http/https/file/data に該当しないためそのまま返す
+        Assert.Equal(extUrl, HtmlReportGenerator.GetFileName(extUrl));
+    }
+
+    /// <summary>
+    /// パスなし URL にクエリ文字列がある場合（スラッシュなし）、クエリを除いたホスト名を返すことを確認する。
+    /// 例: http://example.com?q=1 → example.com（クエリ付きではなく）
+    /// </summary>
+    [Fact]
+    public void GetFileName_NoPathUrlWithQuery_ReturnsHostWithoutQuery()
+    {
+        Assert.Equal("example.com", HtmlReportGenerator.GetFileName("http://example.com?q=1"));
+    }
+
+    /// <summary>
+    /// パスなし URL にフラグメントがある場合（スラッシュなし）、フラグメントを除いたホスト名を返すことを確認する。
+    /// 例: http://example.com#hash → example.com
+    /// </summary>
+    [Fact]
+    public void GetFileName_NoPathUrlWithFragment_ReturnsHostWithoutFragment()
+    {
+        Assert.Equal("example.com", HtmlReportGenerator.GetFileName("http://example.com#hash"));
+    }
+
+    // -----------------------------------------------------------------------
+    // テストG: BuildLines に null を渡した場合の挙動
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// BuildLines に null ソースを渡した場合、空のリストを返して例外が発生しないことを確認する。
+    /// null ガードが source == null のときに空リストを返す実装であることを文書化するテスト。
+    /// </summary>
+    [Fact]
+    public void BuildLines_NullSource_ReturnsEmptyList()
+    {
+        // null ソースを渡した場合、例外ではなく空リストが返るべき
+        var lines = HtmlReportGenerator.BuildLines(null, []);
+        Assert.Empty(lines);
+    }
 }
 
 public class BuildLinesEdgeCaseTests
@@ -1314,6 +1493,19 @@ public class BuildLinesEdgeCaseTests
         var lines = HtmlReportGenerator.BuildLines("", []);
 
         Assert.Empty(lines);
+    }
+
+    /// <summary>
+    /// ソースコードが "\r" のみの場合も、空要素除外が正しく機能して
+    /// Neutral ステータスの空行1件が返ることを確認する。
+    /// （壊れた CRLF 対応）
+    /// </summary>
+    [Fact]
+    public void BuildLines_CarriageReturnOnly_NeutralStatus()
+    {
+        var lines = HtmlReportGenerator.BuildLines("\r", []);
+        Assert.Single(lines);
+        Assert.Equal(LineCoverageStatus.Neutral, lines[0].Status);
     }
 
     /// <summary>
@@ -1374,6 +1566,113 @@ public class BuildLinesEdgeCaseTests
         // これが Covered になるなら offset ズレのバグがある
         Assert.Equal(LineCoverageStatus.Uncovered, lines[1].Status);
     }
+
+    // -----------------------------------------------------------------------
+    // BuildLines — 境界値テスト
+    // -----------------------------------------------------------------------
+
+    /// <summary>行中の NUL 文字（\0）は HTML に出力されないが後続文字の offset は正しいままであることを確認する。</summary>
+    [Fact]
+    public void BuildLines_NullCharInLine_NotRenderedButOffsetCorrect()
+    {
+        // source = "ab\0cd", map は全文字 covered
+        const string source = "ab\0cd";
+        var map = new int[] { 1, 1, 1, 1, 1 };
+
+        var lines = HtmlReportGenerator.BuildLines(source, map);
+
+        Assert.Single(lines);
+        // NUL が含まれていないこと（string.Contains(char) は ordinal 比較を使用する）
+        Assert.False(lines[0].Html.Contains('\0'), "HTML に NUL 文字が含まれてはならない");
+        // 'a','b','c','d' は含まれていること
+        Assert.Contains("a", lines[0].Html);
+        Assert.Contains("d", lines[0].Html);
+        Assert.Equal(LineCoverageStatus.Covered, lines[0].Status);
+    }
+
+    // -----------------------------------------------------------------------
+    // HtmlEncode — 単一引用符は変換しないことを明示する
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// HtmlEncode は HTML コンテンツ用なので単一引用符（'）はエスケープしない。
+    /// HTML 属性値でない限り ' をエスケープする必要はなく、現在の実装はこれが意図的動作。
+    /// BuildLines でも ' はそのまま出力されており、HtmlEncode と挙動が一致していることを示す。
+    /// </summary>
+    [Fact]
+    public void HtmlEncode_SingleQuote_NotEscaped()
+    {
+        Assert.Equal("it's", HtmlReportGenerator.HtmlEncode("it's"));
+    }
+
+    /// <summary>
+    /// HtmlEncode でタブ文字（\t）と改行文字（\n）はエスケープされないことを確認する。
+    /// これらはHTML特殊文字ではないため変換対象外。
+    /// </summary>
+    [Fact]
+    public void HtmlEncode_TabAndNewline_NotEscaped()
+    {
+        // タブと改行はそのまま出力される
+        Assert.Equal("\t\n", HtmlReportGenerator.HtmlEncode("\t\n"));
+    }
+
+    /// <summary>
+    /// HtmlEncode で絵文字（サロゲートペア文字）がそのまま出力されることを確認する。
+    /// U+1F600 (😀) は .NET で 2 つの char（サロゲートペア）で表現されるが、
+    /// HtmlEncode は char 単位でループするため両方そのまま通過する。
+    /// </summary>
+    [Fact]
+    public void HtmlEncode_Emoji_PassedThrough()
+    {
+        Assert.Equal("😀", HtmlReportGenerator.HtmlEncode("😀"));
+    }
+
+    /// <summary>
+    /// BuildLines で ' （シングルクォート）がエスケープされずそのまま出力されることを確認する。
+    /// テキストノード内では ' のエスケープは不要であり、HtmlEncode と挙動が一致している。
+    /// </summary>
+    [Fact]
+    public void BuildLines_SingleQuoteInSource_NotEscaped()
+    {
+        // map: 全文字 covered（1）
+        var lines = HtmlReportGenerator.BuildLines("it's", [1, 1, 1, 1]);
+        Assert.Single(lines);
+        // ' がそのまま含まれていること（&#39; にエスケープされていないこと）
+        Assert.Contains("it", lines[0].Html);
+        Assert.DoesNotContain("&#39;", lines[0].Html);
+    }
+
+    // -----------------------------------------------------------------------
+    // GetFileName — 境界値テスト
+    // -----------------------------------------------------------------------
+
+    /// <summary>ルートパス（"/"）のみの URL はホスト名を返す。</summary>
+    [Fact]
+    public void GetFileName_RootPathOnly_ReturnsHostname()
+    {
+        Assert.Equal("localhost", HtmlReportGenerator.GetFileName("http://localhost/"));
+    }
+
+    /// <summary>javascript: スキームは HTTP/HTTPS/FILE でないためそのまま返す。</summary>
+    [Fact]
+    public void GetFileName_JavaScriptScheme_ReturnsAsIs()
+    {
+        Assert.Equal("javascript:alert(1)", HtmlReportGenerator.GetFileName("javascript:alert(1)"));
+    }
+
+    /// <summary>ws:// スキームはそのまま返す。</summary>
+    [Fact]
+    public void GetFileName_WsScheme_ReturnsAsIs()
+    {
+        Assert.Equal("ws://localhost/app.js", HtmlReportGenerator.GetFileName("ws://localhost/app.js"));
+    }
+
+    /// <summary>フラグメント（# 以降）は除去されてファイル名のみ返す。</summary>
+    [Fact]
+    public void GetFileName_UrlWithFragment_FragmentStripped()
+    {
+        Assert.Equal("app.js", HtmlReportGenerator.GetFileName("http://localhost/app.js#section"));
+    }
 }
 
 /// <summary>
@@ -1432,6 +1731,26 @@ public class GenerateTests : IDisposable
         // index.html の内容に「全体カバレッジ」という文字列が含まれているか確認する
         string content = File.ReadAllText(indexPath);
         Assert.Contains("全体カバレッジ", content);
+    }
+
+    /// <summary>
+    /// 出力先ディレクトリが既に存在してもエラーにならず上書き（新規作成）されることを確認する。
+    /// Directory.CreateDirectory は既存ディレクトリでも安全だが、テストで明示的に動作を保証する。
+    /// </summary>
+    [Fact]
+    public void Generate_OutputDirExists_OverwritesWithoutError()
+    {
+        // 事前に出力先ディレクトリとダミーファイルを作成する
+        Directory.CreateDirectory(_outputDir);
+        File.WriteAllText(Path.Combine(_outputDir, "dummy.txt"), "dummy");
+
+        var generator = new HtmlReportGenerator();
+        // 例外が発生しないことを確認する
+        var ex = Record.Exception(() => generator.Generate([], _outputDir));
+        Assert.Null(ex);
+
+        // index.html が正常に生成されていること
+        Assert.True(File.Exists(Path.Combine(_outputDir, "index.html")));
     }
 
     /// <summary>
@@ -1562,5 +1881,713 @@ public class GenerateTests : IDisposable
         // 何らかのパーセント表示が含まれているか確認する
         Assert.Contains("%", indexContent);
     }
+
+    // -----------------------------------------------------------------------
+    // Bug3: 同一 Page.Index が同一グループに2回現れるとき tabFilename が衝突しないこと
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// 同じタブ（Page.Index=0）が同じスクリプトを異なるページ URL で2回収集した場合
+    /// （ナビゲーション後に同じスクリプトが再読み込みされたケース）、
+    /// タブ別ページが衝突せず2ファイル生成されることを確認する。
+    /// </summary>
+    [Fact]
+    public void Generate_SamePageIndexTwiceInGroup_TwoTabFilesCreated()
+    {
+        var source = "function foo() {}";
+        // 同一 tabIndex=0、異なる pageUrl → 同一グループ (url, source) に2件
+        var script1 = MakeScript(0, "http://example.com/page1", "http://example.com/app.js", source);
+        var script2 = MakeScript(0, "http://example.com/page2", "http://example.com/app.js", source);
+
+        var generator = new HtmlReportGenerator();
+        generator.Generate([script1, script2], _outputDir);
+
+        var scriptsDir = Path.Combine(_outputDir, "scripts");
+        // script-0-tab0.html と script-0-tab1.html の2ファイルが生成されていること
+        var tabFiles = Directory.GetFiles(scriptsDir, "script-0-tab*.html");
+        Assert.Equal(2, tabFiles.Length);
+    }
+
+    // -----------------------------------------------------------------------
+    // テストI: 同一 URL・異なるソースのスクリプトは別グループになる
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// 同じ URL だがソースコードが異なる2件のスクリプト（例: ホットリロードで別バージョンが来た場合）は
+    /// 別グループとして扱われ、2つの別ファイル（script-0.html, script-1.html）が生成されることを確認する。
+    /// </summary>
+    [Fact]
+    public void Generate_SameUrlDifferentSource_CreatesSeperateScriptFiles()
+    {
+        // 同じ URL だが Source が異なる（v1 と v2）
+        var script1 = MakeScript(0, "http://example.com/", "http://example.com/app.js",
+            "var version = 1;", covered: 1);
+        var script2 = MakeScript(0, "http://example.com/", "http://example.com/app.js",
+            "var version = 2;", covered: 1);
+
+        var generator = new HtmlReportGenerator();
+        generator.Generate([script1, script2], _outputDir);
+
+        string scriptsDir = Path.Combine(_outputDir, "scripts");
+
+        // URL が同じでも Source が違うため別グループになり、2ファイルが生成されるべき
+        Assert.True(File.Exists(Path.Combine(scriptsDir, "script-0.html")),
+            "script-0.html が生成されていない");
+        Assert.True(File.Exists(Path.Combine(scriptsDir, "script-1.html")),
+            "script-1.html が生成されていない（同一 URL・異なるソースは別グループになるべき）");
+    }
+
+    // -----------------------------------------------------------------------
+    // GetFileName — 追加エッジケーステスト
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// URL にユーザー名:パスワード@ホスト の形式で認証情報が含まれる場合、
+    /// パスのファイル名部分（最後のセグメント）が返されることを確認する。
+    /// </summary>
+    [Fact]
+    public void GetFileName_UrlWithAuthentication_ReturnsFilename()
+    {
+        // http://user:pass@host/scripts/app.js → pathStart は "/scripts/app.js" の '/' の位置
+        Assert.Equal("app.js", HtmlReportGenerator.GetFileName("http://user:pass@host/scripts/app.js"));
+    }
+
+    /// <summary>
+    /// scriptUrl が空文字の場合、BuildScriptPage が例外なく動作し
+    /// GetFileName("") = "" がそのまま h1 要素に含まれることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildScriptPage_EmptyScriptUrl_NoException()
+    {
+        var lines = new List<LineData>();
+        // 例外が発生しないことを確認する
+        var html = HtmlReportGenerator.BuildScriptPage([], "", lines);
+        // h1 タグが生成されており、空文字が混入してもクラッシュしないこと
+        Assert.Contains("<h1>", html);
+    }
+
+    // -----------------------------------------------------------------------
+    // GetFileName — IPv6 アドレス
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// IPv6 アドレスを含む URL（http://[::1]:3000/app.js）からファイル名が正しく取得できることを確認する。
+    /// [::1] 内の ':' や ']' は schemeLength 以降で IndexOf('/') が最初に見つける '/' より前にあるため
+    /// pathStart が正しく計算され、GetFileName が "app.js" を返す。
+    /// </summary>
+    [Fact]
+    public void GetFileName_IPv6Url_ReturnsFilename()
+    {
+        // http://[::1]:3000/app.js → pathStart は '/' の位置 → rawName = "app.js"
+        Assert.Equal("app.js", HtmlReportGenerator.GetFileName("http://[::1]:3000/app.js"));
+    }
+
+    // -----------------------------------------------------------------------
+    // BuildIndexPage — カバレッジ率ゼロ除算パス
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// 全行が Neutral（対象外）で対象行数 = 0 のスクリプトのみの場合、
+    /// カバレッジ率が 0.0% と表示され、全体集計でもゼロ除算が発生しないことを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildIndexPage_AllNeutralRows_ShowsZeroPercentWithoutException()
+    {
+        // covered=0, partial=0, total=0 のスクリプト → pct=0（ゼロ除算防止パスを通る）
+        var rows = new List<(
+            IReadOnlyList<(string label, string pageUrl, string tabFilename)> tabs,
+            string url, int covered, int partial, int total, string mergedFilename)>
+        {
+            (
+                new List<(string, string, string)> { ("画面1", "http://example.com/", "script-0.html") },
+                "http://example.com/app.js",
+                0, 0, 0,
+                "script-0.html"
+            ),
+        };
+
+        string html = HtmlReportGenerator.BuildIndexPage(rows);
+
+        // 0.0% が表示されること（ゼロ除算で例外が起きないこと）
+        Assert.Contains("0.0%", html);
+        // 対象行数 0 であること
+        Assert.Contains("<td class=\"num\">0</td>", html);
+    }
+
+    /// <summary>
+    /// GetFileName に null を渡した場合、例外なく空文字が返されることを確認する。
+    /// #nullable disable 環境で null が渡された場合の安全性を検証する。
+    /// </summary>
+    [Fact]
+    public void GetFileName_NullUrl_ReturnsEmpty()
+    {
+        // null を渡しても NullReferenceException が出ず空文字が返ること
+        var result = HtmlReportGenerator.GetFileName(null);
+        Assert.Equal("", result);
+    }
+
+    /// <summary>
+    /// 全体カバレッジでも対象行数が 0 の場合（全スクリプト Neutral）、
+    /// 全体カバレッジ率が 0.0% と表示されることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildIndexPage_OverallAllNeutral_ShowsZeroOverallPercent()
+    {
+        // 全スクリプト total=0 → overallPct = 0（全体集計のゼロ除算防止パスを通る）
+        var rows = new List<(
+            IReadOnlyList<(string label, string pageUrl, string tabFilename)> tabs,
+            string url, int covered, int partial, int total, string mergedFilename)>();
+
+        string html = HtmlReportGenerator.BuildIndexPage(rows);
+
+        // 全体カバレッジ 0.0% が表示されること
+        Assert.Contains("0.0%", html);
+    }
+
+    /// <summary>
+    /// 不正なパーセントシーケンス（%GG など）を含む URL を渡しても例外が発生しないことを確認する。
+    /// Uri.UnescapeDataString が例外を投げた場合でも try-catch で保護されていることを検証する。
+    /// </summary>
+    [Fact]
+    public void GetFileName_InvalidPercentSequence_DoesNotThrow()
+    {
+        // %GG は不正なパーセントシーケンス → .NET によっては UriFormatException を投げる可能性がある
+        var ex = Record.Exception(() => HtmlReportGenerator.GetFileName("http://localhost/foo%GG.js"));
+        Assert.Null(ex);
+    }
+
+    /// <summary>
+    /// 末尾が % だけで終わる不正な URL を渡しても例外が発生しないことを確認する。
+    /// </summary>
+    [Fact]
+    public void GetFileName_TrailingPercent_DoesNotThrow()
+    {
+        // 末尾 % は不完全なパーセントシーケンス → 例外なく何らかの文字列を返すこと
+        var ex = Record.Exception(() => HtmlReportGenerator.GetFileName("http://localhost/app%"));
+        Assert.Null(ex);
+    }
+
+    /// <summary>
+    /// パス部分がない認証情報付き URL でホスト名のみを返す（パスワードを含まない）。
+    /// </summary>
+    [Fact]
+    public void GetFileName_AuthCredentialsNoPath_ReturnsHostOnly()
+    {
+        // http://user:pass@host はパス部分がないため hostOnly 分岐に入る
+        // Bug: @ 以前の認証情報（user:pass）がそのまま返されていた
+        Assert.Equal("host",        HtmlReportGenerator.GetFileName("http://user:pass@host"));
+        Assert.Equal("example.com", HtmlReportGenerator.GetFileName("http://user@example.com"));
+    }
+
+    /// <summary>
+    /// URL に複数のパスセグメントがある場合、最後のセグメント（ファイル名）が返されることを確認する。
+    /// パス /v1/2/3/app.js → LastIndexOf('/') によって app.js が取得される。
+    /// </summary>
+    [Fact]
+    public void GetFileName_UrlWithMultiplePathSegments_ReturnsLastSegment()
+    {
+        Assert.Equal("app.js", HtmlReportGenerator.GetFileName("https://cdn.example.com/v1/2/3/app.js"));
+        Assert.Equal("main.js", HtmlReportGenerator.GetFileName("http://localhost:3000/assets/js/dist/main.js"));
+    }
+
+    /// <summary>
+    /// URL に制御文字（\0 や \n など ASCII 0x00-0x1F）が含まれる場合でも
+    /// GetFileName が例外を投げずに処理できることを確認する。
+    /// </summary>
+    [Fact]
+    public void GetFileName_ControlCharactersInUrl_NoException()
+    {
+        // 制御文字を含む不正な URL でも例外が発生しないことを確認する
+        var ex1 = Record.Exception(() => HtmlReportGenerator.GetFileName("https://example.com/path\0/file.js"));
+        Assert.Null(ex1);
+        var ex2 = Record.Exception(() => HtmlReportGenerator.GetFileName("https://example.com/path\n/file.js"));
+        Assert.Null(ex2);
+        var ex3 = Record.Exception(() => HtmlReportGenerator.GetFileName("https://example.com/path\t/file.js"));
+        Assert.Null(ex3);
+    }
+
+    /// <summary>
+    /// XSS 対策: &lt;script&gt; タグが HTML エンコードされることを確認する。
+    /// ファイル名や URL に悪意あるスクリプトが含まれる場合に HTML 出力が安全であることを保証する。
+    /// </summary>
+    [Fact]
+    public void HtmlEncode_ScriptTag_EscapedForXss()
+    {
+        const string input    = "<script>alert('XSS')</script>";
+        const string expected = "&lt;script&gt;alert('XSS')&lt;/script&gt;";
+        Assert.Equal(expected, HtmlReportGenerator.HtmlEncode(input));
+    }
+
+    /// <summary>
+    /// 認証情報（user:pass@）がホスト部に含まれ、かつパスが存在する URL では、
+    /// パス抽出の段階で認証情報は自然に除かれてファイル名のみが返されることを確認する。
+    /// </summary>
+    [Fact]
+    public void GetFileName_UrlWithCredentialsAndPath_ReturnsFilenameOnly()
+    {
+        // pathStart は "https://" 以降の最初の '/' なので user:pass@ を含まない
+        Assert.Equal("app.js", HtmlReportGenerator.GetFileName("https://user:pass@example.com/js/app.js"));
+        Assert.Equal("app.js", HtmlReportGenerator.GetFileName("http://user@localhost:3000/app.js"));
+    }
+
+    /// <summary>
+    /// 末尾改行なしのソース（最後の文字がファイル末尾）を渡した場合、
+    /// オフセット計算が正しく動作して最後の文字のカバレッジが反映されることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildLines_SourceWithNoTrailingNewline_LastCharCovered()
+    {
+        // "ab" — 末尾に \n がない2文字。b（index=1）が実行済みにマークされること
+        const string source = "ab";
+        var map = new int[] { 1, 1 };
+        var lines = HtmlReportGenerator.BuildLines(source, map);
+        // 1行だけ生成されているか確認する
+        Assert.Single(lines);
+        // 最終文字 'b' を含む行が Covered になっているか確認する
+        Assert.Equal(LineCoverageStatus.Covered, lines[0].Status);
+        Assert.Contains("b", lines[0].Html);
+    }
 }
-
+
+// -----------------------------------------------------------------------
+// コードレビュー指摘対応: BuildScriptPage 追加テストケース
+// -----------------------------------------------------------------------
+
+/// <summary>
+/// コードレビューで指摘された BuildScriptPage の追加テストケース。
+/// </summary>
+public class BuildScriptPageReviewTests
+{
+    /// <summary>
+    /// pageInfos が空リストの場合、BuildScriptPage が "(不明)" フォールバックを返すことを確認する。
+    /// pageInfos.Count == 0 のコードパスが正しく動作することを検証する。
+    /// </summary>
+    [Fact]
+    public void BuildScriptPage_EmptyPageInfosList_ShowsFallback()
+    {
+        // pageInfos が空 → "(不明)" が表示されるはず
+        var html = HtmlReportGenerator.BuildScriptPage([], "app.js", []);
+
+        // "(不明)" フォールバック文字列が含まれているか確認する
+        Assert.Contains("(不明)", html);
+        // 有効な HTML が返っているか確認する
+        Assert.Contains("<html", html);
+    }
+}
+
+// -----------------------------------------------------------------------
+// コードレビュー指摘対応: GenerateTests の追加テストケース（BOM・XSS）
+// -----------------------------------------------------------------------
+
+/// <summary>
+/// コードレビューで指摘された Generate の追加テストケース。
+/// </summary>
+public class GenerateReviewTests : IDisposable
+{
+    private readonly string _outputDir;
+
+    public GenerateReviewTests()
+    {
+        _outputDir = Path.Combine(Path.GetTempPath(), "GenerateReviewTests_" + Guid.NewGuid().ToString("N"));
+    }
+
+    public void Dispose()
+    {
+        if (Directory.Exists(_outputDir))
+        {
+            Directory.Delete(_outputDir, recursive: true);
+        }
+    }
+
+    private static JsCoverageReporter.Coverage.ScriptCoverage MakeScriptWithRanges(
+        int tabIndex, string pageUrl, string scriptUrl, string source,
+        IReadOnlyList<JsCoverageReporter.Coverage.CoverageRange> ranges)
+    {
+        var functions = new List<JsCoverageReporter.Coverage.FunctionCoverage>
+        {
+            new("main", ranges),
+        };
+        var page = new JsCoverageReporter.Coverage.PageInfo(tabIndex, pageUrl);
+        return new JsCoverageReporter.Coverage.ScriptCoverage(page, scriptUrl, source, functions);
+    }
+
+    /// <summary>
+    /// BOM（バイトオーダーマーク U+FEFF）付きのソースを Generate に渡した場合、
+    /// V8 のオフセット（BOM を文字としてカウントしない）と正しく一致することを確認する。
+    /// BUG: BOM を除去せずに BuildCoverageMap に渡すと、オフセットが1ずれて末尾文字が中立になる。
+    /// FIX: Generate で canonical.Source.TrimStart('\uFEFF') してから BuildCoverageMap を呼ぶ。
+    /// </summary>
+    [Fact]
+    public void Generate_BomPrefixedSource_CoverageAlignedToContent()
+    {
+        // BOM + "var x;" = 7文字（BOM=1 + jsContent=6）
+        // V8 は BOM を文字としてカウントしないため、range(0, 6, 1) は jsContent の全6文字を covered にする
+        const string jsContent = "var x;";
+        string source = "\uFEFF" + jsContent; // 7文字（index 0=BOM, 1='v', ..., 6=';'）
+
+        // V8 スタイルのカバレッジ: BOM を除いた 0〜5 (全jsContent) を covered
+        var ranges = new List<JsCoverageReporter.Coverage.CoverageRange>
+        {
+            new(0, jsContent.Length, 1), // offset 0〜5 → jsContent の全文字
+        };
+
+        var script = MakeScriptWithRanges(
+            0, "http://example.com/", "http://example.com/app.js", source, ranges);
+
+        var generator = new HtmlReportGenerator();
+        generator.Generate([script], _outputDir);
+
+        string scriptContent = File.ReadAllText(
+            Path.Combine(_outputDir, "scripts", "script-0.html"));
+
+        // BOM が正しく除去されていれば全文字 covered → neutral span は現れないはず
+        // BOM 未除去だと ';'（最後の文字）が V8 のオフセット範囲外になって neutral になる
+        Assert.DoesNotContain("class=\"neutral\"", scriptContent);
+
+        // covered span が存在すること（ソースコードが正しく処理されていることを確認する）
+        Assert.Contains("class=\"covered\"", scriptContent);
+    }
+
+    /// <summary>
+    /// ページ URL（スクリプト詳細ページの見出しに表示される URL）に
+    /// XSS ペイロードが含まれる場合、HTML エンコードされることを確認する。
+    /// BuildScriptPage は pageInfos[0].url を HtmlEncode するため安全なはず。
+    /// </summary>
+    [Fact]
+    public void Generate_XssInPageUrl_EscapedInScriptPage()
+    {
+        // ページ URL に </script><svg onload=alert(1)> を埋め込む
+        const string xssPageUrl = "http://evil.com/</script><svg onload=alert(1)>";
+        var ranges = new List<JsCoverageReporter.Coverage.CoverageRange>
+        {
+            new(0, 10, 1),
+        };
+        var script = MakeScriptWithRanges(
+            0, xssPageUrl, "http://example.com/app.js", "var x = 1;", ranges);
+
+        var generator = new HtmlReportGenerator();
+        generator.Generate([script], _outputDir);
+
+        string scriptContent = File.ReadAllText(
+            Path.Combine(_outputDir, "scripts", "script-0.html"));
+
+        // XSS ペイロードの < > が &lt; &gt; にエスケープされているか確認する
+        Assert.Contains("&lt;/script&gt;", scriptContent);
+        // 生の </script> タグが HTML に残っていないことを確認する（ブラウザでスクリプト実行を防ぐ）
+        Assert.DoesNotContain("</script><svg", scriptContent);
+    }
+
+    /// <summary>
+    /// TC-17: BuildIndexPage の tab pageUrl に "javascript:alert(1)" が含まれる場合、
+    /// 表示テキストとして HTML エンコード（または素通り）されるだけで
+    /// href 属性に "javascript:" が現れないことを確認する（XSS 防止）。
+    /// pageUrl は表示テキストにのみ使われ、href は常に tabFilename 経由のため安全。
+    /// </summary>
+    [Fact]
+    public void BuildIndexPage_JavascriptSchemeInPageUrl_NotUsedAsHref()
+    {
+        // tab の pageUrl に javascript: スキームを含む文字列を渡す
+        var tabs = new List<(string label, string pageUrl, string tabFilename)>
+        {
+            ("画面1", "javascript:alert(1)", "script-0.html"),
+        };
+        var rows = new List<(
+            IReadOnlyList<(string label, string pageUrl, string tabFilename)> tabs,
+            string url, int covered, int partial, int total, string mergedFilename)>
+        {
+            (tabs, "http://example.com/app.js", 5, 0, 10, "script-0.html"),
+        };
+
+        string html = HtmlReportGenerator.BuildIndexPage(rows);
+
+        // href 属性に "javascript:" が現れないこと（XSS 防止の核心）
+        Assert.DoesNotContain("href=\"javascript:", html);
+        // href は tabFilename 経由でのみ設定されること
+        Assert.Contains("scripts/script-0.html", html);
+    }
+
+    /// <summary>
+    /// BOM（U+FEFF）のみからなるソースを Generate に渡した場合、
+    /// BOM を除去した後のソースが空文字になっても例外が発生しないことを確認する。
+    /// BuildCoverageMap("") は空マップ、BuildLines("", []) は空リストを返すため
+    /// BuildScriptPage に空の lines が渡される。
+    /// </summary>
+    [Fact]
+    public void Generate_BomOnlySource_DoesNotThrow()
+    {
+        // BOM だけからなるソース（除去後は空文字）
+        string source = "\uFEFF";
+        var ranges = new List<JsCoverageReporter.Coverage.CoverageRange>();
+        var script = MakeScriptWithRanges(
+            0, "http://example.com/", "http://example.com/app.js", source, ranges);
+
+        var generator = new HtmlReportGenerator();
+        var ex = Record.Exception(() => generator.Generate([script], _outputDir));
+
+        // 例外なく完了すること
+        Assert.Null(ex);
+        // index.html が生成されること
+        Assert.True(File.Exists(Path.Combine(_outputDir, "index.html")));
+    }
+}
+
+/// <summary>
+/// コードレビュー指摘対応: TG-7/TG-11/M-1 の追加テスト。
+/// GetFileName・BuildIndexPage のエッジケースを確認する。
+/// </summary>
+public class GetFileNameEdgeCaseTests
+{
+    /// <summary>
+    /// TG-7: URL のファイル名部分に %2F（パーセントエンコードされたスラッシュ）が含まれる場合、
+    /// Uri.UnescapeDataString によって '/' にデコードされた表示名が返されることを確認する。
+    /// （表示名への影響のみで、HTML の href 属性には使われないため XSS リスクなし）
+    /// </summary>
+    [Fact]
+    public void GetFileName_PercentEncodedSlash_DecodedToSlashInDisplayName()
+    {
+        // %2F はパーセントエンコードされた '/' — デコード後は "my/app.js" になる
+        string result = HtmlReportGenerator.GetFileName("http://example.com/scripts/my%2Fapp.js");
+        Assert.Equal("my/app.js", result);
+    }
+
+    /// <summary>
+    /// TG-11: BuildIndexPage に covered + partial * 0.5 が total を超えるデータを渡した場合、
+    /// カバレッジ率が 100% 超で表示されることを確認する（クランプなし・そのまま表示）。
+    /// </summary>
+    [Fact]
+    public void BuildIndexPage_CoveredPlusHalfPartialExceedsTotal_OverHundredPercentDisplayed()
+    {
+        // covered=10, partial=10, total=10 → pct = 100 * (10 + 5) / 10 = 150.0%
+        var tabs = new List<(string label, string pageUrl, string tabFilename)>
+        {
+            ("画面1", "http://example.com/", "script-0.html"),
+        };
+        var rows = new List<(
+            IReadOnlyList<(string label, string pageUrl, string tabFilename)> tabs,
+            string url, int covered, int partial, int total, string mergedFilename)>
+        {
+            (tabs, "http://example.com/app.js", 10, 10, 10, "script-0.html"),
+        };
+
+        string html = HtmlReportGenerator.BuildIndexPage(rows);
+
+        // カバレッジ率 150.0% がそのまま出力される（クランプなし）
+        Assert.Contains("150.0%", html);
+    }
+
+    /// <summary>
+    /// M-1 fix: GetFileName でルートパス（末尾 '/' のみ）の URL に認証情報（user:pass@）が含まれる場合、
+    /// 認証情報を除去したホスト名のみを返すことを確認する。
+    /// 修正前は "user:pass@example.com" が返されてレポートに認証情報が露出していた。
+    /// </summary>
+    [Fact]
+    public void GetFileName_RootPathUrlWithAuthInfo_AuthInfoStripped()
+    {
+        // http://user:pass@example.com/ → パス部分が "/" のみ → ルートパスケース
+        string result = HtmlReportGenerator.GetFileName("http://user:pass@example.com/");
+        // 認証情報が除去され、ホスト名のみが返される
+        Assert.Equal("example.com", result);
+        Assert.DoesNotContain("user", result);
+        Assert.DoesNotContain("pass", result);
+    }
+
+    /// <summary>
+    /// BuildScriptPage に複数 pageInfos を渡した場合、URL が空のエントリはラベルのみ表示され
+    /// URL が非空のエントリはラベルと URL が両方表示されることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildScriptPage_TwoPageInfosOneEmptyUrl_LabelOnlyForEmpty()
+    {
+        // 1件目: URL なし（ラベルのみ）、2件目: URL あり
+        var html = HtmlReportGenerator.BuildScriptPage(
+            [("画面1", ""), ("画面2", "https://example.com/page")],
+            "https://example.com/app.js",
+            []);
+
+        // 両方のラベルが含まれること
+        Assert.Contains("画面1", html);
+        Assert.Contains("画面2", html);
+        // 2件目の URL が含まれること
+        Assert.Contains("https://example.com/page", html);
+        // 空 URL のエントリは "()" のような空括弧が付かないこと
+        Assert.DoesNotContain("画面1 ()", html);
+    }
+
+    // ─── TC-4: BuildLines — 行中の \0 文字 ──────────────────────────────────────
+
+    /// <summary>
+    /// 行の途中に \0（ヌル文字）がある場合、\0 はレンダリングされないが
+    /// 後続の文字のカバレッジが正しく取得されることを確認する。
+    /// （BuildLines で \0 は表示スキップされるが、idx = offset + i の計算は CDP マップと一致する）
+    /// </summary>
+    [Fact]
+    public void BuildLines_NullCharMidLine_SubsequentCharHasCorrectCoverage()
+    {
+        // "a\0b" — a(idx=0): covered(1)、\0(idx=1): neutral(-1)、b(idx=2): uncovered(0)
+        const string source = "a\0b";
+        int[] map = [1, -1, 0];
+
+        var lines = HtmlReportGenerator.BuildLines(source, map);
+
+        // 1行だけ生成される
+        Assert.Single(lines);
+        var line = lines[0];
+
+        // a は covered、b は uncovered → Partial 行
+        Assert.Equal(LineCoverageStatus.Partial, line.Status);
+        // a が covered span に含まれること
+        Assert.Contains("covered", line.Html);
+        // b が uncovered span に含まれること
+        Assert.Contains("uncovered", line.Html);
+    }
+
+    // ─── TC-5: GetFileName — chrome-extension:// URL ─────────────────────────────
+
+    /// <summary>
+    /// chrome-extension:// スキームの URL は http/https/file 以外のため、
+    /// クエリ・フラグメントを含む URL 全体がそのまま返されることを確認する。
+    /// （現状の仕様として文書化。XSS 対策は呼び出し元の HtmlEncode で行う）
+    /// </summary>
+    [Fact]
+    public void GetFileName_ChromeExtensionUrlWithQueryAndFragment_ReturnsAsIs()
+    {
+        // chrome-extension:// は非対応スキームのため全文字列をそのまま返す
+        string input = "chrome-extension://abcdef1234567890/content.js?v=1#top";
+        string result = HtmlReportGenerator.GetFileName(input);
+        Assert.Equal(input, result);
+    }
+
+    // ─── TC-8: BuildIndexPage — 全行 Neutral のスクリプト ───────────────────────
+
+    /// <summary>
+    /// 全行が Neutral（カバレッジ対象外）のスクリプトのみの場合、
+    /// total=0 となり 0% が表示されることを確認する（ゼロ除算なし）。
+    /// </summary>
+    [Fact]
+    public void BuildIndexPage_AllNeutralLines_ShowsZeroPercent()
+    {
+        // 全行 Neutral → covered=0, partial=0, total=0
+        var rows = new List<(
+            IReadOnlyList<(string label, string pageUrl, string tabFilename)> tabs,
+            string url, int covered, int partial, int total, string mergedFilename)>
+        {
+            ([("画面1", "https://example.com/", "script-0.html")],
+             "https://example.com/app.js", 0, 0, 0, "script-0.html"),
+        };
+
+        string html = HtmlReportGenerator.BuildIndexPage(rows);
+
+        // 0.0% が表示されること（ゼロ除算例外が発生しないこと）
+        Assert.Contains("0.0%", html);
+    }
+
+    // ─── TC-9: GetFileName — 末尾スラッシュの有無で結果が同じになること ─────────
+
+    /// <summary>
+    /// "https://example.com/" と "https://example.com" は別コードパスを通るが、
+    /// どちらもホスト名 "example.com" を返すことを確認する。
+    /// </summary>
+    [Fact]
+    public void GetFileName_TrailingSlashVsNoSlash_SameResult()
+    {
+        string withSlash    = HtmlReportGenerator.GetFileName("https://example.com/");
+        string withoutSlash = HtmlReportGenerator.GetFileName("https://example.com");
+
+        Assert.Equal(withoutSlash, withSlash);
+        Assert.Equal("example.com", withSlash);
+    }
+
+    // ─── TC-10: GetFileName — IPv6 アドレスを含む URL ───────────────────────────
+
+    /// <summary>
+    /// IPv6 アドレス（[::1]）を含む URL から正しくファイル名部分を取得できることを確認する。
+    /// IPv6 アドレスの [] 内に '/' は含まれないため pathStart の検索が正しく動作する。
+    /// </summary>
+    [Fact]
+    public void GetFileName_IPv6Url_ReturnsFileName()
+    {
+        // http://[::1]/app.js → app.js
+        string result = HtmlReportGenerator.GetFileName("http://[::1]/app.js");
+        Assert.Equal("app.js", result);
+    }
+
+    // ─── TC-11: GetFileName — ユーザー情報（user:pass@）付き URL ───────────────
+
+    /// <summary>
+    /// user:pass@ 形式の認証情報を含む URL でも、
+    /// パス部分からファイル名が正しく取得できることを確認する。
+    /// （認証情報はパス検索に影響しない）
+    /// </summary>
+    [Fact]
+    public void GetFileName_UserInfoInUrl_ReturnsFileName()
+    {
+        // http://user:pass@host/file.js → file.js
+        string result = HtmlReportGenerator.GetFileName("http://user:pass@host/file.js");
+        Assert.Equal("file.js", result);
+    }
+
+    // ─── TC-12: GetFileName — ポート番号がユーザー情報の : と紛らわしい URL ──
+
+    /// <summary>
+    /// user:8080@ 形式（ポート番号のように見えるユーザー情報）を含む URL でも、
+    /// ファイル名部分が正しく取得できることを確認する。
+    /// pathStart の検索はスキーム直後の最初の / を探すだけなので影響を受けない。
+    /// </summary>
+    [Fact]
+    public void GetFileName_PortLikeUserInfoInUrl_ReturnsFileName()
+    {
+        // http://user:8080@host/file.js → ユーザー情報の : がポートに見えるが正しく処理される
+        string result = HtmlReportGenerator.GetFileName("http://user:8080@host/file.js");
+        Assert.Equal("file.js", result);
+    }
+
+    // ─── TC-13: BuildLines — ソース末尾が CRLF で終わる場合 ────────────────
+
+    /// <summary>
+    /// ソースが CRLF（\r\n）で終わる場合でも正しい行数が返ることを確認する。
+    /// source.EndsWith('\n') が true のため末尾の空行がカウントされないことを検証する。
+    /// </summary>
+    [Fact]
+    public void BuildLines_SourceEndingWithCRLF_CorrectLineCount()
+    {
+        // "abc\r\ndef\r\n": CRLF で終わる2行。行数は2であること
+        string source = "abc\r\ndef\r\n";
+        var map = new int[source.Length];
+        Array.Fill(map, 1); // 全文字実行済み
+        var lines = HtmlReportGenerator.BuildLines(source, map);
+        // 末尾の空行はカウントされないため 2 行
+        Assert.Equal(2, lines.Count);
+        // 各行に \r が含まれないこと
+        Assert.DoesNotContain("\r", lines[0].Html);
+        Assert.DoesNotContain("\r", lines[1].Html);
+    }
+
+    // -----------------------------------------------------------------------
+    // BuildLines — 1 文字ソースの境界値テスト
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// 1 文字だけのソース（"a"）でも正しく 1 行が返ることを確認する（境界値テスト）。
+    /// </summary>
+    [Fact]
+    public void BuildLines_SingleCharSource_ReturnsOneLine()
+    {
+        // source = "a"（改行なし）→ 1 行
+        var lines = HtmlReportGenerator.BuildLines("a", [1]);
+        Assert.Single(lines);
+        Assert.Equal(LineCoverageStatus.Covered, lines[0].Status);
+    }
+
+    /// <summary>
+    /// 改行のみのソース（"\n\n"）の行数が正しく 2 になることを確認する。
+    /// source.EndsWith('\n') が true のため末尾の空要素が除外される。
+    /// </summary>
+    [Fact]
+    public void BuildLines_OnlyNewlines_CorrectLineCount()
+    {
+        // "\n\n" は Split('\n') で ["", "", ""] → 末尾の空要素を除いて 2 行
+        var lines = HtmlReportGenerator.BuildLines("\n\n", [-1, -1]);
+        Assert.Equal(2, lines.Count);
+    }
+}
+

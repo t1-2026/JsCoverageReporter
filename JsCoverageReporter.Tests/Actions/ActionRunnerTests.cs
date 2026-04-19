@@ -2,6 +2,8 @@ using System.Net;
 using JsCoverageReporter.Actions;
 using JsCoverageReporter.Config;
 using Microsoft.Playwright;
+using NSubstitute;
+using NSubstitute.ExceptionExtensions;
 
 namespace JsCoverageReporter.Tests.Actions;
 
@@ -66,8 +68,8 @@ public class ActionRunnerTests
                     response.ContentLength64 = buffer.Length;
                     response.ContentType = "text/html; charset=utf-8";
                     
-                    await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
-                    response.OutputStream.Close();
+                    await using var stream = response.OutputStream;
+                    await stream.WriteAsync(buffer, 0, buffer.Length);
                 }
             }
             catch (HttpListenerException)
@@ -79,6 +81,8 @@ public class ActionRunnerTests
         public void Dispose()
         {
             _listener.Stop();
+            // Stop() で ListenLoop が HttpListenerException を受けて終了するのを待ってから Close する
+            _listenTask.Wait();
             _listener.Close();
         }
     }
@@ -398,5 +402,185 @@ public class ActionRunnerTests
         await ActionRunner.RunAsync(page, actions, timeoutMs: 5000, continueOnError: false);
 
         Assert.True(true);
+    }
+
+    /// <summary>
+    /// action.Type が null の場合、警告メッセージ中に "(null)" が含まれ例外が発生しないことを確認する。
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_ActionTypeIsNull_ShowsNullLabelAndDoesNotThrow()
+    {
+        using var playwright = await Playwright.CreateAsync();
+        await using var browser = await playwright.Chromium.LaunchAsync();
+        var page = await browser.NewPageAsync();
+
+        var actions = new List<ScenarioAction>
+        {
+            // Type が null → default ケースで "(null)" と表示されてスキップされるはず
+            new ScenarioAction { Type = null! }
+        };
+
+        // 例外が発生しないことを確認する
+        var ex = await Record.ExceptionAsync(() => ActionRunner.RunAsync(page, actions));
+        Assert.Null(ex);
+    }
+
+    /// <summary>
+    /// scroll アクションで x が負数の場合、例外なく実行されることを確認する。
+    /// window.scrollBy は負数を受け入れ左スクロールとして処理される。
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_ScrollAction_NegativeDeltaX_DoesNotThrow()
+    {
+        using var playwright = await Playwright.CreateAsync();
+        await using var browser = await playwright.Chromium.LaunchAsync();
+        var page = await browser.NewPageAsync();
+
+        var actions = new List<ScenarioAction>
+        {
+            // x が負数 → window.scrollBy(-100, 0) として実行される（例外なし）
+            new ScenarioAction { Type = "scroll", X = -100, Y = 0 }
+        };
+
+        var ex = await Record.ExceptionAsync(() => ActionRunner.RunAsync(page, actions));
+        Assert.Null(ex);
+    }
+
+    /// <summary>
+    /// scroll アクションで X・Y 両方が非ゼロの場合、例外なく実行されることを確認する。
+    /// X と Y が両方 null でない場合のコードパスを網羅する。
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_ScrollAction_BothXAndY_DoesNotThrow()
+    {
+        using var playwright = await Playwright.CreateAsync();
+        await using var browser = await playwright.Chromium.LaunchAsync();
+        var page = await browser.NewPageAsync();
+        var actions = new List<ScenarioAction>
+        {
+            // X も Y も非ゼロ → window.scrollBy(100, 200) として実行される
+            new ScenarioAction { Type = "scroll", X = 100, Y = 200 }
+        };
+        var ex = await Record.ExceptionAsync(() => ActionRunner.RunAsync(page, actions));
+        Assert.Null(ex);
+    }
+
+    /// <summary>
+    /// continueOnError = true のとき、OperationCanceledException は再スローされることを確認する。
+    /// BUG: 現在の実装は continueOnError=true のとき全例外を握りつぶすため、
+    ///      キャンセルシグナルも無視してしまう。
+    /// FIX: catch ブロックで OperationCanceledException を先に再スローする。
+    /// NSubstitute で IPage をモックして GotoAsync が OperationCanceledException を投げるようにする。
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_ContinueOnError_DoesNotSwallowOperationCanceledException()
+    {
+        // IPage のモックを作成して navigate アクションが OperationCanceledException を投げるようにする
+        var page = Substitute.For<IPage>();
+        page.GotoAsync(Arg.Any<string>(), Arg.Any<PageGotoOptions>())
+            .ThrowsAsync(new OperationCanceledException("テストキャンセル"));
+
+        var actions = new List<ScenarioAction>
+        {
+            new ScenarioAction { Type = "navigate", Url = "http://example.com" }
+        };
+
+        // continueOnError = true でも OperationCanceledException は再スローされるはず
+        var ex = await Record.ExceptionAsync(
+            () => ActionRunner.RunAsync(page, actions, continueOnError: true));
+
+        // OperationCanceledException が伝播されているか確認する
+        // 未修正の場合: ex は null（例外が握りつぶされる）
+        // 修正後:       ex は OperationCanceledException
+        Assert.IsAssignableFrom<OperationCanceledException>(ex);
+    }
+
+    /// <summary>
+    /// select アクションで value がどの option とも一致しない場合、
+    /// continueOnError = true のときは警告を出して次のアクションへ進むことを確認する。
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_SelectAction_InvalidValue_ContinueOnError_DoesNotThrow()
+    {
+        const string html = """
+            <!DOCTYPE html>
+            <html><body>
+            <select id="s"><option value="a">A</option></select>
+            </body></html>
+            """;
+
+        using var server = new TestServer(html);
+        using var playwright = await Playwright.CreateAsync();
+        await using var browser = await playwright.Chromium.LaunchAsync();
+        var page = await browser.NewPageAsync();
+        await page.GotoAsync(server.Url);
+
+        var actions = new List<ScenarioAction>
+        {
+            // "zzz" は存在しない value → Playwright が例外を投げるが continueOnError=true でスキップ
+            new ScenarioAction { Type = "select", Selector = "#s", Value = "zzz" }
+        };
+
+        var ex = await Record.ExceptionAsync(
+            () => ActionRunner.RunAsync(page, actions, timeoutMs: 3000, continueOnError: true));
+        Assert.Null(ex);
+    }
+
+    /// <summary>
+    /// scroll アクションで X を指定せず（null）Y のみを指定した場合、
+    /// Y 方向だけスクロールされ X デルタは 0 として扱われることを確認する。
+    /// action.X == null のとき deltaX = 0 になるコードパスの文書化テスト。
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_ScrollAction_NullXWithY_ScrollsVertically()
+    {
+        // スクロール可能な高さを持つページを用意する
+        const string html = """
+            <!DOCTYPE html>
+            <html><body style="height:2000px;"></body></html>
+            """;
+
+        using var server = new TestServer(html);
+        using var playwright = await Playwright.CreateAsync();
+        await using var browser = await playwright.Chromium.LaunchAsync();
+        var page = await browser.NewPageAsync();
+        await page.GotoAsync(server.Url);
+
+        var actions = new List<ScenarioAction>
+        {
+            // X は未指定（null → deltaX=0）、Y のみ指定 → 縦方向のみスクロール
+            new ScenarioAction { Type = "scroll", Y = 300 }
+        };
+
+        await ActionRunner.RunAsync(page, actions, timeoutMs: 5000, continueOnError: false);
+
+        // 縦スクロールが発生していること
+        var scrollY = await page.EvaluateAsync<double>("window.scrollY");
+        Assert.True(scrollY > 0, $"scrollY should be > 0, but was {scrollY}");
+        // 横スクロールは 0 のまま（X=null → deltaX=0）
+        var scrollX = await page.EvaluateAsync<double>("window.scrollX");
+        Assert.Equal(0, scrollX);
+    }
+
+    /// <summary>
+    /// wait に int.MaxValue ミリ秒を指定した場合、timeoutMs で正しくキャンセルされて
+    /// TimeoutException が発生することを確認する（Task.Delay(int.MaxValue) 自体は有効な呼び出し）。
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_WaitMaxInt_CancelledByTimeout_ThrowsTimeoutException()
+    {
+        // IPage モックを使用（wait アクションはページ操作を行わないため）
+        var page = Substitute.For<IPage>();
+        var actions = new List<ScenarioAction>
+        {
+            new ScenarioAction { Type = "wait", Milliseconds = int.MaxValue }
+        };
+
+        // timeoutMs = 200ms で早めにキャンセルする
+        var ex = await Record.ExceptionAsync(
+            () => ActionRunner.RunAsync(page, actions, timeoutMs: 200));
+
+        // wait のタイムアウトは TaskCanceledException を TimeoutException にラップして投げる
+        Assert.IsType<TimeoutException>(ex);
     }
 }
