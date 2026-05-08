@@ -241,21 +241,41 @@ public class HtmlOutputTests
     }
 
     /// <summary>
-    /// \r が行の途中にある異常データを渡した場合でも、
-    /// \r が HTML に出力されないことを確認する。
+    /// CR のみ（\r）の改行を含むソースを渡した場合、\r が行区切りとして機能して
+    /// 複数行に分割されることを確認する（旧 Mac 形式・インライン HTML スクリプト対応）。
     /// </summary>
     [Fact]
     public void BuildLines_CrInMiddleOfLine_NotInHtml()
     {
-        // "a\rb": 異常な位置の \r。それでも HTML に出力されてはいけない
+        // "a\rb": CR のみの改行。\r で2行に分割されて HTML には出力されないはず
+        // source インデックス: a=0, \r=1（行区切り）, b=2
         var lines = HtmlReportGenerator.BuildLines("a\rb", [1, 1, 1]);
-        // 1行だけ生成されているか確認する
-        Assert.Single(lines);
-        // \r が HTML に含まれていないか確認する
+        // \r で2行に分割されているか確認する
+        Assert.Equal(2, lines.Count);
+        // \r が各行の HTML に含まれていないか確認する
         Assert.DoesNotContain("\r", lines[0].Html);
-        // 実際の文字（a・b）は含まれているか確認する
+        Assert.DoesNotContain("\r", lines[1].Html);
+        // 実際の文字（a・b）は各行に含まれているか確認する
         Assert.Contains("a", lines[0].Html);
-        Assert.Contains("b", lines[0].Html);
+        Assert.Contains("b", lines[1].Html);
+    }
+
+    /// <summary>
+    /// CR のみ（\r）の改行を含む複数行ソースが正しく複数行に分割されることを確認する。
+    /// インライン JavaScript（HTML の &lt;script&gt; タグ内）で発生するケースへの対応。
+    /// </summary>
+    [Fact]
+    public void BuildLines_CrOnlyMultiLine_SplitsIntoMultipleLines()
+    {
+        // "a\rb\rc": CR のみ改行の3行。3行に分割されるはず
+        // source インデックス: a=0, \r=1, b=2, \r=3, c=4
+        var lines = HtmlReportGenerator.BuildLines("a\rb\rc", [1, -1, 1, -1, 1]);
+        // 3行に分割されているか確認する
+        Assert.Equal(3, lines.Count);
+        // 各行の文字が正しく含まれているか確認する
+        Assert.Contains("a", lines[0].Html);
+        Assert.Contains("b", lines[1].Html);
+        Assert.Contains("c", lines[2].Html);
     }
 
     // -----------------------------------------------------------------------
@@ -1760,7 +1780,7 @@ public class GenerateTests : IDisposable
     public void Generate_SingleScript_CreatesIndexAndScriptFile()
     {
         var script = MakeScript(0, "http://example.com/", "http://example.com/app.js",
-            "function foo() { return 1; }", covered: 1);
+            "function foo() {\n  return 1;\n}", covered: 1);
 
         var generator = new HtmlReportGenerator();
         generator.Generate([script], _outputDir);
@@ -1784,9 +1804,9 @@ public class GenerateTests : IDisposable
     {
         var scripts = new[]
         {
-            MakeScript(0, "http://example.com/", "http://example.com/app.js",   "var a = 1;", covered: 1),
-            MakeScript(0, "http://example.com/", "http://example.com/util.js",  "var b = 2;", covered: 0),
-            MakeScript(0, "http://example.com/", "http://example.com/extra.js", "var c = 3;", covered: 1),
+            MakeScript(0, "http://example.com/", "http://example.com/app.js",   "var a = 1;\nvar aa = 2;", covered: 1),
+            MakeScript(0, "http://example.com/", "http://example.com/util.js",  "var b = 1;\nvar bb = 2;", covered: 0),
+            MakeScript(0, "http://example.com/", "http://example.com/extra.js", "var c = 1;\nvar cc = 2;", covered: 1),
         };
 
         var generator = new HtmlReportGenerator();
@@ -1814,9 +1834,9 @@ public class GenerateTests : IDisposable
     {
         // 同じ URL "http://example.com/shared.js" が tab0 と tab1 から収集された
         var tab0 = MakeScript(0, "http://example.com/page1", "http://example.com/shared.js",
-            "function shared() { return 1; }", covered: 1);
+            "function shared() {\n  return 1;\n}", covered: 1);
         var tab1 = MakeScript(1, "http://example.com/page2", "http://example.com/shared.js",
-            "function shared() { return 1; }", covered: 0);
+            "function shared() {\n  return 1;\n}", covered: 0);
 
         var generator = new HtmlReportGenerator();
         generator.Generate([tab0, tab1], _outputDir);
@@ -1894,7 +1914,7 @@ public class GenerateTests : IDisposable
     [Fact]
     public void Generate_SamePageIndexTwiceInGroup_TwoTabFilesCreated()
     {
-        var source = "function foo() {}";
+        var source = "function foo() {\n  return 1;\n}";
         // 同一 tabIndex=0、異なる pageUrl → 同一グループ (url, source) に2件
         var script1 = MakeScript(0, "http://example.com/page1", "http://example.com/app.js", source);
         var script2 = MakeScript(0, "http://example.com/page2", "http://example.com/app.js", source);
@@ -1921,9 +1941,9 @@ public class GenerateTests : IDisposable
     {
         // 同じ URL だが Source が異なる（v1 と v2）
         var script1 = MakeScript(0, "http://example.com/", "http://example.com/app.js",
-            "var version = 1;", covered: 1);
+            "var version = 1;\nvar extra = 1;", covered: 1);
         var script2 = MakeScript(0, "http://example.com/", "http://example.com/app.js",
-            "var version = 2;", covered: 1);
+            "var version = 2;\nvar extra = 2;", covered: 1);
 
         var generator = new HtmlReportGenerator();
         generator.Generate([script1, script2], _outputDir);
@@ -2147,6 +2167,32 @@ public class GenerateTests : IDisposable
         Assert.Equal(LineCoverageStatus.Covered, lines[0].Status);
         Assert.Contains("b", lines[0].Html);
     }
+
+    /// <summary>
+    /// Generate で1行スクリプト（スキップ対象）の後に複数行スクリプトが続く場合、
+    /// スキップされたスクリプトで番号がずれず、次のスクリプトが script-0.html になることを確認する。
+    /// 修正前は1行スクリプトのスキップ時に i++ していたため script-1.html が生成されていた。
+    /// </summary>
+    [Fact]
+    public void Generate_SingleLineScriptSkipped_NextScriptStartsAtIndex0()
+    {
+        // 1行スクリプト（スキップ対象）と複数行スクリプトの2件を渡す
+        var singleLine = MakeScript(0, "http://example.com/", "http://example.com/inline.js",
+            "var x = 1;", covered: 0); // 改行なし → 1行 → スキップされる
+        var multiLine  = MakeScript(0, "http://example.com/", "http://example.com/app.js",
+            "var a = 1;\nvar b = 2;", covered: 1); // 2行 → スキップされない
+
+        var generator = new HtmlReportGenerator();
+        generator.Generate([singleLine, multiLine], _outputDir);
+
+        string scriptsDir = Path.Combine(_outputDir, "scripts");
+        // 複数行スクリプトは script-0.html（番号ずれなし）として生成されること
+        Assert.True(File.Exists(Path.Combine(scriptsDir, "script-0.html")),
+            "script-0.html が生成されていない（1行スキップで番号がずれていた可能性）");
+        // script-1.html は生成されないこと（スキップで余分な番号を消費していた場合に生成される）
+        Assert.False(File.Exists(Path.Combine(scriptsDir, "script-1.html")),
+            "script-1.html が不正に生成されている（番号がずれていた）");
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -2222,8 +2268,8 @@ public class GenerateReviewTests : IDisposable
     {
         // BOM + "var x;" = 7文字（BOM=1 + jsContent=6）
         // V8 は BOM を文字としてカウントしないため、range(0, 6, 1) は jsContent の全6文字を covered にする
-        const string jsContent = "var x;";
-        string source = "\uFEFF" + jsContent; // 7文字（index 0=BOM, 1='v', ..., 6=';'）
+        const string jsContent = "var x;\nvar y;";
+        string source = "\uFEFF" + jsContent; // BOM + jsContent
 
         // V8 スタイルのカバレッジ: BOM を除いた 0〜5 (全jsContent) を covered
         var ranges = new List<JsCoverageReporter.Coverage.CoverageRange>
@@ -2260,10 +2306,10 @@ public class GenerateReviewTests : IDisposable
         const string xssPageUrl = "http://evil.com/</script><svg onload=alert(1)>";
         var ranges = new List<JsCoverageReporter.Coverage.CoverageRange>
         {
-            new(0, 10, 1),
+            new(0, 21, 1),
         };
         var script = MakeScriptWithRanges(
-            0, xssPageUrl, "http://example.com/app.js", "var x = 1;", ranges);
+            0, xssPageUrl, "http://example.com/app.js", "var x = 1;\nvar y = 2;", ranges);
 
         var generator = new HtmlReportGenerator();
         generator.Generate([script], _outputDir);
@@ -2588,6 +2634,19 @@ public class GetFileNameEdgeCaseTests
         // "\n\n" は Split('\n') で ["", "", ""] → 末尾の空要素を除いて 2 行
         var lines = HtmlReportGenerator.BuildLines("\n\n", [-1, -1]);
         Assert.Equal(2, lines.Count);
+    }
+
+    /// <summary>
+    /// CR のみ（\r）1文字のソースを渡した場合、1行の Neutral 行が返ることを確認する。
+    /// source.EndsWith('\r') が true のため末尾の空要素が除外されて行数は 1 になる。
+    /// </summary>
+    [Fact]
+    public void BuildLines_OnlyCr_ReturnsOneNeutralLine()
+    {
+        // "\r" のみ — CR で行分割され末尾の空要素を除いて 1 行（空行 = Neutral）
+        var lines = HtmlReportGenerator.BuildLines("\r", [-1]);
+        Assert.Single(lines);
+        Assert.Equal(LineCoverageStatus.Neutral, lines[0].Status);
     }
 }
 

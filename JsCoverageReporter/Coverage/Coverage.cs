@@ -29,9 +29,10 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
     private EventHandler<IPage>? _pageEventHandler = null;
 
     // スクリプトフィルター（StartAsync で設定。中間スナップショット時にも使う）
-    private IReadOnlyList<string> _scriptFilters  = [];
+    // volatile: バックグラウンドタスクが古いキャッシュを読まないようにメモリ可視性を保証する
+    private volatile IReadOnlyList<string> _scriptFilters  = [];
     // スクリプト除外フィルター（StartAsync で設定。中間スナップショット時にも使う）
-    private IReadOnlyList<string> _scriptExcludes = [];
+    private volatile IReadOnlyList<string> _scriptExcludes = [];
 
     // ページごとの全収集済みスクリプトカバレッジデータ（scriptId -> ScriptCoverage）
     // ナビゲーションキャンセルの際に生存しているスクリプトの実行数を更新するために利用する
@@ -40,6 +41,8 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
     private readonly List<Task>                                 _snapTasks           = [];
     // ページごとのリクエストイベントハンドラー（DisposeAsync / StopAsync で解除する）
     private readonly Dictionary<IPage, EventHandler<IRequest>> _requestHandlers     = [];
+    // ページごとのページ閉鎖イベントハンドラー（StopAsync 前にページが閉じられた場合でも収集できるようにする）
+    private readonly Dictionary<IPage, EventHandler<IPage>>    _closeHandlers       = [];
     // ページごとの最終スナップショット時刻（スロットリング用。iframe ナビゲーションの過剰スナップショットを防ぐ）
     private readonly Dictionary<IPage, long>                   _lastSnapshotTick    = [];
     // スナップショットのスロットリング間隔（ミリ秒）（この間隔内の連続スナップショットはスキップする）
@@ -170,6 +173,31 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
         lock (_lock)
         {
             _requestHandlers[targetPage] = reqHandler;
+        }
+
+        // ページが閉じられたときにスナップショットを撮るハンドラーを定義する
+        // （StopAsync より先にページが閉じられた場合でも、実行済みスクリプトを取得できるようにする）
+        EventHandler<IPage> closeHandler = (_, _) =>
+        {
+            // ページが閉じられる直前の URL を取得する（取得できない場合は空文字列にする）
+            string currentUrl;
+            try { currentUrl = targetPage.Url; }
+            catch (Exception) { currentUrl = ""; }
+
+            // ページ閉鎖直後は CDP コマンドが失敗する可能性があるが、
+            // TakeIntermediateSnapshotAsync が内部で try-catch しているため安全
+            var snapTask = TakeIntermediateSnapshotAsync(targetPage, currentUrl);
+            lock (_lock)
+            {
+                // タスク開始後に _stopped になった場合は追加しない（孤立タスクは CDP try-catch で保護済み）
+                if (_stopped) { return; }
+                _snapTasks.Add(snapTask);
+            }
+        };
+        targetPage.Close += closeHandler;
+        lock (_lock)
+        {
+            _closeHandlers[targetPage] = closeHandler;
         }
     }
 
@@ -442,6 +470,21 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
             p.Request -= handler;
         }
 
+        // ページ閉鎖イベントハンドラをすべて解除する（StopAsync 後に Close イベントが発火しないようにする）
+        List<(IPage p, EventHandler<IPage> handler)> closePairs = [];
+        lock (_lock)
+        {
+            foreach (var kv in _closeHandlers)
+            {
+                closePairs.Add((kv.Key, kv.Value));
+            }
+            _closeHandlers.Clear();
+        }
+        foreach (var (p, handler) in closePairs)
+        {
+            p.Close -= handler;
+        }
+
         // 追跡ページがない場合は空リストを返す（setupTasks 待機後は trackedPages が安定している）
         int trackedCount;
         lock (_lock)
@@ -619,6 +662,21 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
         foreach (var (p, handler) in reqPairs)
         {
             p.Request -= handler;
+        }
+
+        // StopAsync を経由せずに Dispose された場合もページ閉鎖ハンドラーを解除する
+        List<(IPage p, EventHandler<IPage> handler)> closePairs = [];
+        lock (_lock)
+        {
+            foreach (var kv in _closeHandlers)
+            {
+                closePairs.Add((kv.Key, kv.Value));
+            }
+            _closeHandlers.Clear();
+        }
+        foreach (var (p, handler) in closePairs)
+        {
+            p.Close -= handler;
         }
 
         // インフライトのスナップショットタスクが完了するまでループ待機してから CDP セッションを解放する

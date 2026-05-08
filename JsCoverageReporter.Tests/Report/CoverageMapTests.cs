@@ -5889,4 +5889,81 @@ public class EdgeCaseParserTests
         Assert.Equal(0, map[second]);
         Assert.Equal(0, map[third]);
     }
+
+    /// <summary>
+    /// ソースの先頭が => で始まる（ファイル先頭アロー関数）場合でも
+    /// SkipWhitespaceAndCommentsBackward が pos=-1 で安全に動作することを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_ArrowFunctionAtFileStart_MarkedAsUncovered()
+    {
+        // "=> {}" — ファイル先頭が => のアロー関数。arrowStart=0 なので逆走査に pos=-1 が渡される
+        const string source = "=> {}";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        Assert.Equal(0, map[0]); // '=' of =>
+        Assert.Equal(0, map[3]); // '{'
+        Assert.Equal(0, map[4]); // '}'
+    }
+
+    /// <summary>
+    /// async を変数名として使ったアロー関数 const async = () => {} で、
+    /// async キーワードとして誤マークされず、アロー部分のみ 0（未実行）になることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_AsyncUsedAsVariableName_BodyMarkedArrowOnly()
+    {
+        // const async = () => {} の場合、async は変数名であり async キーワードではない。
+        // TryMarkArrowFunction の逆走査で () の前が '=' (代入演算子) のため async キーワード未検出。
+        const string source = "const async = () => {}";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        int arrowIdx = source.IndexOf("=>");
+        Assert.Equal(0, map[arrowIdx]);                         // '=' of => は 0
+        Assert.Equal(0, map[source.IndexOf('{', arrowIdx)]);    // { は 0
+        int asyncIdx = source.IndexOf("async");
+        Assert.Equal(-1, map[asyncIdx]);                        // 変数名 async は -1（誤マークなし）
+    }
+
+    /// <summary>
+    /// MarkUncalledFunctionBodiesAsUncovered に source より短い map を渡した場合に
+    /// IndexOutOfRangeException が発生しないことを確認する（ラテントバグの回帰テスト）。
+    /// </summary>
+    [Fact]
+    public void MarkUncalledFunctionBodies_MapShorterThanSource_NoIndexOutOfRange()
+    {
+        // "f(){}" — 5文字のソースに対して長さ 4 の map（末尾の } が範囲外）を渡す
+        // 修正前は TryMarkMethodShorthand の書き込みループが map 末尾を超えてクラッシュしていた
+        const string source = "f(){}";
+        var map = new int[4]; // source.Length より 1 短い
+        Array.Fill(map, -1);
+        var ex = Record.Exception(() => CoverageParser.MarkUncalledFunctionBodiesAsUncovered(source, map));
+        Assert.Null(ex); // 例外が発生しないこと
+    }
+
+    /// <summary>
+    /// ソースが "function" の 8 文字だけ（本体なし）の場合、すべての文字が -1（対象外）のままであることを確認する。
+    /// funcStart + 8 >= end の境界値で TryMarkFunctionKeyword が早期リターンする動作の回帰テスト。
+    /// </summary>
+    [Fact]
+    public void BuildMap_SourceIsJustFunctionKeyword_AllNeutral()
+    {
+        // "function" のみ（本体なし）— 8文字ちょうど。TryMarkFunctionKeyword は
+        // j = funcStart + 8 = end になるため '(' も '{' も見つからず全文字 -1 のまま
+        var map = CoverageParser.BuildCoverageMap("function", []);
+        Assert.All(map, v => Assert.Equal(-1, v));
+    }
+
+    /// <summary>
+    /// 関数本体内に identifier / 2 のような除算がある場合に IsRegexStart が '/' を除算と正しく判定し、
+    /// 関数本体全体が 0（未実行）としてマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_DivisionAfterIdentifierInFunctionBody_FunctionDetected()
+    {
+        // "function foo() { return x / 2; }" — IsRegexStart が x の後の '/' を
+        // 正規表現開始と誤判定すると SkipRegexLiteral が '2; }' を食い、'}' を見失う
+        const string source = "function foo() { return x / 2; }";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        Assert.Equal(0, map[0]);                 // 'f' of function は 0
+        Assert.Equal(0, map[source.Length - 1]); // 末尾の '}' は 0
+    }
 }

@@ -124,8 +124,10 @@ internal static class CoverageParser
     /// <param name="map">BuildCoverageMap で作成したカバレッジマップ（内容を書き換える）</param>
     internal static void MarkUncalledFunctionBodiesAsUncovered(string source, int[] map)
     {
-        // ソースコード全体をスキャンして未実行関数本体をマークする
-        ScanRange(source, map, 0, source.Length);
+        if (map == null || map.Length == 0) { return; }
+        // map が source より短い場合は map の範囲内だけをスキャンする（範囲外読み取りを防ぐ）
+        int scanEnd = Math.Min(source.Length, map.Length);
+        ScanRange(source, map, 0, scanEnd);
     }
 
     /// <summary>
@@ -202,6 +204,7 @@ internal static class CoverageParser
                 i += 2;
                 while (i + 1 < end && !(source[i] == '*' && source[i + 1] == '/')) { i++; }
                 i += 2; // */ の2文字をスキップする
+                if (i > end) { i = end; } // サブレンジ境界をまたいだ場合はクランプする
                 continue;
             }
 
@@ -280,8 +283,9 @@ internal static class CoverageParser
             return arrowStart + 2; // 対応する } が見つからない場合はスキップ
         }
 
-        // => から } まで未実行（0）にマークする
-        for (int m = arrowStart; m < braceEnd; m++)
+        // => から } まで未実行（0）にマークする（map の長さを超えないようにクランプする）
+        int arrowWriteEnd = Math.Min(braceEnd, map.Length);
+        for (int m = arrowStart; m < arrowWriteEnd; m++)
         {
             if (map[m] == -1) { map[m] = 0; }
         }
@@ -333,6 +337,8 @@ internal static class CoverageParser
                     while (backScan >= 0)
                     {
                         char rc = source[backScan];
+                        // JS の正規表現リテラルは改行をまたがないため、改行が見つかったら逆走査を中断する
+                        if (rc == '\n' || rc == '\r') { break; }
                         if (rc == ']')
                         {
                             // \] はエスケープされた ] のため文字クラスの終端ではない
@@ -457,8 +463,9 @@ internal static class CoverageParser
             int funcEnd = FindMatchingBrace(source, j);
             if (funcEnd > j) // j は '{' の位置なので funcEnd > j で有効な対応 '}' を確認する
             {
-                // 関数本体内でカバレッジ対象外(-1)の部分を未実行(0)としてマークする
-                for (int k = funcStart; k < funcEnd; k++)
+                // 関数本体内でカバレッジ対象外(-1)の部分を未実行(0)としてマークする（map の長さを超えないようにクランプする）
+                int funcWriteEnd = Math.Min(funcEnd, map.Length);
+                for (int k = funcStart; k < funcWriteEnd; k++)
                 {
                     if (map[k] == -1) { map[k] = 0; }
                 }
@@ -552,8 +559,9 @@ internal static class CoverageParser
             if (staticPrevOk) { markStart = staticScan - 5; } // static の 's' の位置からマーク
         }
 
-        // markStart（static先頭 または async先頭 または * または bracketStart）から } までを未実行（0）にマークする
-        for (int m = markStart; m < braceEnd; m++) { if (map[m] == -1) { map[m] = 0; } }
+        // markStart（static先頭 または async先頭 または * または bracketStart）から } までを未実行（0）にマークする（map の長さを超えないようにクランプする）
+        int computedWriteEnd = Math.Min(braceEnd, map.Length);
+        for (int m = markStart; m < computedWriteEnd; m++) { if (map[m] == -1) { map[m] = 0; } }
         return braceEnd;
     }
 
@@ -597,8 +605,8 @@ internal static class CoverageParser
 
         if (isExcluded)
         {
-            // 除外対象なので何もしない（識別子の次の位置を返して ScanRange を1文字進める）
-            return identStart + 1;
+            // 除外対象なので何もしない（identEnd を返してキーワード全体をスキップする）
+            return identEnd;
         }
 
         // identifier の後の空白・コメントをスキップする（function と同様に SkipWhitespaceAndCommentsForward を使う）
@@ -721,8 +729,9 @@ internal static class CoverageParser
             if (staticPrevOk) { markStart = staticScan - 5; }
         }
 
-        // markStart（static先頭 または async先頭 または * または identStart）から } までを未実行（0）にマークする
-        for (int m = markStart; m < braceEnd; m++)
+        // markStart（static先頭 または async先頭 または * または identStart）から } までを未実行（0）にマークする（map の長さを超えないようにクランプする）
+        int shorthandWriteEnd = Math.Min(braceEnd, map.Length);
+        for (int m = markStart; m < shorthandWriteEnd; m++)
         {
             if (map[m] == -1)
             {
@@ -784,7 +793,8 @@ internal static class CoverageParser
             // それ以外の識別子・変数名の後は除算演算子
             return false;
         }
-        // 演算子・区切り文字の後は正規表現
+        // 演算子・区切り文字・文字列終端クォートの後は正規表現
+        // 注: SkipWhitespaceAndCommentsBackward は文字列内容を読み飛ばさないため "str"/2 のような除算を正規表現と誤判定する可能性があるが、実用上は許容範囲
         return true;
     }
 
@@ -1135,7 +1145,7 @@ internal static class CoverageParser
             {
                 merged[i] = 1;
             }
-            // いずれかが未実行（0）なら未実行にする（対象外より優先）
+            // 両方が実行済みでなく、少なくとも一方が未実行（0）なら未実行とする（対象外 -1 より優先）
             else if (v1 == 0 || v2 == 0)
             {
                 merged[i] = 0;
@@ -1346,6 +1356,38 @@ internal class HtmlReportGenerator
     /// <param name="source">スクリプトのソースコード全文</param>
     /// <param name="map">BuildCoverageMap が返したカバレッジ値の配列</param>
     /// <returns>行ごとの LineData オブジェクトのリスト</returns>
+    /// <summary>
+    /// ソースコードを改行文字（\n、\r\n、\r のみ）で行に分割する。
+    /// \r\n の場合は \r を行末に含め（Split('\n') と同じ）、\r のみの場合は \r を区切り文字として除く。
+    /// オフセット計算の整合性は保たれる（各行の区切り文字が1文字のため +1 が正しく適用される）。
+    /// </summary>
+    private static string[] SplitOnNewlines(string source)
+    {
+        var lines = new List<string>();
+        int lineStart = 0;
+        int i = 0;
+        while (i < source.Length)
+        {
+            char c = source[i];
+            if (c == '\n')
+            {
+                // LF: Split('\n') と同じ動作（\r\n なら \r が rawLine に残る）
+                lines.Add(source.Substring(lineStart, i - lineStart));
+                lineStart = i + 1;
+            }
+            else if (c == '\r' && (i + 1 >= source.Length || source[i + 1] != '\n'))
+            {
+                // CR のみ（後ろに \n がない場合）: \r を区切り文字として行分割する
+                lines.Add(source.Substring(lineStart, i - lineStart));
+                lineStart = i + 1;
+            }
+            i++;
+        }
+        // 最後の行（末尾に改行がない場合も含む）
+        lines.Add(source.Substring(lineStart));
+        return lines.ToArray();
+    }
+
     internal static List<LineData> BuildLines(string source, int[] map)
     {
         // 行データを格納する結果リスト
@@ -1354,12 +1396,12 @@ internal class HtmlReportGenerator
         // 空文字列・null ソースは空リストを返す（CDP データ取得失敗などで null になった場合の防衛）
         if (string.IsNullOrEmpty(source)) { return result; }
 
-        // ソースコードを改行文字 \n で行に分割する
-        var rawLines = source.Split('\n');
+        // ソースコードを改行文字で行に分割する（\n、\r\n、\r のみ に対応）
+        var rawLines = SplitOnNewlines(source);
 
-        // ソースが \n で終わる場合、末尾に必ず空の要素が生まれるので除く
+        // ソースが改行文字で終わる場合、末尾に必ず空の要素が生まれるので除く
         int lineCount = rawLines.Length;
-        if (lineCount > 0 && source.EndsWith('\n'))
+        if (lineCount > 0 && (source.EndsWith('\n') || source.EndsWith('\r')))
         {
             // 末尾の空要素を処理対象から除外するためカウントを1減らす
             lineCount--;
@@ -1598,6 +1640,11 @@ internal class HtmlReportGenerator
 
             // OR 合成したマップから行データを生成する（BOM 除去済みのソースを使う）
             var mergedLines = BuildLines(canonicalSource, mergedMap);
+
+            // 1行しかないスクリプトはレポート対象外としてスキップする
+            // （インライン eval や最小化された1行スクリプトなど、有意な情報が得られないため）
+            // i はインクリメントしない → スキップしてもファイル番号に欠番が生じない
+            if (mergedLines.Count <= 1) { continue; }
 
             // 合成ページのファイル名（全タブの OR 合成カバレッジを表示する）
             var mergedFilename = $"script-{i}.html";
