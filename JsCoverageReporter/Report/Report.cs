@@ -624,10 +624,10 @@ internal static class CoverageParser
         // identifier の後の空白・コメントをスキップする（function と同様に SkipWhitespaceAndCommentsForward を使う）
         int afterIdent = SkipWhitespaceAndCommentsForward(source, identEnd, len);
 
-        // 次の文字が ( でなければメソッド短縮構文でない
+        // 次の文字が ( でなければメソッド短縮構文でない（識別子全体をスキップして identEnd を返す）
         if (afterIdent >= len || source[afterIdent] != '(')
         {
-            return identStart + 1;
+            return identEnd;
         }
 
         // SkipBalancedParens でパラメータ括弧をスキップする
@@ -1918,6 +1918,16 @@ internal class HtmlReportGenerator
             <tr><th>ページ URL</th><th>スクリプト</th><th class="num">実行済み</th><th class="num">部分実行</th><th class="num">対象行数</th><th class="num">カバレッジ率<br><small style="font-weight:normal;font-size:11px">※部分実行は0.5行換算</small></th></tr>
             """);
 
+        // 重複ファイル名の連番管理: 同名ファイル名が複数行に現れる場合に "(2)" "(3)" を付ける
+        var filenameCount = new Dictionary<string, int>();
+        foreach (var (_, u, _, _, _, _) in rows)
+        {
+            string fn = GetFileName(u);
+            if (!filenameCount.ContainsKey(fn)) { filenameCount[fn] = 0; }
+            filenameCount[fn]++;
+        }
+        var filenameSeen = new Dictionary<string, int>();
+
         // スクリプトごとのデータ行を出力する
         foreach (var (tabs, url, covered, partial, total, mergedFilename) in rows)
         {
@@ -1982,9 +1992,24 @@ internal class HtmlReportGenerator
                 pageUrlCell = sbDetails.ToString();
             }
 
+            // 重複ファイル名の場合は "(N)" サフィックスを付けてユーザーが区別できるようにする
+            // 1件目はサフィックスなし、2件目以降は "(2)" "(3)" と連番を付ける
+            string baseName = GetFileName(url);
+            if (!filenameSeen.ContainsKey(baseName)) { filenameSeen[baseName] = 0; }
+            filenameSeen[baseName]++;
+            string displayName;
+            if (filenameSeen[baseName] > 1)
+            {
+                displayName = $"{baseName} ({filenameSeen[baseName]})";
+            }
+            else
+            {
+                displayName = baseName;
+            }
+
             // ページ URL・スクリプトファイル名（合成ページへのリンク付き）・各行数・カバレッジ率を出力する
             sb.AppendLine($"<tr><td>{pageUrlCell}</td>" +
-                          $"<td><a href=\"scripts/{mergedFilename}\">{HtmlEncode(GetFileName(url))}</a></td>" +
+                          $"<td><a href=\"scripts/{mergedFilename}\">{HtmlEncode(displayName)}</a></td>" +
                           $"<td class=\"num\">{covered}</td><td class=\"num\">{partial}</td>" +
                           $"<td class=\"num\">{total}</td><td class=\"num\">{pct:F1}%</td></tr>");
         }

@@ -2754,5 +2754,34 @@ public class GetFileNameEdgeCaseTests
         string result = HtmlReportGenerator.GetFileName("https://user:pass@example.com/scripts/app.js");
         Assert.Equal("app.js", result);
     }
+
+    /// <summary>
+    /// I-1 修正: 同じファイル名を持つスクリプトが複数ある場合（異なるホストで同名ファイル）、
+    /// BuildIndexPage のリンクテキストに連番サフィックスが付いて区別できることを確認する。
+    /// 修正前は両方とも "app.js" と表示されユーザーが区別できなかった。
+    /// </summary>
+    [Fact]
+    public void BuildIndexPage_DuplicateFilename_AppendsCounter()
+    {
+        // 同じファイル名 "app.js" を持つが異なるホストの URL を持つ 2 件のスクリプト
+        var tabs = new List<(string label, string pageUrl, string tabFilename)>
+        {
+            ("画面1", "http://example.com/", "script-0.html"),
+        };
+        var rows = new List<(
+            IReadOnlyList<(string label, string pageUrl, string tabFilename)> tabs,
+            string url, int covered, int partial, int total, string mergedFilename)>
+        {
+            (tabs, "http://host1.com/app.js", 5, 0, 10, "script-0.html"),
+            (tabs, "http://host2.com/app.js", 3, 0, 10, "script-1.html"),
+        };
+
+        string html = HtmlReportGenerator.BuildIndexPage(rows);
+
+        // 1 件目はサフィックスなし
+        Assert.Contains(">app.js<", html);
+        // 2 件目は "(2)" サフィックス付き
+        Assert.Contains(">app.js (2)<", html);
+    }
 }
 

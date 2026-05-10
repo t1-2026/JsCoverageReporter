@@ -6469,3 +6469,250 @@ public class EdgeCaseParserTests
         Assert.Equal(0, map[bodyBrace]);
     }
 }
+
+/// <summary>
+/// コードレビューで指摘された追加テストケース群。
+/// 既存動作の文書化と境界値の網羅を目的とする。
+/// </summary>
+public class ReviewMissingCoverageTests
+{
+    // -----------------------------------------------------------------------
+    // アロー関数パラメータの正規表現デフォルト値（C-4 検証）
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// アロー関数のデフォルト値に `)` を含む正規表現が使われても
+    /// 逆走査が正しく正規表現をスキップして本体 { を 0 にマークすることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_ArrowParamRegexContainingParen_BodyMarked()
+    {
+        // const f = (x = /a)b/) => { return x; }
+        // 逆走査で /a)b/ 内の ) を誤ってパラメータ末尾と判定しないことを確認する
+        const string source = "const f = (x = /a)b/) => { return x; }";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        int arrowIdx = source.IndexOf("=>");
+        int bodyBrace = source.IndexOf('{', arrowIdx);
+        // 本体 { が 0（未実行）にマークされること
+        Assert.Equal(0, map[bodyBrace]);
+    }
+
+    /// <summary>
+    /// async アロー関数のデフォルト値に `)` を含む正規表現が使われても
+    /// async キーワードが 0 にマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_AsyncArrowParamRegexContainingParen_AsyncMarked()
+    {
+        // async (x = /a)b/) => { return x; }
+        const string source = "async (x = /a)b/) => { return x; }";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        int asyncIdx = source.IndexOf("async");
+        // async キーワードが 0（未実行）にマークされること
+        Assert.Equal(0, map[asyncIdx]);
+    }
+
+    // -----------------------------------------------------------------------
+    // ジェネレーター関数式（オブジェクト値）
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// オブジェクトプロパティの値としてジェネレーター関数式を書いた場合に
+    /// 本体 { が 0 にマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_GeneratorFunctionExpressionAsObjectValue_BodyMarked()
+    {
+        // { gen: function*() { yield 1; } }
+        const string source = "var o = { gen: function*() { yield 1; } }";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        int funcIdx = source.IndexOf("function*");
+        int bodyBrace = source.IndexOf('{', funcIdx + "function*()".Length);
+        // 本体 { が 0（未実行）にマークされること
+        Assert.Equal(0, map[bodyBrace]);
+    }
+
+    // -----------------------------------------------------------------------
+    // クラスフィールドのアロー関数
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// クラスフィールドとして定義されたアロー関数の本体 { が 0 にマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_ClassFieldArrowFunction_BodyMarked()
+    {
+        // class Foo { bar = () => { return 1; } }
+        const string source = "class Foo { bar = () => { return 1; } }";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        int arrowIdx = source.IndexOf("=>");
+        int bodyBrace = source.IndexOf('{', arrowIdx);
+        // アロー関数本体 { が 0（未実行）にマークされること
+        Assert.Equal(0, map[bodyBrace]);
+    }
+
+    // -----------------------------------------------------------------------
+    // computed key にテンプレートリテラルを使ったメソッド短縮構文
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// テンプレートリテラルを computed key に使ったメソッド短縮構文の本体 { が
+    /// 0 にマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_ComputedKeyWithTemplateLiteral_BodyMarked()
+    {
+        // var o = { [`key${1}`]() { return 1; } }
+        const string source = "var o = { [`key${1}`]() { return 1; } }";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        // メソッド本体の { を特定する（`]()` の後）
+        int parenClose = source.IndexOf("()");
+        int bodyBrace = source.IndexOf('{', parenClose + 2);
+        // 本体 { が 0（未実行）にマークされること
+        Assert.Equal(0, map[bodyBrace]);
+    }
+
+    // -----------------------------------------------------------------------
+    // デストラクチャリングデフォルト値の中のアロー関数
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// 関数パラメータのデストラクチャリングデフォルト値にアロー関数を書いた場合に
+    /// 外側の function と内側のアロー関数両方の本体 { が 0 にマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_FunctionWithDestructuringDefaultArrow_BothMarked()
+    {
+        // function foo({ x = () => {} } = {}) {}
+        const string source = "function foo({ x = () => {} } = {}) {}";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        int arrowIdx = source.IndexOf("=>");
+        int innerBrace = source.IndexOf('{', arrowIdx);
+        int outerBrace = source.LastIndexOf('{');
+        // アロー関数本体 { が 0（未実行）にマークされること
+        Assert.Equal(0, map[innerBrace]);
+        // 外側の function 本体 { が 0（未実行）にマークされること
+        Assert.Equal(0, map[outerBrace]);
+    }
+
+    // -----------------------------------------------------------------------
+    // export default class のメソッド
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// export default class のメソッドが 0 にマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_ExportDefaultClassMethod_MethodMarked()
+    {
+        // export default class { greet() { return 1; } }
+        const string source = "export default class { greet() { return 1; } }";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        int greetIdx = source.IndexOf("greet");
+        int bodyBrace = source.IndexOf('{', greetIdx);
+        // greet() の本体 { が 0（未実行）にマークされること
+        Assert.Equal(0, map[bodyBrace]);
+    }
+
+    // -----------------------------------------------------------------------
+    // case ブロック内の関数宣言
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// switch の case ブロック内に書かれた関数宣言が 0 にマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_FunctionInCaseBlock_FunctionMarked()
+    {
+        // switch(x) { case 1: function foo() { return 1; } break; }
+        const string source = "switch(x) { case 1: function foo() { return 1; } break; }";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        int funcIdx = source.IndexOf("function foo");
+        int bodyBrace = source.IndexOf('{', funcIdx);
+        // function foo の本体 { が 0（未実行）にマークされること
+        Assert.Equal(0, map[bodyBrace]);
+    }
+
+    // -----------------------------------------------------------------------
+    // 行コメント直後（改行なし）の関数宣言
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// 行コメントの直後に改行がある場合でも function が 0 にマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_FunctionPrecededByLineComment_FunctionMarked()
+    {
+        // // comment\nfunction foo() { return 1; }
+        const string source = "// comment\nfunction foo() { return 1; }";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        int funcIdx = source.IndexOf("function foo");
+        int bodyBrace = source.IndexOf('{', funcIdx);
+        // function foo の本体 { が 0（未実行）にマークされること
+        Assert.Equal(0, map[bodyBrace]);
+    }
+
+    // -----------------------------------------------------------------------
+    // async という名前のメソッドと async function の共存
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// async という名前のメソッドと本物の async function が共存する場合に
+    /// 両方の本体 { が 0 にマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_AsyncMethodNameAndAsyncFunction_BothMarked()
+    {
+        // var o = { async() { return 1; }, realAsync: async function() { return 2; } }
+        const string source = "var o = { async() { return 1; }, realAsync: async function() { return 2; } }";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        // async() メソッドの本体 {
+        int asyncMethodIdx = source.IndexOf("async()");
+        int firstBrace = source.IndexOf('{', asyncMethodIdx);
+        // async function の本体 {
+        int asyncFuncIdx = source.IndexOf("async function");
+        int secondBrace = source.IndexOf('{', asyncFuncIdx);
+        // 両方の本体 { が 0（未実行）にマークされること
+        Assert.Equal(0, map[firstBrace]);
+        Assert.Equal(0, map[secondBrace]);
+    }
+
+    // -----------------------------------------------------------------------
+    // // を含む正規表現の後の関数宣言（意地悪テスト）
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// ダブルスラッシュを含む正規表現の後に function を書いても
+    /// 正規表現が行コメントと誤判定されず function が 0 にマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_RegexContainingDoubleSlash_FunctionAfterNotMissed()
+    {
+        // var re = /\/\//; function foo() { return 1; }
+        const string source = "var re = /\\//; function foo() { return 1; }";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        int funcIdx = source.IndexOf("function foo");
+        int bodyBrace = source.IndexOf('{', funcIdx);
+        // function foo の本体 { が 0（未実行）にマークされること
+        Assert.Equal(0, map[bodyBrace]);
+    }
+
+    // -----------------------------------------------------------------------
+    // ラベル付き関数宣言（意地悪テスト）
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// ラベル付きで書かれた関数宣言が 0 にマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_LabeledFunctionStatement_FunctionMarked()
+    {
+        // label: function foo() { return 1; }
+        const string source = "label: function foo() { return 1; }";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        int funcIdx = source.IndexOf("function foo");
+        int bodyBrace = source.IndexOf('{', funcIdx);
+        // function foo の本体 { が 0（未実行）にマークされること
+        Assert.Equal(0, map[bodyBrace]);
+    }
+}
