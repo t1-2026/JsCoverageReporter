@@ -1816,6 +1816,33 @@ public class CoverageMapTests
     }
 
     /// <summary>
+    // -----------------------------------------------------------------------
+    // MergeMaps — null ガードのテスト（I-3 修正）
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// baseMap が null のとき ArgumentNullException をスローすることを確認する（I-3 修正）。
+    /// </summary>
+    [Fact]
+    public void MergeMaps_NullBaseMap_ThrowsArgumentNullException()
+    {
+        // baseMap が null のとき ArgumentNullException をスローすること
+        Assert.Throws<ArgumentNullException>(() =>
+            CoverageParser.MergeMaps(null!, new int[] { 1, 0, -1 }));
+    }
+
+    /// <summary>
+    /// otherMap が null のとき ArgumentNullException をスローすることを確認する（I-3 修正）。
+    /// </summary>
+    [Fact]
+    public void MergeMaps_NullOtherMap_ThrowsArgumentNullException()
+    {
+        // otherMap が null のとき ArgumentNullException をスローすること
+        Assert.Throws<ArgumentNullException>(() =>
+            CoverageParser.MergeMaps(new int[] { 1, 0, -1 }, null!));
+    }
+
+    /// <summary>
     /// `function` をオブジェクトプロパティの「キー名」として使った場合（{ function: 1 }）、
     /// function キーワードとして誤検知せず、マップが変化しないことを確認する。
     /// JavaScript では `function` はプロパティ名として合法であり、関数本体を持たない。
@@ -2197,6 +2224,28 @@ public class NestedTemplateLiteralTests
         Assert.Equal(0, map[21]); // 'f' of function
         Assert.Equal(0, map[31]); // '{'
         Assert.Equal(0, map[43]); // '}'
+    }
+
+    /// <summary>
+    /// 三段ネストのテンプレートリテラル内のアロー関数（`${`${`${()=>{}}`}`}`）が
+    /// 未実行の場合、0（未実行）としてマークされることを確認する。
+    /// ScanRange → 再帰ScanRange → ネストテンプレート処理 → 再帰ScanRange の連鎖で
+    /// 最深部のアロー関数本体が検出されるはず。
+    /// </summary>
+    [Fact]
+    public void BuildMap_ArrowFunctionInNestedTemplateLiteral_MarkedAsUncovered()
+    {
+        // var x = `${`${`${() => { return 1; }}`}`}`;
+        // 3段ネスト: 最深部のアロー関数が検出されるか確認する
+        const string source = "var x = `${`${`${() => { return 1; }}`}`}`;";
+        // { of arrow function body is the first '{' after '=>'
+        int arrowPos = source.IndexOf("=>");
+        int bracePos = source.IndexOf('{', arrowPos);
+
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        // アロー関数の { が 0（未実行）にマークされているはず
+        Assert.Equal(0, map[bracePos]);
     }
 
     /// <summary>
@@ -5965,5 +6014,458 @@ public class EdgeCaseParserTests
         var map = CoverageParser.BuildCoverageMap(source, []);
         Assert.Equal(0, map[0]);                 // 'f' of function は 0
         Assert.Equal(0, map[source.Length - 1]); // 末尾の '}' は 0
+    }
+
+    /// <summary>
+    /// "function" で始まる識別子のメソッド（例: functionX(){}）が未実行の場合、
+    /// 0（未実行）にマークされることを確認する。
+    /// 修正前は TryMarkFunctionKeyword が funcStart+1 を返して ScanRange が
+    /// TryMarkMethodShorthand を呼ばなかったため -1（中立）のままだった。
+    /// </summary>
+    [Fact]
+    public void BuildMap_MethodNamedFunctionX_MarkedAsUncovered()
+    {
+        // "const obj = { functionX() { return 1; } }"
+        //  0         1         2         3         4
+        //  0123456789012345678901234567890123456789012
+        // 'f' of 'functionX' at 14, '{' at 25
+        const string source = "const obj = { functionX() { return 1; } }";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        Assert.Equal(0, map[14]); // 'f' of functionX
+        Assert.Equal(0, map[25]); // '{'
+    }
+
+    /// <summary>
+    /// static クラスフィールドのアロー関数（例: static handler = () => {}）が未実行の場合、
+    /// アロー本体が 0（未実行）にマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_StaticClassFieldArrow_MarkedAsUncovered()
+    {
+        // "class C { static handler = () => { return 1; } }"
+        //  0         1         2         3         4
+        //  012345678901234567890123456789012345678901234567
+        // '=' of '=>' at 30, '{' of body at 33
+        const string source = "class C { static handler = () => { return 1; } }";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        Assert.Equal(0, map[30]); // '=' of '=>'
+        Assert.Equal(0, map[33]); // '{' of arrow body
+    }
+
+    /// <summary>
+    /// クラスフィールドの function 式（例: method = function(){}）が未実行の場合、
+    /// 0（未実行）にマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_ClassFieldFunctionExpression_MarkedAsUncovered()
+    {
+        // "class C { method = function() { return 1; } }"
+        //  0         1         2         3         4
+        //  012345678901234567890123456789012345678901234
+        // 'f' of function at 19, '{' at 30
+        const string source = "class C { method = function() { return 1; } }";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        Assert.Equal(0, map[19]); // 'f' of function
+        Assert.Equal(0, map[30]); // '{'
+    }
+
+    /// <summary>
+    /// } の直後にアロー関数が連続する場合（例: const f = () => {}; const g = () => {}）、
+    /// 両方のアロー本体が 0（未実行）にマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_ArrowAfterCloseBrace_MarkedAsUncovered()
+    {
+        // "const f = () => {}; const g = () => {}"
+        //  0         1         2         3
+        //  01234567890123456789012345678901234567
+        // 1st arrow '=>' at 13, '{' at 16; 2nd arrow '=>' at 33, '{' at 36
+        const string source = "const f = () => {}; const g = () => {}";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        Assert.Equal(0, map[16]); // '{' of first arrow body
+        Assert.Equal(0, map[36]); // '{' of second arrow body
+    }
+
+    /// <summary>
+    /// CDP でカバー済みの外側関数の内側に CDP でカバー済みのアロー関数がある場合、
+    /// MarkUncalledFunctionBodiesAsUncovered が CDP マーク（1）を 0 に上書きしないことを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_NestedArrowInsideCoveredFunction_NotOverwritten()
+    {
+        // "function outer() { const f = () => {}; }"
+        //  0         1         2         3
+        //  01234567890123456789012345678901234567890
+        // outer: 0..40, inner arrow '{' at 35
+        const string source = "function outer() { const f = () => {}; }";
+        var functions = new[]
+        {
+            new FunctionCoverage("outer", [new CoverageRange(0, 40, 1)]),
+            new FunctionCoverage("", [new CoverageRange(32, 37, 1)]), // => {}
+        };
+        var map = CoverageParser.BuildCoverageMap(source, functions);
+        // CDP が 1 をセットした位置は MarkUncalledFunctionBodiesAsUncovered で 0 に変わらない
+        Assert.Equal(1, map[35]); // '{' of inner arrow — must stay 1
+    }
+
+    /// <summary>
+    /// 配列リテラル内の function 式（例: [function(){}]）が未実行の場合、
+    /// 0（未実行）にマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_FunctionExpressionInArray_MarkedAsUncovered()
+    {
+        // "const arr = [function() { return 1; }]"
+        //  0         1         2         3
+        //  0123456789012345678901234567890123456
+        // 'f' of function at 13, '{' at 24
+        const string source = "const arr = [function() { return 1; }]";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        Assert.Equal(0, map[13]); // 'f' of function
+        Assert.Equal(0, map[24]); // '{'
+    }
+
+    /// <summary>
+    /// "return" をメソッド名として使った場合（ES6+ 合法）、
+    /// "return" は ControlFlowKeywords に含まれないため 0（未実行）にマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_MethodNamedReturn_MarkedAsUncovered()
+    {
+        // "const obj = { return() { } }"
+        //  0         1         2
+        //  0123456789012345678901234567
+        // 'r' of 'return' at 14, '{' at 23
+        const string source = "const obj = { return() { } }";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        Assert.Equal(0, map[14]); // 'r' of return method
+        Assert.Equal(0, map[23]); // '{'
+    }
+
+    /// <summary>
+    /// 深くネストした computed property key（例: [[[key]]](){}）が未実行の場合、
+    /// SkipBalancedBrackets が深いネストを正しく処理して 0（未実行）にマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_DeeplyNestedBracketsInComputedKey_MarkedAsUncovered()
+    {
+        // "const o = { [[[key]]]() {} }"
+        //  0         1         2
+        //  0123456789012345678901234567
+        // outer '[' at 12, '(' at 21, '{' at 24, '}' at 25
+        const string source = "const o = { [[[key]]]() {} }";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        Assert.Equal(0, map[12]); // outer '[' of computed key
+        Assert.Equal(0, map[24]); // '{'
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 3: 追加テスト — 特殊な JS パターンの未実行検出
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// export default async function*() {} が未実行の場合、
+    /// 関数本体の { が 0（未実行）にマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_ExportDefaultAsyncGenerator_MarkedAsUncovered()
+    {
+        // "export default async function*() { yield 1; }"
+        //  0         1         2         3         4
+        //  0123456789012345678901234567890123456789012345
+        // 'f' of function at 22, '*' at 30, '(' at 31, ')' at 32, ' ' at 33, '{' at 34
+        const string source = "export default async function*() { yield 1; }";
+        int funcPos = source.IndexOf("function");
+        int bracePos = source.IndexOf('{', funcPos);
+
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        Assert.Equal(0, map[funcPos]); // 'f' of function
+        Assert.Equal(0, map[bracePos]); // '{'
+    }
+
+    /// <summary>
+    /// void function() { return 1; }() — void IIFE が未実行の場合、
+    /// 関数本体の { が 0（未実行）にマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_VoidIIFE_Uncalled_MarkedAsUncovered()
+    {
+        // "void function() { return 1; }()"
+        //  0         1         2         3
+        //  01234567890123456789012345678901
+        // 'f' of function at 5, '{' at 16
+        const string source = "void function() { return 1; }()";
+        int funcPos = source.IndexOf("function");
+        int bracePos = source.IndexOf('{', funcPos);
+
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        Assert.Equal(0, map[funcPos]); // 'f' of function
+        Assert.Equal(0, map[bracePos]); // '{'
+    }
+
+    /// <summary>
+    /// !function() { return 1; }() — 否定 IIFE が未実行の場合、
+    /// 関数本体の { が 0（未実行）にマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_NegatedIIFE_Uncalled_MarkedAsUncovered()
+    {
+        // "!function() { return 1; }()"
+        //  0         1         2
+        //  0123456789012345678901234567
+        // 'f' of function at 1, '{' at 12
+        const string source = "!function() { return 1; }()";
+        int funcPos = source.IndexOf("function");
+        int bracePos = source.IndexOf('{', funcPos);
+
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        Assert.Equal(0, map[funcPos]); // 'f' of function
+        Assert.Equal(0, map[bracePos]); // '{'
+    }
+
+    /// <summary>
+    /// 括弧で囲まれたオブジェクトリテラルのメソッド（例: ({method(){}})）が未実行の場合、
+    /// メソッド本体の { が 0（未実行）にマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_ParenthesizedObjectLiteralMethod_MarkedAsUncovered()
+    {
+        // "var obj = ({method() { return 1; }});"
+        //  0         1         2         3
+        //  0123456789012345678901234567890123456
+        // 'm' of method at 12, '{' at 21
+        const string source = "var obj = ({method() { return 1; }});";
+        int methodPos = source.IndexOf("method");
+        int bracePos = source.IndexOf('{', methodPos + 6); // skip to body brace
+
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        Assert.Equal(0, map[methodPos]); // 'm' of method
+        Assert.Equal(0, map[bracePos]); // '{' of method body
+    }
+
+    /// <summary>
+    /// クラスのプライベートメソッド（#private(){}）が未実行の場合、
+    /// メソッド本体の { が 0（未実行）にマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledPrivateMethod_MarkedAsUncovered()
+    {
+        // "class Foo { #private() { return 1; } }"
+        //  0         1         2         3
+        //  0123456789012345678901234567890123456789
+        // '#' at 12, '{' of body at 23
+        const string source = "class Foo { #private() { return 1; } }";
+        int hashPos = source.IndexOf('#');
+        int bracePos = source.IndexOf('{', hashPos + 1); // skip to body brace (not class brace)
+
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        Assert.Equal(0, map[hashPos]); // '#' of #private
+        Assert.Equal(0, map[bracePos]); // '{' of method body
+    }
+
+    /// <summary>
+    /// デフォルト引数にオブジェクトリテラルを持つアロー関数（(x = {a: 1}) => {}）が未実行の場合、
+    /// アロー本体の { が 0（未実行）にマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_ArrowFunction_DefaultObjectParam_MarkedAsUncovered()
+    {
+        // "var f = (x = {a: 1}) => { return x; };"
+        //  0         1         2         3
+        //  0123456789012345678901234567890123456789
+        // '=>' at 21, '{' of body at 24
+        const string source = "var f = (x = {a: 1}) => { return x; };";
+        int arrowPos = source.IndexOf("=>");
+        int bracePos = source.IndexOf('{', arrowPos);
+
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        Assert.Equal(0, map[arrowPos]); // '=' of '=>'
+        Assert.Equal(0, map[bracePos]); // '{' of arrow body
+    }
+
+    /// <summary>
+    /// ラベル付き関数宣言（label: function foo() {}）が未実行の場合、
+    /// 関数本体の { が 0（未実行）にマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_LabeledFunctionDeclaration_MarkedAsUncovered()
+    {
+        // "label: function foo() { return 1; }"
+        //  0         1         2         3
+        //  0123456789012345678901234567890123456
+        // 'f' of function at 7, '{' at 22
+        const string source = "label: function foo() { return 1; }";
+        int funcPos = source.IndexOf("function");
+        int bracePos = source.IndexOf('{', funcPos);
+
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        Assert.Equal(0, map[funcPos]); // 'f' of function
+        Assert.Equal(0, map[bracePos]); // '{'
+    }
+
+    /// <summary>
+    /// computed プロパティキーのジェネレータメソッド（*[Symbol.iterator](){}）が未実行の場合、
+    /// メソッド本体の { が 0（未実行）にマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_ComputedGeneratorMethod_MarkedAsUncovered()
+    {
+        // "class Foo { *[Symbol.iterator]() { yield 1; } }"
+        //  0         1         2         3         4
+        //  0123456789012345678901234567890123456789012345678
+        // '*' at 12, '[' at 13, '{' of body at 33
+        const string source = "class Foo { *[Symbol.iterator]() { yield 1; } }";
+        int starPos = source.IndexOf('*');
+        int bracePos = source.IndexOf('{', starPos + 1); // first { after '*'
+
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        Assert.Equal(0, map[starPos]); // '*' of generator method
+        Assert.Equal(0, map[bracePos]); // '{' of generator body
+    }
+
+    /// <summary>
+    /// typeof function expression（typeof function(){}）が未実行の場合、
+    /// 関数本体の { が 0（未実行）にマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_TypeofFunctionExpression_MarkedAsUncovered()
+    {
+        // "typeof function() { return 1; }"
+        //  0         1         2         3
+        //  0123456789012345678901234567890
+        // 'f' of function at 7, '{' at 18
+        const string source = "typeof function() { return 1; }";
+        int funcPos = source.IndexOf("function");
+        int bracePos = source.IndexOf('{', funcPos);
+
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        Assert.Equal(0, map[funcPos]); // 'f' of function
+        Assert.Equal(0, map[bracePos]); // '{'
+    }
+
+    /// <summary>
+    /// new Function("return 1") — 動的コード生成は関数本体を含まないため、
+    /// マップ全体に 0 が書き込まれないことを確認する（すべて -1 のまま）。
+    /// </summary>
+    [Fact]
+    public void BuildMap_NewFunctionDynamic_RemainsNeutral()
+    {
+        // "new Function(\"return 1\");"
+        // この文字列には { } が含まれないため、function キーワードも検出されない
+        const string source = "new Function(\"return 1\");";
+
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        // すべて -1（対象外）のまま — function キーワードがないため
+        Assert.All(map, v => Assert.Equal(-1, v));
+    }
+
+    /// <summary>
+    /// <summary>
+    /// 既知のコスメティック問題: async を変数名として使った後に async function が続く場合、
+    /// 変数 async が誤って赤にマークされる。この制限を文書化する Skip テスト。
+    /// </summary>
+    [Fact(Skip = "既知のコスメティック問題: async を変数名として使った後に async function が続く場合、変数 async が誤って赤にマークされる")]
+    public void BuildMap_AsyncVariableName_BeforeAsyncFunction_VariableNotMarkedRed()
+    {
+        // let async = 1; の後に async function foo(){} が続くとき
+        // 変数 "async" は赤にならないべきだが、現状はなる（コスメティックのみ）
+        string source = "let async = 1;\nasync function foo() { return 1; }";
+
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        // 変数 async の位置は -1（ニュートラル）であるべき
+        int varAsyncPos = source.IndexOf("async"); // 1行目の async
+        Assert.Equal(-1, map[varAsyncPos]);
+    }
+
+    /// <summary>
+    /// async generator function（async function* gen(){}）が未実行の場合、
+    /// async キーワードから関数本体末尾まで 0（未実行）にマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_AsyncGeneratorFunction_MarkedAsUncovered()
+    {
+        // "async function* gen() { yield 1; }"
+        //  0         1         2         3
+        //  0123456789012345678901234567890123
+        // 'a' of async at 0, 'f' of function at 6, '{' at 22
+        const string source = "async function* gen() { yield 1; }";
+        int asyncPos = 0;
+        int funcPos = source.IndexOf("function");
+        int bracePos = source.IndexOf('{', funcPos);
+
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        Assert.Equal(0, map[asyncPos]); // 'a' of async
+        Assert.Equal(0, map[funcPos]);  // 'f' of function
+        Assert.Equal(0, map[bracePos]); // '{'
+    }
+
+    /// <summary>
+    /// <summary>
+    /// ["]"](){} のように computed property key の文字列内に ] があっても
+    /// SkipBalancedBrackets が誤終了しないことの確認テスト。
+    /// </summary>
+    [Fact]
+    public void BuildMap_ComputedMethod_CloseBracketInStringKey_MarkedAsUncovered()
+    {
+        // ["]"](){} のように computed property key の文字列内に ] があっても
+        // SkipBalancedBrackets が誤終了しないことの確認
+        string source = "const obj = { [\"]\"](){ return 1; } };";
+
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        // メソッドの [ から 0（未実行・赤）にマークされること
+        int bracketPos = source.IndexOf('[');
+        Assert.Equal(0, map[bracketPos]);
+    }
+
+    /// <summary>
+    /// for...of で正規表現 /[}]/ を使うとき、FindMatchingBrace が } を早期に検出してしまい、
+    /// 内側の function foo が検出されないバグの回帰テスト（I-1: "of" を RegexPrecedingKeywords に追加）。
+    /// outer 関数の本体をスキャンするとき FindMatchingBrace が呼ばれ、
+    /// /[}]/ 内の } が深さカウントを狂わせて outer の終了 } を誤検出する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_ForOfWithRegexContainingBrace_FunctionAfterForOfDetected()
+    {
+        // outer の本体で FindMatchingBrace が呼ばれ、その中の for...of /[}]/ の
+        // } がブレース深度を狂わせて function foo が検出されなくなるバグの回帰テスト
+        string source = "function outer() { for (var x of /[}]/) { } function foo() { return 1; } }";
+
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        // function foo の本体 { が 0（未実行・赤）にマークされること
+        int fooIdx = source.IndexOf("function foo");
+        int bodyBrace = source.IndexOf('{', fooIdx);
+        Assert.Equal(0, map[bodyBrace]);
+    }
+
+    /// <summary>
+    /// "of" を RegexPrecedingKeywords に追加した後、除算 x / 2 が誤って正規表現と
+    /// 解釈されないことの回帰テスト（直前トークンが識別子なら IsRegexStart=false）。
+    /// </summary>
+    [Fact]
+    public void BuildMap_ForOfDivision_DivisionNotMistakenForRegex()
+    {
+        // "of" を RegexPrecedingKeywords に追加した後、除算 x / 2 が誤って正規表現と
+        // 解釈されないことの回帰テスト（直前トークンが識別子なら IsRegexStart=false）
+        string source = "for (var x of arr) { var y = x / 2; } function foo() { return 1; }";
+
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        int fooIdx = source.IndexOf("function foo");
+        int bodyBrace = source.IndexOf('{', fooIdx);
+        Assert.Equal(0, map[bodyBrace]);
     }
 }

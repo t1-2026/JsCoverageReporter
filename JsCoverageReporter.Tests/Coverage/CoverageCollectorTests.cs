@@ -125,12 +125,11 @@ public class CoverageCollectorTests
         // 3. Click the link that returns 204 No Content
         // This triggers an intermediate snapshot in CoverageCollector
         // Wait for request before clicking to ensure it fires reliably
-        var requestTask = page.WaitForRequestAsync("**/nocontent");
+        // WaitForResponseAsync で 204 レスポンス受信まで待つ（Task.Delay より確実）
+        // StopAsync が _snapTasks を全件 await するため、中間スナップショットの完了は保証される
+        var responseTask = page.WaitForResponseAsync("**/nocontent");
         await page.ClickAsync("#cancelLink");
-        await requestTask;
-
-        // Give some time for the intermediate snapshot logic inside the event handler to finish
-        await Task.Delay(500);
+        await responseTask;
 
         // 4. Click the button, which invokes window.doAction() and increases coverage counts
         await page.ClickAsync("#actionBtn");

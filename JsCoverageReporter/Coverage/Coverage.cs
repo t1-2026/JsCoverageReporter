@@ -96,8 +96,8 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
         // 追跡ページリストにこのページを追加する（追加順がタブ番号になる）
         lock (_lock)
         {
-            // 既に追跡中のページはスキップする（StartAsync の二重呼び出し対策）
-            if (_trackedPages.Contains(targetPage)) { return; }
+            // 既に追跡中のページはスキップする（_scriptCache は _trackedPages と同時追加なので O(1) で判定できる）
+            if (_scriptCache.ContainsKey(targetPage)) { return; }
             _trackedPages.Add(targetPage);
             // このページのスクリプトキャッシュを初期化する
             _scriptCache[targetPage] = new Dictionary<string, ScriptCoverage>();

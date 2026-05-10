@@ -1693,6 +1693,24 @@ public class BuildLinesEdgeCaseTests
     {
         Assert.Equal("app.js", HtmlReportGenerator.GetFileName("http://localhost/app.js#section"));
     }
+
+    /// <summary>
+    /// U+2028（Unicode 行区切り文字）は SplitOnNewlines の対象外のため1行として扱われる。
+    /// この制限を文書化するテスト（ECMAScript では行末文字だが C# の BuildLines では改行扱いしない）。
+    /// </summary>
+    [Fact]
+    public void BuildLines_LineSeparatorU2028_TreatedAsSingleLine()
+    {
+        // U+2028 は SplitOnNewlines (\n / \r\n / \r のみ対応) で分割されないため
+        // 全体が1行として扱われる
+        string source = "a" + "\u2028" + "b";
+        int[] map = new int[] { 1, -1, 1 };
+
+        var lines = HtmlReportGenerator.BuildLines(source, map);
+
+        // U+2028 で分割されず1行として返されることを確認する
+        Assert.Single(lines);
+    }
 }
 
 /// <summary>
@@ -2375,6 +2393,26 @@ public class GenerateReviewTests : IDisposable
         // index.html が生成されること
         Assert.True(File.Exists(Path.Combine(_outputDir, "index.html")));
     }
+
+    /// <summary>
+    /// BOM のみのソースは mergedLines.Count が 1 以下になるため、
+    /// スクリプト個別ページ（script-0.html 等）が生成されないことを確認する。
+    /// </summary>
+    [Fact]
+    public void Generate_BomOnlySource_NoScriptFileCreated()
+    {
+        string source = "﻿";
+        var script = MakeScriptWithRanges(
+            0, "http://example.com/", "http://example.com/app.js", source, []);
+
+        new HtmlReportGenerator().Generate([script], _outputDir);
+
+        // スクリプト個別ページは作られないこと（行数 1 以下のスクリプトはスキップされる）
+        string scriptsDir = Path.Combine(_outputDir, "scripts");
+        bool anyScriptFile = Directory.Exists(scriptsDir) &&
+                             Directory.GetFiles(scriptsDir, "script-*.html").Length > 0;
+        Assert.False(anyScriptFile);
+    }
 }
 
 /// <summary>
@@ -2647,6 +2685,74 @@ public class GetFileNameEdgeCaseTests
         var lines = HtmlReportGenerator.BuildLines("\r", [-1]);
         Assert.Single(lines);
         Assert.Equal(LineCoverageStatus.Neutral, lines[0].Status);
+    }
+
+    /// <summary>
+    /// 全行が未実行（covered=0, partial=0, total=10）の場合、
+    /// カバレッジ率が "0.0%" と表示されることを確認する（境界値テスト）。
+    /// </summary>
+    [Fact]
+    public void BuildIndexPage_AllUncovered_ShowsZeroPercent()
+    {
+        var tabs = new List<(string label, string pageUrl, string tabFilename)>
+        {
+            ("画面1", "http://example.com/", "script-0.html"),
+        };
+        var rows = new List<(IReadOnlyList<(string label, string pageUrl, string tabFilename)> tabs,
+                             string url, int covered, int partial, int total, string mergedFilename)>
+        {
+            (tabs, "http://example.com/app.js", 0, 0, 10, "script-0.html"),
+        };
+
+        string html = HtmlReportGenerator.BuildIndexPage(rows);
+
+        Assert.Contains("0.0%", html);
+    }
+
+    /// <summary>
+    /// 全行が実行済み（covered=10, partial=0, total=10）の場合、
+    /// カバレッジ率が "100.0%" と表示されることを確認する（境界値テスト）。
+    /// </summary>
+    [Fact]
+    public void BuildIndexPage_AllCovered_ShowsHundredPercent()
+    {
+        var tabs = new List<(string label, string pageUrl, string tabFilename)>
+        {
+            ("画面1", "http://example.com/", "script-0.html"),
+        };
+        var rows = new List<(IReadOnlyList<(string label, string pageUrl, string tabFilename)> tabs,
+                             string url, int covered, int partial, int total, string mergedFilename)>
+        {
+            (tabs, "http://example.com/app.js", 10, 0, 10, "script-0.html"),
+        };
+
+        string html = HtmlReportGenerator.BuildIndexPage(rows);
+
+        Assert.Contains("100.0%", html);
+    }
+
+    /// <summary>
+    /// スキームなし（相対パス）の URL（例: /js/app.js）はパース対象外のためそのまま返されることを確認する。
+    /// http:// / https:// / file:// で始まらない文字列は変換せずそのまま返す。
+    /// </summary>
+    [Fact]
+    public void GetFileName_RelativePath_ReturnsAsIs()
+    {
+        // "/js/app.js" — http でも https でも file でもないためそのまま返す
+        string result = HtmlReportGenerator.GetFileName("/js/app.js");
+        Assert.Equal("/js/app.js", result);
+    }
+
+    /// <summary>
+    /// https://user:pass@example.com/scripts/app.js のように認証情報が含まれる URL でも
+    /// ファイル名（app.js）が正しく返されることを確認する。
+    /// </summary>
+    [Fact]
+    public void GetFileName_UrlWithCredentials_ReturnsFilename()
+    {
+        // https://user:pass@example.com/scripts/app.js → app.js
+        string result = HtmlReportGenerator.GetFileName("https://user:pass@example.com/scripts/app.js");
+        Assert.Equal("app.js", result);
     }
 }
 

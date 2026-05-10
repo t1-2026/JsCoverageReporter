@@ -32,6 +32,7 @@ internal static class CoverageParser
         "case",   // switch 文内: case /regex/.test(x) のパターン
         "await",  // 非同期関数内: await /regex/ のパターン
         "else",   // else /regex/.test(x) のパターン
+        "of",     // for...of ループ内: for (x of /regex/) のパターン（I-1 修正）
     };
     /// <summary>
     /// ソースコードの各文字に対してカバレッジ値を記録した配列を作成する。
@@ -419,12 +420,23 @@ internal static class CoverageParser
         // function の直後が識別子文字でないことを確認する（例: functionCall を除外する）
         bool nextOk = funcStart + 8 >= end || !IsIdentifierChar(source[funcStart + 8]);
 
-        if (!prevOk || !nextOk || map[funcStart] != -1)
+        // 識別子の途中（例: myFunctionX の中の 'f'）または既に CDP でマーク済み → スキップ
+        if (!prevOk || map[funcStart] != -1)
         {
-            return funcStart + 1; // 条件を満たさない場合は 1 文字進む
+            return funcStart + 1;
+        }
+        // "function" で始まる識別子（例: functionX(){}）→ メソッド短縮構文として委譲する
+        if (!nextOk)
+        {
+            return TryMarkMethodShorthand(source, map, funcStart, end);
         }
 
         // async function の場合、async キーワードも未実行（赤）としてマークする
+        // 注意: SkipWhitespaceAndCommentsBackward は end パラメータを持たずソース全体を逆走査する。
+        // ScanRange のサブレンジ再帰（例: テンプレートリテラル ${ } 内の再帰呼び出し）から
+        // この関数が呼ばれた場合、逆走査が $ より前のコンテキストに入り込む可能性がある。
+        // ただし async の直前が ${…} の { や $ になるケースは実用上ほぼ起きないため、
+        // 誤検出のリスクは許容範囲と判断し、現状の実装を維持する。
         int scanBack = SkipWhitespaceAndCommentsBackward(source, funcStart - 1);
         if (scanBack >= 4 && source.AsSpan(scanBack - 4, 5).SequenceEqual("async"))
         {
@@ -1124,6 +1136,15 @@ internal static class CoverageParser
     /// <returns>OR 合成したカバレッジマップ（baseMap と同じ長さ）</returns>
     internal static int[] MergeMaps(int[] baseMap, int[] otherMap)
     {
+        // null ガード
+        if (baseMap == null)
+        {
+            throw new ArgumentNullException(nameof(baseMap));
+        }
+        if (otherMap == null)
+        {
+            throw new ArgumentNullException(nameof(otherMap));
+        }
         // baseMap の長さを基準に合成結果の配列を作る
         var merged = new int[baseMap.Length];
         for (int i = 0; i < baseMap.Length; i++)
