@@ -6715,4 +6715,149 @@ public class ReviewMissingCoverageTests
         // function foo の本体 { が 0（未実行）にマークされること
         Assert.Equal(0, map[bodyBrace]);
     }
+
+    // -----------------------------------------------------------------------
+    // export default /regex/ — IsRegexStart の default キーワード対応確認
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// export default の直後の / が正規表現の開始として認識されること（除算でないこと）を確認する。
+    /// "default" が RegexPrecedingKeywords に含まれていない場合、/regex/ 内の function が
+    /// 誤検出されてカバレッジが 0（未実行・赤）として塗られてしまう。
+    /// </summary>
+    [Fact]
+    public void BuildMap_ExportDefaultRegexLiteral_FunctionInsideRegexNotDetected()
+    {
+        // export default /function notReal() { return 0; }/;
+        // function notReal は正規表現リテラル内のテキストであり、実際の関数定義ではない。
+        // V8 のカバレッジデータなし（全 -1）の場合でも誤マーク（0 への書き換え）が起きないこと。
+        const string source = "export default /function notReal() { return 0; }/;";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        int funcPos = source.IndexOf("function notReal");
+        // カバレッジデータなし（-1 のまま）であること — 0 に書き換わると回帰バグ
+        Assert.Equal(-1, map[funcPos]);
+    }
+
+    // -----------------------------------------------------------------------
+    // ES2019 optional catch binding 内の関数検出
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// catch (e) なしの catch ブロック（ES2019 optional catch binding）内の
+    /// function 宣言が未実行（0）としてマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_FunctionInsideOptionalCatchBinding_MarkedAsUncovered()
+    {
+        // try { ok(); } catch { function fallback() { return 1; } }
+        // ES2019: catch の変数を省略できる構文
+        const string source = "try { ok(); } catch { function fallback() { return 1; } }";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        int funcPos = source.IndexOf("function fallback");
+        int bracePos = source.IndexOf('{', funcPos);
+        Assert.Equal(0, map[funcPos]);
+        Assert.Equal(0, map[bracePos]);
+    }
+
+    // -----------------------------------------------------------------------
+    // 論理代入演算子 ??= / ||= 右辺のアロー・function 検出
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// Nullish 代入演算子 ??= の右辺にアロー関数が来た場合、
+    /// アロー本体が未実行（0）としてマークされることを確認する。
+    /// ??= の = は => の = ではないため誤検出しない。
+    /// </summary>
+    [Fact]
+    public void BuildMap_NullishAssignmentArrow_MarkedAsUncovered()
+    {
+        // handler ??= () => { return 1; };
+        const string source = "handler ??= () => { return 1; };";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        int arrowPos = source.IndexOf("=>");
+        // arrowPos は => の '=' の位置。スキャナはここを起点にアロー本体 {} を 0 にマークする。
+        Assert.Equal(0, map[arrowPos]);
+    }
+
+    /// <summary>
+    /// 論理 OR 代入演算子 ||= の右辺に function 式が来た場合、
+    /// 関数本体が未実行（0）としてマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_LogicalOrAssignmentFunction_MarkedAsUncovered()
+    {
+        // fn ||= function fallback() { return 1; };
+        const string source = "fn ||= function fallback() { return 1; };";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        int funcPos = source.IndexOf("function fallback");
+        int bracePos = source.IndexOf('{', funcPos);
+        Assert.Equal(0, map[funcPos]);
+        Assert.Equal(0, map[bracePos]);
+    }
+
+    // -----------------------------------------------------------------------
+    // switch の default: ケース内の関数宣言
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// switch 文の default: ケース内に function 宣言がある場合、
+    /// 未実行（0）としてマークされることを確認する。
+    /// IsRegexStart の実行パス: switch の default: は末尾が ':' であるため、
+    /// 識別子チェック分岐（RegexPrecedingKeywords を参照する分岐）には到達しない。
+    /// ':' は演算子・区切り文字として IsRegexStart が true を返すコードパスを通るため、
+    /// "default" を RegexPrecedingKeywords に追加しても switch の動作に影響しない。
+    /// </summary>
+    [Fact]
+    public void BuildMap_FunctionInsideSwitchDefault_MarkedAsUncovered()
+    {
+        // switch(x) { case 1: break; default: function fallback() { return 1; } }
+        const string source = "switch(x) { case 1: break; default: function fallback() { return 1; } }";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        int funcPos = source.IndexOf("function fallback");
+        int bracePos = source.IndexOf('{', funcPos);
+        Assert.Equal(0, map[funcPos]);
+        Assert.Equal(0, map[bracePos]);
+    }
+
+    // -----------------------------------------------------------------------
+    // 動的インポート import() 後のコールバック関数検出
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// 動的インポート import() の .then() コールバックとして渡された function が
+    /// 未実行（0）としてマークされることを確認する。
+    /// .then() の引数内の function は TryMarkFunctionKeyword が通常どおり検出する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_FunctionInsideDynamicImportThen_MarkedAsUncovered()
+    {
+        // import('./mod.js').then(function loaded() { return 1; });
+        const string source = "import('./mod.js').then(function loaded() { return 1; });";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        int funcPos = source.IndexOf("function loaded");
+        int bracePos = source.IndexOf('{', funcPos);
+        Assert.Equal(0, map[funcPos]);
+        Assert.Equal(0, map[bracePos]);
+    }
+
+    // -----------------------------------------------------------------------
+    // export default function — default キーワード追加の副作用がないことの確認
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// export default function foo() {} は正規表現ではなく関数宣言であり、
+    /// "default" を RegexPrecedingKeywords に追加しても検出に影響しないことを確認する。
+    /// IsRegexStart は '/' が来たときだけ参照されるため、function キーワードの検出パスとは独立している。
+    /// </summary>
+    [Fact]
+    public void BuildMap_ExportDefaultFunction_MarkedAsUncovered()
+    {
+        // export default function foo() { return 1; }
+        const string source = "export default function foo() { return 1; }";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        int funcPos = source.IndexOf("function foo");
+        int bracePos = source.IndexOf('{', funcPos);
+        Assert.Equal(0, map[funcPos]);
+        Assert.Equal(0, map[bracePos]);
+    }
 }

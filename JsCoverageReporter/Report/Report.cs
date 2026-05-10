@@ -31,9 +31,11 @@ internal static class CoverageParser
         "yield",  // ジェネレータ関数内: yield /regex/ のパターン
         "case",   // switch 文内: case /regex/.test(x) のパターン
         "await",  // 非同期関数内: await /regex/ のパターン
-        "else",   // else /regex/.test(x) のパターン
-        "of",     // for...of ループ内: for (x of /regex/) のパターン（I-1 修正）
+        "else",    // else /regex/.test(x) のパターン
+        "of",      // for...of ループ内: for (x of /regex/) のパターン
+        "default", // export default /regex/ / switch の default ケース
     };
+
     /// <summary>
     /// ソースコードの各文字に対してカバレッジ値を記録した配列を作成する。
     /// 値の意味: -1 = カバレッジ対象外, 0 = 未実行, 1 = 実行済み。
