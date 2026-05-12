@@ -45,22 +45,44 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
     private readonly Dictionary<IPage, EventHandler<IPage>>    _closeHandlers       = [];
     // ページごとの最終スナップショット時刻（スロットリング用。iframe ナビゲーションの過剰スナップショットを防ぐ）
     private readonly Dictionary<IPage, long>                   _lastSnapshotTick    = [];
+    // ページごとのタブ番号（SetupPageAsync で登録順に付番。O(1) で取得するため Dictionary を使う）
+    private readonly Dictionary<IPage, int>                    _tabIndices          = [];
     // スナップショットのスロットリング間隔（ミリ秒）（この間隔内の連続スナップショットはスキップする）
     // テストからインスタンスごとに 0 に設定することでスロットリングを無効化できる（internal にしてテスト性を確保）
     internal long SnapshotThrottleMs = 500;
+
+    // window.close() オーバーライドが fetch を送る特殊 URL。
+    // Playwright がこの URL をインターセプトしてスナップショットを取り、応答後に close を実行させる。
+    // ブラウザからは到達できない偽ドメインを使って他の通信と混在しないようにする。
+    private const string BeforeCloseRouteUrl = "https://jscoverage.internal/__before_close__";
+
+    // window.close() をオーバーライドする JS スクリプト（SetupPageAsync で各ページに注入する）。
+    // static readonly にすることで SetupPageAsync が呼ばれるたびに文字列を再生成しない。
+    // BeforeCloseRouteUrl は const なので連結しても定数折り畳みと同等の効果がある。
+    private static readonly string CloseOverrideScript =
+        "(function() {" +
+        "  if (window.__jsCoverageCloseOverridden) { return; }" +
+        "  window.__jsCoverageCloseOverridden = true;" +
+        "  var _orig = window.close.bind(window);" +
+        "  window.close = async function() {" +
+        "    try { await fetch('" + BeforeCloseRouteUrl + "', { method: 'POST', keepalive: true }); } catch (e) {}" +
+        "    _orig();" +
+        "  };" +
+        "})();";
 
     /// <summary>
     /// カバレッジ収集を開始する。
     /// フィルターを保存し、初期ページのCDPセッションを開始し、新しいタブの自動検出を登録する。
     /// </summary>
-    /// <param name="scriptFilters">URLにいずれかの文字列を含むスクリプトだけを返す（空リストなら全部）</param>
-    /// <param name="scriptExcludes">URLにいずれかの文字列を含むスクリプトを除外する（空リストなら除外なし）</param>
-    public async Task StartAsync(IReadOnlyList<string> scriptFilters, IReadOnlyList<string> scriptExcludes)
+    /// <param name="scriptFilters">URLにいずれかの文字列を含むスクリプトだけを返す（null または省略で全部）</param>
+    /// <param name="scriptExcludes">URLにいずれかの文字列を含むスクリプトを除外する（null または省略で除外なし）</param>
+    public async Task StartAsync(IReadOnlyList<string> scriptFilters = null, IReadOnlyList<string> scriptExcludes = null)
     {
+        // null の場合はフィルターなし（全スクリプト対象）として扱う
         // フィルターをインスタンスフィールドに保存する（中間スナップショット時にも参照する）
         // 参照型の代入は .NET のメモリモデル上アトミックなため、バックグラウンドタスクとのロック不要
-        _scriptFilters  = scriptFilters;
-        _scriptExcludes = scriptExcludes;
+        if (scriptFilters == null) { _scriptFilters = []; } else { _scriptFilters = scriptFilters; }
+        if (scriptExcludes == null) { _scriptExcludes = []; } else { _scriptExcludes = scriptExcludes; }
 
         // 最初のページ（コンストラクタで渡されたページ）のカバレッジを開始する
         await SetupPageAsync(page);
@@ -101,6 +123,8 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
             _trackedPages.Add(targetPage);
             // このページのスクリプトキャッシュを初期化する
             _scriptCache[targetPage] = new Dictionary<string, ScriptCoverage>();
+            // タブ番号を Dictionary に記録する（_trackedPages.IndexOf より O(1) で取得できる）
+            _tabIndices[targetPage] = _trackedPages.Count - 1;
         }
 
         // ページに接続したCDPセッションを作成する
@@ -121,6 +145,81 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
             ["callCount"]            = true,
             ["detailed"]             = true,
             ["allowTriggeredUpdates"] = true,
+        });
+
+        // window.close() をオーバーライドするスクリプトを注入する。
+        // ページが JS 側から window.close() で閉じられる直前に BeforeCloseRouteUrl へ fetch することで
+        // Playwright がスナップショットを取ってから元の close を呼べるようにする。
+        // （page.Close イベントは CDP セッション無効化後に発火するため、イベント内でのスナップショットは失敗する）
+
+        // すでに読み込まれている現在のページに即座に注入する
+        try
+        {
+            await targetPage.EvaluateAsync(CloseOverrideScript);
+        }
+        catch (Exception)
+        {
+            // ページが既に閉じているなどの場合は無視する
+        }
+
+        // 以降のナビゲーション後にも自動的に注入するよう登録する
+        // 注: Playwright に RemoveInitScript per-script API がないため StopAsync/DisposeAsync では除去できない。
+        // StopAsync 後に window.close() が呼ばれても fetch が失敗して catch(e){} に吸収されるため実害はない。
+        await targetPage.AddInitScriptAsync(CloseOverrideScript);
+
+        // BeforeCloseRouteUrl へのリクエストをインターセプトしてスナップショットを取るルートを登録する。
+        // fetch が await されている間は window.close() の元の処理が止まっているため、
+        // CDP セッションはまだ有効でありスナップショットを安全に取得できる。
+        await targetPage.RouteAsync(BeforeCloseRouteUrl, async route =>
+        {
+            // _stopped チェックをアトミックに行う
+            bool shouldProcess;
+            lock (_lock)
+            {
+                if (_stopped)
+                {
+                    shouldProcess = false;
+                }
+                else
+                {
+                    shouldProcess = true;
+                }
+            }
+
+            if (shouldProcess)
+            {
+                string closeRouteUrl;
+                try { closeRouteUrl = targetPage.Url; }
+                catch (Exception) { closeRouteUrl = ""; }
+
+                // ルートを完了させる前にスナップショットを取る
+                // （完了させると window.close() の元の処理が再開されページが閉じてしまう）
+                await TakeIntermediateSnapshotAsync(targetPage, closeRouteUrl);
+                // スナップショット完了後に tick をセットする。
+                // 完了前にセットすると、スナップショット失敗時に closeHandler のスロットリング判定を
+                // 誤って抑制し、フォールバックも失われてカバレッジが欠落する可能性がある。
+                lock (_lock) { _lastSnapshotTick[targetPage] = Environment.TickCount64; }
+            }
+
+            // fetch を完了させて window.close() のオーバーライド関数が _orig() を呼べるようにする。
+            // Access-Control-Allow-Origin を付けないと CORS エラーで fetch が reject されるため追加する。
+            // reject されてもスナップショット取得済みのため実害はないが、余計な例外を発生させないようにする。
+            try
+            {
+                await route.FulfillAsync(new RouteFulfillOptions
+                {
+                    Status  = 200,
+                    Body    = "",
+                    Headers = new Dictionary<string, string>
+                    {
+                        ["Access-Control-Allow-Origin"] = "*",
+                    },
+                });
+            }
+            catch (Exception)
+            {
+                // ページが既に閉じていた場合は無視する
+            }
         });
 
         // ナビゲーションリクエストを検出してスナップショットを撮るハンドラーを定義する
@@ -157,6 +256,9 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
             try { currentUrl = targetPage.Url; }
             catch (Exception) { currentUrl = ""; }
 
+            // スロットリングロック解放後に StopAsync が完了していた場合はタスク開始自体をスキップする
+            lock (_lock) { if (_stopped) { return; } }
+
             // 中間スナップショットタスクを開始してから、_stopped チェックと _snapTasks.Add を
             // 同一ロックでアトミックに行う（チェックと追加の間に StopAsync が完了するレースを排除する）
             // TakeIntermediateSnapshotAsync は _lock を内部で取得するためロック外で呼ぶ必要がある
@@ -175,21 +277,34 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
             _requestHandlers[targetPage] = reqHandler;
         }
 
-        // ページが閉じられたときにスナップショットを撮るハンドラーを定義する
-        // （StopAsync より先にページが閉じられた場合でも、実行済みスクリプトを取得できるようにする）
+        // ページが閉じられたときにスナップショットを撮るハンドラーを定義する。
+        // window.close() ルート経由でスナップショット済みの場合はスロットリングによりスキップする。
+        // （page.Close イベントは CDP セッション無効化後に発火するため、スナップショットは通常失敗する。
+        //   ルート未経由の予期しない close（ブラウザ強制終了など）のフォールバックとして残している）
         EventHandler<IPage> closeHandler = (_, _) =>
         {
-            // ページが閉じられる直前の URL を取得する（取得できない場合は空文字列にする）
+            // スロットリング: ルート経由でスナップショットが取られた直後なら重複試行を避ける
+            // （CDP は既に無効なため試みても失敗し、不要な警告が出るだけになる）
+            lock (_lock)
+            {
+                if (_stopped) { return; }
+                long now = Environment.TickCount64;
+                if (_lastSnapshotTick.TryGetValue(targetPage, out long lastTick))
+                {
+                    if (now - lastTick < SnapshotThrottleMs) { return; }
+                }
+                _lastSnapshotTick[targetPage] = now;
+            }
+
             string currentUrl;
             try { currentUrl = targetPage.Url; }
             catch (Exception) { currentUrl = ""; }
 
-            // ページ閉鎖直後は CDP コマンドが失敗する可能性があるが、
-            // TakeIntermediateSnapshotAsync が内部で try-catch しているため安全
             var snapTask = TakeIntermediateSnapshotAsync(targetPage, currentUrl);
             lock (_lock)
             {
                 // タスク開始後に _stopped になった場合は追加しない（孤立タスクは CDP try-catch で保護済み）
+                // reqHandler と同じパターン — _stopped 後の CDP エラーは内部で警告ログに変換される
                 if (_stopped) { return; }
                 _snapTasks.Add(snapTask);
             }
@@ -215,7 +330,8 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
         lock (_lock)
         {
             _cdpSessions.TryGetValue(targetPage, out cdp);
-            tabIndex = _trackedPages.IndexOf(targetPage);
+            // _tabIndices は SetupPageAsync で O(1) で登録済み（_trackedPages.IndexOf より高速）
+            if (!_tabIndices.TryGetValue(targetPage, out tabIndex)) { tabIndex = -1; }
         }
         if (cdp == null) { return; }
 
@@ -413,6 +529,61 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
     }
 
     /// <summary>
+    /// ページが閉じられる直前に呼ぶ。スナップショットを取得してから close イベントハンドラを解除する。
+    /// ActionRunner の "close" アクションから呼ばれることを想定している。
+    /// （page.Close イベントは CDP セッション無効化後に発火するため、イベント内でのスナップショットは失敗する。
+    ///   そのためアクション実行中に明示的に呼ぶ必要がある）
+    /// </summary>
+    /// <param name="targetPage">閉じられようとしているページ</param>
+    public async Task BeforePageCloseAsync(IPage targetPage)
+    {
+        // StopAsync 完了後に呼ばれた場合は解放済み CDP セッションへの無用な試行を避けて早期リターンする
+        lock (_lock)
+        {
+            if (_stopped) { return; }
+        }
+
+        // close イベントハンドラを解除する（ページ閉鎖後に二重スナップショットを試みてエラーになるのを防ぐ）
+        EventHandler<IPage>? closeHandler;
+        lock (_lock)
+        {
+            _closeHandlers.TryGetValue(targetPage, out closeHandler);
+            _closeHandlers.Remove(targetPage);
+        }
+        if (closeHandler != null)
+        {
+            targetPage.Close -= closeHandler;
+        }
+
+        // CDP セッションがまだ有効なうちにスナップショットを取得する
+        string currentUrl;
+        try { currentUrl = targetPage.Url; }
+        catch (Exception) { currentUrl = ""; }
+
+        // スナップショットタスクを _snapTasks に登録してから await する。
+        // StopAsync は _snapTasks をドレインしてから _scriptCache を読み出すため、
+        // 登録しないと並走する StopAsync がスナップショット書き込み前に allScripts を返し
+        // 閉じたタブのカバレッジデータが欠落する可能性がある。
+        var snapTask = TakeIntermediateSnapshotAsync(targetPage, currentUrl);
+        bool shouldAwait;
+        lock (_lock)
+        {
+            // lock 内で _stopped を再確認する（先頭チェック後に StopAsync が完了した場合の TOCTOU 対策）
+            if (!_stopped)
+            {
+                _snapTasks.Add(snapTask);
+                shouldAwait = true;
+            }
+            else
+            {
+                // _stopped が true の場合は解放済み CDP セッションへの await を避ける
+                shouldAwait = false;
+            }
+        }
+        if (shouldAwait) { await snapTask; }
+    }
+
+    /// <summary>
     /// カバレッジ収集を停止してデータを返す。
     /// 中間スナップショットのデータと最終収集のデータを合わせて返す。
     /// </summary>
@@ -485,6 +656,18 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
             p.Close -= handler;
         }
 
+        // window.close() 用ルートハンドラを解除する（StopAsync 後の fetch インターセプトを防ぐ）
+        List<IPage> routePages;
+        lock (_lock) { routePages = new List<IPage>(_trackedPages); }
+        foreach (var routePage in routePages)
+        {
+            if (!routePage.IsClosed)
+            {
+                try { await routePage.UnrouteAsync(BeforeCloseRouteUrl); }
+                catch (Exception ex) { Console.Error.WriteLine($"[Warning] StopAsync: UnrouteAsync failed: {ex.Message}"); }
+            }
+        }
+
         // 追跡ページがない場合は空リストを返す（setupTasks 待機後は trackedPages が安定している）
         int trackedCount;
         lock (_lock)
@@ -524,12 +707,23 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
         for (int i = 0; i < pageSnapshot.Count; i++)
         {
             var targetPage = pageSnapshot[i];
+
+            // ページが既に閉じられている場合、CDP セッションは無効なので最終収集をスキップする。
+            // BeforePageCloseAsync でスナップショット済みのため、キャッシュ内のデータを使う。
+            if (targetPage.IsClosed)
+            {
+                continue;
+            }
+
             // StopAsync 時点の URL を最終ページ URL として使用する
             // ページが既に閉じられている場合 page.Url が例外を投げることがあるため try-catch で保護する
             string pageUrl;
             try { pageUrl = targetPage.Url; }
             catch (Exception) { pageUrl = ""; }
-            var pageInfo = new PageInfo(i, pageUrl);
+            // _tabIndices から O(1) でタブ番号を取得する（フォールバックとしてループ添字 i を使う）
+            int tabIdx;
+            lock (_lock) { if (!_tabIndices.TryGetValue(targetPage, out tabIdx)) { tabIdx = i; } }
+            var pageInfo = new PageInfo(tabIdx, pageUrl);
 
             ICDPSession? cdp;
             Dictionary<string, ScriptCoverage>? scriptCache;
@@ -679,6 +873,18 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
             p.Close -= handler;
         }
 
+        // window.close() 用ルートハンドラを解除する（DisposeAsync 後の fetch インターセプトを防ぐ）
+        List<IPage> disposeRoutePages;
+        lock (_lock) { disposeRoutePages = new List<IPage>(_trackedPages); }
+        foreach (var routePage in disposeRoutePages)
+        {
+            if (!routePage.IsClosed)
+            {
+                try { await routePage.UnrouteAsync(BeforeCloseRouteUrl); }
+                catch (Exception ex) { Console.Error.WriteLine($"[Warning] DisposeAsync: UnrouteAsync failed: {ex.Message}"); }
+            }
+        }
+
         // インフライトのスナップショットタスクが完了するまでループ待機してから CDP セッションを解放する
         // （解放済みセッションをスナップショットタスクが使用しないようにするための保護）
         // リクエストハンドラ解除直前に発火した reqHandler が _snapTasks.Add を呼ぶまでの
@@ -701,13 +907,22 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
 
         // すべての CDP セッションを解放する
         // StopAsync を経由せず Dispose された場合は Profiler / Debugger を明示的に停止する
-        List<ICDPSession> sessions;
+        List<(IPage p, ICDPSession cdp)> sessionPairs;
         lock (_lock)
         {
-            sessions = new List<ICDPSession>(_cdpSessions.Values);
+            sessionPairs = [];
+            foreach (var kv in _cdpSessions)
+            {
+                sessionPairs.Add((kv.Key, kv.Value));
+            }
         }
-        foreach (var cdp in sessions)
+        foreach (var (targetPage, cdp) in sessionPairs)
         {
+            // ページが既に閉じられている場合は CDP セッションも無効なので解放をスキップする
+            if (targetPage.IsClosed)
+            {
+                continue;
+            }
             // StopAsync を経ていない場合は Profiler / Debugger が enable のまま残っている
             // 安全に停止を試みる（失敗しても Dispose は続行する）
             if (needsCleanup)
@@ -716,7 +931,6 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
                 try { await cdp.SendAsync("Profiler.disable"); } catch (Exception ex) { Console.Error.WriteLine($"[Warning] DisposeAsync: Profiler.disable failed: {ex.Message}"); }
                 try { await cdp.SendAsync("Debugger.disable"); } catch (Exception ex) { Console.Error.WriteLine($"[Warning] DisposeAsync: Debugger.disable failed: {ex.Message}"); }
             }
-            // ページが既に閉じられている場合 DisposeAsync が例外を投げることがあるため保護する
             try { await cdp.DisposeAsync(); }
             catch (Exception ex) { Console.Error.WriteLine($"[Warning] DisposeAsync: CDPSession.DisposeAsync failed: {ex.Message}"); }
         }

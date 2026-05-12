@@ -819,4 +819,34 @@ public class CoverageCollectorTests
         // 大文字フィルターでも小文字 URL がマッチして結果に含まれること
         Assert.Contains(scripts, s => s.Url.Contains("app.js"));
     }
+
+    /// <summary>
+    /// BeforePageCloseAsync と StopAsync を同時に呼び出しても、
+    /// デッドロック・例外なしで両方が完了することを確認する（並行呼び出しの安全性）。
+    /// </summary>
+    [Fact]
+    public async Task BeforePageCloseAsync_ConcurrentWithStopAsync_NeitherThrows()
+    {
+        using var playwright = await Playwright.CreateAsync();
+        await using var browser = await playwright.Chromium.LaunchAsync();
+        var page = await browser.NewPageAsync();
+
+        await using var collector = new CoverageCollector(page);
+        await collector.StartAsync([], []);
+
+        // BeforePageCloseAsync と StopAsync を同時に発火させてレース条件を作る
+        // どちらが先に完了しても例外が発生しないことを確認する
+        var task1 = collector.BeforePageCloseAsync(page);
+        var task2 = collector.StopAsync();
+
+        // 両方のタスクが完了するまで待つ（タイムアウト 10 秒でデッドロック検出）
+        var all = Task.WhenAll(task1, task2);
+        var completed = await Task.WhenAny(all, Task.Delay(10_000));
+
+        // タイムアウトなしで完了したこと（デッドロックなし）
+        Assert.Same(all, completed);
+        // 例外が発生していないこと
+        var ex = await Record.ExceptionAsync(() => all);
+        Assert.Null(ex);
+    }
 }

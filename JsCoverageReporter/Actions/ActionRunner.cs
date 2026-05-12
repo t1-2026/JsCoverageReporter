@@ -16,7 +16,7 @@ internal static class ActionRunner
     /// <param name="actions">実行するアクションのコレクション</param>
     /// <param name="timeoutMs">各アクションのタイムアウト（ミリ秒）。null の場合は Playwright のデフォルト（30秒）を使用する</param>
     /// <param name="continueOnError">true にすると、アクションが失敗しても後続のアクションを続行する</param>
-    internal static async Task RunAsync(IPage page, IEnumerable<ScenarioAction> actions, int? timeoutMs = null, bool continueOnError = false)
+    internal static async Task RunAsync(IPage page, IEnumerable<ScenarioAction> actions, int? timeoutMs = null, bool continueOnError = false, Func<IPage, Task>? onBeforeClose = null)
     {
         if (actions == null)
         {
@@ -139,7 +139,9 @@ internal static class ActionRunner
                     int delayMs;
                     if (action.Milliseconds == null)
                     {
-                        // milliseconds が null（未指定）の場合は 0 ミリ秒（待機なし）とする
+                        // milliseconds が未指定の場合は警告して 0 ミリ秒（待機なし）とする
+                        // ユーザーが意図せず何も待機しないシナリオを設定してしまうのを防ぐための警告
+                        Console.Error.WriteLine("[Warning] 'wait' action missing 'milliseconds' — waiting 0ms (no-op).");
                         delayMs = 0;
                     }
                     else
@@ -213,6 +215,40 @@ internal static class ActionRunner
                     await page.DblClickAsync(action.Selector, new PageDblClickOptions { Timeout = timeoutMs });
                     break;
 
+                // タブ（ページ）を閉じる
+                // 注意: page は RunAsync に渡された初期ページであり、新規タブ（window.open 等）は閉じられない
+                case "close":
+                {
+                    // 閉じる前にコールバックを呼ぶ（カバレッジスナップショット取得などに使う）
+                    // page.Close イベントは CDP セッション無効化後に発火するため、
+                    // 閉じる前にスナップショットを取る必要がある
+                    // コールバックが例外をスローしても CloseAsync は必ず呼ぶ（ページを開いたまま放置しない）
+                    Exception? callbackException = null;
+                    if (onBeforeClose != null)
+                    {
+                        try
+                        {
+                            await onBeforeClose(page);
+                        }
+                        catch (Exception cbEx)
+                        {
+                            // コールバック例外を保存して CloseAsync を続行する。
+                            // CloseAsync 後に再スローすることで外側の continueOnError ハンドラーに委ねる。
+                            callbackException = cbEx;
+                            Console.Error.WriteLine($"[Warning] 'close' action: onBeforeClose failed: {cbEx.Message}");
+                        }
+                    }
+                    await page.CloseAsync();
+                    // ページが閉じられたため後続のアクションはすべて実行不可能。
+                    // 直ちに返して残りのアクションをスキップする（continueOnError でも同様）。
+                    // コールバック例外があれば再スローして外側の continueOnError ハンドラーに処理させる。
+                    if (callbackException != null)
+                    {
+                        throw callbackException;
+                    }
+                    return;
+                }
+
                 // 要素またはページをスクロールする
                 case "scroll":
                     // selector がない場合は x/y のデルタ量だけページをホイールスクロールする
@@ -252,7 +288,9 @@ internal static class ActionRunner
                 // 未知のアクション種別はスキップして警告する
                 default:
                     string actionTypeLabel;
-                    if (action.Type == null) { actionTypeLabel = "(null)"; } else { actionTypeLabel = action.Type; }
+                    if (action.Type == null) { actionTypeLabel = "(null)"; }
+                    else if (action.Type == "") { actionTypeLabel = "(missing)"; }
+                    else { actionTypeLabel = action.Type; }
                     Console.Error.WriteLine($"[Warning] Unknown action type '{actionTypeLabel}' — skipping.");
                     break;
             }

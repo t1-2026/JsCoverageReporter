@@ -233,6 +233,41 @@ public class ActionRunnerTests
         Assert.True(true);
     }
 
+    /// <summary>
+    /// "wait" アクションで milliseconds を省略（null）した場合、
+    /// 警告メッセージが標準エラーに出力されることを確認する（#13 修正）。
+    /// 修正前は無言で 0ms 待機（ノーオプ）になっていてユーザーが気づけなかった。
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_WaitAction_NullMilliseconds_WarningEmitted()
+    {
+        using var playwright = await Playwright.CreateAsync();
+        await using var browser = await playwright.Chromium.LaunchAsync();
+        var page = await browser.NewPageAsync();
+
+        var actions = new List<ScenarioAction>
+        {
+            // milliseconds を指定しない（null）→ 0ms 待機になるが警告が出るべき
+            new ScenarioAction { Type = "wait" }
+        };
+
+        var captured = new System.IO.StringWriter();
+        var originalErr = Console.Error;
+        Console.SetError(captured);
+        try
+        {
+            await ActionRunner.RunAsync(page, actions, timeoutMs: 5000, continueOnError: false);
+        }
+        finally
+        {
+            Console.SetError(originalErr);
+        }
+
+        // "wait" アクションで milliseconds が未指定の旨の警告が出ること
+        Assert.Contains("[Warning]", captured.ToString());
+        Assert.Contains("wait", captured.ToString());
+    }
+
     [Fact]
     public async Task RunAsync_NullActions_DoesNotThrow()
     {
@@ -582,5 +617,192 @@ public class ActionRunnerTests
 
         // wait のタイムアウトは TaskCanceledException を TimeoutException にラップして投げる
         Assert.IsType<TimeoutException>(ex);
+    }
+
+    /// <summary>
+    /// "close" アクション実行後にページが閉じられていることを確認する。
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_CloseAction_ClosesPage()
+    {
+        using var playwright = await Playwright.CreateAsync();
+        await using var browser = await playwright.Chromium.LaunchAsync();
+        var page = await browser.NewPageAsync();
+
+        // 最初はページが開いていることを確認する
+        Assert.False(page.IsClosed);
+
+        var actions = new List<ScenarioAction>
+        {
+            new ScenarioAction { Type = "close" }
+        };
+
+        // Act
+        await ActionRunner.RunAsync(page, actions, timeoutMs: 5000, continueOnError: false);
+
+        // close アクション後はページが閉じているはず
+        Assert.True(page.IsClosed);
+    }
+
+    /// <summary>
+    /// "close" アクションの後に続くアクションは実行されないことを確認する。
+    /// 修正前は continueOnError=false の場合でも TargetClosedError が発生していたが、
+    /// return で抜けるようになったため例外なく完走する。
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_CloseAction_SubsequentActionsAreSkipped()
+    {
+        using var playwright = await Playwright.CreateAsync();
+        await using var browser = await playwright.Chromium.LaunchAsync();
+        var page = await browser.NewPageAsync();
+
+        // "close" の後に存在しないセレクターへのクリックを追加する。
+        // 修正前: page が閉じた後も click を試みて TargetClosedError がスローされていた。
+        // 修正後: close で return するため後続アクションはスキップされ例外が出ない。
+        var actions = new List<ScenarioAction>
+        {
+            new ScenarioAction { Type = "close" },
+            new ScenarioAction { Type = "click", Selector = "#nonexistent" }
+        };
+
+        // continueOnError = false のまま例外なく完走するはず
+        var ex = await Record.ExceptionAsync(
+            () => ActionRunner.RunAsync(page, actions, timeoutMs: 5000, continueOnError: false));
+
+        Assert.Null(ex);
+        // close が実行されてページは閉じているはず
+        Assert.True(page.IsClosed);
+    }
+
+    /// <summary>
+    /// "close" アクション実行前に onBeforeClose コールバックが呼ばれることを確認する。
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_CloseAction_CallsOnBeforeCloseBeforeClosing()
+    {
+        using var playwright = await Playwright.CreateAsync();
+        await using var browser = await playwright.Chromium.LaunchAsync();
+        var page = await browser.NewPageAsync();
+
+        bool callbackCalled = false;
+        bool pageWasOpenDuringCallback = false;
+
+        // onBeforeClose: コールバック呼び出し時にページがまだ開いているかを記録する
+        Func<IPage, Task> onBeforeClose = p =>
+        {
+            callbackCalled = true;
+            pageWasOpenDuringCallback = !p.IsClosed;
+            return Task.CompletedTask;
+        };
+
+        var actions = new List<ScenarioAction>
+        {
+            new ScenarioAction { Type = "close" }
+        };
+
+        await ActionRunner.RunAsync(page, actions, timeoutMs: 5000, continueOnError: false,
+            onBeforeClose: onBeforeClose);
+
+        // コールバックが呼ばれていること
+        Assert.True(callbackCalled);
+        // コールバック呼び出し時はページがまだ開いていること（close より前に呼ばれる）
+        Assert.True(pageWasOpenDuringCallback);
+        // コールバック後にページが閉じていること
+        Assert.True(page.IsClosed);
+    }
+
+    /// <summary>
+    /// "close" アクションで onBeforeClose コールバックが例外をスローした場合の動作確認。
+    /// continueOnError = true のときは例外が握りつぶされ、ページは閉じられないまま続行される。
+    /// continueOnError = false のときは例外が再スローされる。
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_CloseAction_OnBeforeCloseThrows_ContinueOnError_SwallowsException()
+    {
+        using var playwright = await Playwright.CreateAsync();
+        await using var browser = await playwright.Chromium.LaunchAsync();
+        var page = await browser.NewPageAsync();
+
+        // onBeforeClose が例外をスローするコールバック
+        Func<IPage, Task> onBeforeClose = _ => throw new InvalidOperationException("スナップショット失敗");
+
+        var actions = new List<ScenarioAction>
+        {
+            new ScenarioAction { Type = "close" }
+        };
+
+        // continueOnError = true のとき: 例外が握りつぶされて完走するはず
+        // onBeforeClose が失敗しても CloseAsync は必ず呼ばれるためページは閉じられる
+        var ex = await Record.ExceptionAsync(
+            () => ActionRunner.RunAsync(page, actions, timeoutMs: 5000, continueOnError: true,
+                onBeforeClose: onBeforeClose));
+
+        Assert.Null(ex);
+        // onBeforeClose が throw しても CloseAsync は必ず呼ばれるため、ページは閉じている
+        Assert.True(page.IsClosed);
+    }
+
+    /// <summary>
+    /// "close" アクションで onBeforeClose が例外をスローした場合、
+    /// continueOnError = false でも CloseAsync が必ず呼ばれてページが閉じられることを確認する。
+    /// onBeforeClose の例外は CloseAsync より優先されてはならない。
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_CloseAction_OnBeforeCloseThrows_ContinueOnErrorFalse_PageIsStillClosed()
+    {
+        using var playwright = await Playwright.CreateAsync();
+        await using var browser = await playwright.Chromium.LaunchAsync();
+        var page = await browser.NewPageAsync();
+
+        // onBeforeClose が例外をスローするコールバック
+        Func<IPage, Task> onBeforeClose = _ => throw new InvalidOperationException("スナップショット失敗");
+
+        var actions = new List<ScenarioAction>
+        {
+            new ScenarioAction { Type = "close" }
+        };
+
+        // continueOnError = false のとき: 例外が再スローされる（RunAsync が throw する）
+        // ただし CloseAsync は例外前に呼ばれるためページは閉じている
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ActionRunner.RunAsync(page, actions, timeoutMs: 5000, continueOnError: false,
+                onBeforeClose: onBeforeClose));
+
+        // 例外がスローされた後もページは閉じていること
+        Assert.True(page.IsClosed);
+    }
+
+    /// <summary>
+    /// action.Type が空文字 "" の場合、警告メッセージ中に "(missing)" が含まれることを確認する（#18 修正）。
+    /// 修正前は action.Type がそのまま使われるため '' が表示され、ユーザーが原因を把握しにくかった。
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_ActionTypeIsEmpty_ShowsMissingLabelInWarning()
+    {
+        using var playwright = await Playwright.CreateAsync();
+        await using var browser = await playwright.Chromium.LaunchAsync();
+        var page = await browser.NewPageAsync();
+
+        var actions = new List<ScenarioAction>
+        {
+            // Type が空文字 → default ケースで "(missing)" と表示されてスキップされるはず
+            new ScenarioAction { Type = "" }
+        };
+
+        // 標準エラー出力をキャプチャして警告メッセージを確認する
+        var captured = new System.IO.StringWriter();
+        var originalErr = Console.Error;
+        Console.SetError(captured);
+        try
+        {
+            await ActionRunner.RunAsync(page, actions, timeoutMs: 5000);
+        }
+        finally
+        {
+            Console.SetError(originalErr);
+        }
+
+        // "(missing)" がメッセージに含まれることを確認する
+        Assert.Contains("(missing)", captured.ToString());
     }
 }

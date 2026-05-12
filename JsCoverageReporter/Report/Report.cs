@@ -642,7 +642,7 @@ internal static class CoverageParser
         // 次の文字が { であり、かつカバレッジデータにない場合のみ処理する
         if (afterParens >= len || source[afterParens] != '{' || map[identStart] != -1)
         {
-            return identStart + 1;
+            return identEnd;
         }
 
         // 対応する } を探す（FindMatchingBrace は } の直後のインデックスを返す）
@@ -650,7 +650,7 @@ internal static class CoverageParser
         if (braceEnd <= afterParens)
         {
             // 対応する } が見つからなかった場合は何もしない
-            return identStart + 1;
+            return identEnd;
         }
 
         // FindMatchingBrace は } の次の位置を返すため、} 自体は braceEnd - 1
@@ -813,6 +813,45 @@ internal static class CoverageParser
     }
 
     /// <summary>
+    /// SkipTemplateLiteralFull の ${ } 深さカウントループ専用の正規表現開始判定。
+    /// IsRegexStart は SkipWhitespaceAndCommentsBackward を呼ぶため、
+    /// SkipTemplateLiteralFull → IsRegexStart → SkipWhitespaceAndCommentsBackward → SkipTemplateLiteralFull
+    /// という相互再帰でスタックオーバーフローが起きる。
+    /// このヘルパーは空白のみをスキップして前の文字またはキーワードで判定し、再帰しない。
+    /// コメントをスキップしないためコメント直後の / を誤判定する場合があるが、
+    /// テンプレートリテラル補間内の実用コードでは影響が極めて少ない。
+    /// </summary>
+    /// <param name="source">ソースコード全文</param>
+    /// <param name="pos">'/' のインデックス</param>
+    /// <returns>正規表現リテラルの開始なら true</returns>
+    private static bool IsRegexStartInsideTemplate(string source, int pos)
+    {
+        // pos の直前の空白・タブ・改行をスキップする（コメントはスキップしない。スキップすると再帰が起きる）
+        int i = pos - 1;
+        while (i >= 0 && char.IsWhiteSpace(source[i])) { i--; }
+        // ファイル先頭または式の先頭なら正規表現
+        if (i < 0) { return true; }
+        char p = source[i];
+        // 閉じ括弧・閉じ角括弧・テンプレートリテラル閉じ の後は除算演算子（式の末尾）
+        if (p == ')' || p == ']' || p == '`') { return false; }
+        // 後置インクリメント/デクリメント の直後の / は除算
+        if (p == '+' && i > 0 && source[i - 1] == '+') { return false; }
+        if (p == '-' && i > 0 && source[i - 1] == '-') { return false; }
+        // 識別子文字末尾の後はキーワードかどうかで判定する
+        if (IsIdentifierChar(p))
+        {
+            // 識別子全体を取り出す（数字で始まる場合はリテラル → 除算）
+            int wordEnd = i;
+            while (i >= 0 && IsIdentifierChar(source[i])) { i--; }
+            string word = source.Substring(i + 1, wordEnd - i);
+            // 正規表現の前に来るキーワードの後は正規表現（例: return /regex/ / typeof /regex/）
+            return RegexPrecedingKeywords.Contains(word);
+        }
+        // 演算子・区切り文字の後は正規表現
+        return true;
+    }
+
+    /// <summary>
     /// 単一引用符の文字列 '...' をスキップして閉じ ' の直後の位置を返す。
     /// バックスラッシュによるエスケープを考慮する。
     /// </summary>
@@ -904,6 +943,11 @@ internal static class CoverageParser
                     if (t == '"')  { i = SkipDoubleQuotedString(source, i); continue; }
                     // ネストされたテンプレートリテラルを再帰的にスキップする
                     if (t == '`')  { i = SkipTemplateLiteralFull(source, i); continue; }
+                    // 正規表現リテラルをスキップする（/}/ のような正規表現内の } が深さカウントを狂わせないようにする）
+                    // IsRegexStart は SkipWhitespaceAndCommentsBackward を呼ぶため
+                    // SkipTemplateLiteralFull → IsRegexStart → SkipWhitespaceAndCommentsBackward → SkipTemplateLiteralFull
+                    // の相互再帰によるスタックオーバーフローを防ぐため、専用の簡易判定ヘルパーを使う。
+                    if (t == '/' && IsRegexStartInsideTemplate(source, i)) { i = SkipRegexLiteral(source, i); continue; }
                     // { で深さが増える、} で深さが減る
                     if (t == '{') { depth++; }
                     else if (t == '}')
@@ -1002,6 +1046,8 @@ internal static class CoverageParser
                 // ブロックコメントをスキップする（コメント内の ( ) が深さカウントに影響しないようにする）
                 i += 2;
                 while (i + 1 < len && !(source[i] == '*' && source[i + 1] == '/')) { i++; }
+                // i は * の位置。i++ で / の位置に進め、ループ末尾の i++ で / の次へ進む。
+                // ここで continue しないのは意図的：continue すると / が次イテレーションで再処理されるため。
                 i++; // '*' をスキップする（直後の '/' は外側の i++ で処理される）
             }
             else if (c == '/' && IsRegexStart(source, i))
@@ -1045,6 +1091,7 @@ internal static class CoverageParser
                 // ブロックコメントをスキップする（コメント内の ] が深さカウントに影響しないようにする）
                 i += 2;
                 while (i + 1 < len && !(source[i] == '*' && source[i + 1] == '/')) { i++; }
+                // i は * の位置。i++ で / の位置に進め、ループ末尾の i++ で / の次へ進む（SkipBalancedParens と同じ意図）。
                 i++; // '*' をスキップする（直後の '/' は外側の i++ で処理される）
             }
             else if (c == '/' && IsRegexStart(source, i))
@@ -1270,6 +1317,15 @@ internal static class CoverageParser
                         k = SkipTemplateLiteralFull(source, k);
                         continue;
                     }
+                    // ブロックコメント終端 */ をスキップする。
+                    // 前行から続く /* */ が現在行の先頭付近で閉じる場合、
+                    // この * をスキップしないと直後の / を IsRegexStart が正規表現開始と誤判定し、
+                    // 後続の // 行コメントを検出できなくなる。
+                    if (kc == '*' && k + 1 < source.Length && source[k + 1] == '/')
+                    {
+                        k += 2; // */ の2文字をスキップする
+                        continue;
+                    }
                     // ブロックコメント /* */ をスキップする（コメント内の // を行コメントと誤判定しないようにする）
                     if (kc == '/' && k + 1 < source.Length && source[k + 1] == '*')
                     {
@@ -1279,7 +1335,9 @@ internal static class CoverageParser
                         continue;
                     }
                     // 正規表現リテラルをスキップする（/\/\// のような正規表現内の // を行コメントと誤判定しないようにする）
-                    if (kc == '/' && IsRegexStart(source, k))
+                    // IsRegexStart は SkipWhitespaceAndCommentsBackward を呼ぶため相互再帰になる。
+                    // IsRegexStartInsideTemplate はコメントをスキップしない非再帰版なので O(N) で完了する。
+                    if (kc == '/' && IsRegexStartInsideTemplate(source, k))
                     {
                         k = SkipRegexLiteral(source, k);
                         continue;
@@ -1452,13 +1510,14 @@ internal class HtmlReportGenerator
             // 行内の各文字を順番に処理する
             for (int i = 0; i < rawLine.Length; i++)
             {
-                // \r（CRLF 改行の CR 部分）はカバレッジカウントに含めない（オフセット値には含まれるので idx の計算に影鈷しない）。
+                // \r（CRLF 改行の CR 部分）はカバレッジカウントに含めない。
+                // ただし offset は rawLine.Length + 1 でまとめて加算されるため \r 分も正しく進む。
                 // \0（ヌル文字）は理論上 JS ソースに含まれる可能性があるが、
                 // HTML 出力時にブラウザが無視するため表示上の問題がなく、カバレッジカウントに含めない。
                 char chSkip = rawLine[i];
                 if (chSkip == '\r' || chSkip == '\0')
                 {
-                    // offset は進めない（後で offset += rawLine.Length + 1 でまとめて加算する）
+                    // カバレッジカウントと HTML 出力をスキップするが offset はループ末尾で加算済み
                     continue;
                 }
 
@@ -1667,7 +1726,12 @@ internal class HtmlReportGenerator
             // 1行しかないスクリプトはレポート対象外としてスキップする
             // （インライン eval や最小化された1行スクリプトなど、有意な情報が得られないため）
             // i はインクリメントしない → スキップしてもファイル番号に欠番が生じない
-            if (mergedLines.Count <= 1) { continue; }
+            if (mergedLines.Count <= 1)
+            {
+                // スキップ理由をユーザーが把握できるよう警告を出す
+                Console.Error.WriteLine($"[Warning] Skipping 1-line script (no coverage info): {scriptUrl}");
+                continue;
+            }
 
             // 合成ページのファイル名（全タブの OR 合成カバレッジを表示する）
             var mergedFilename = $"script-{i}.html";

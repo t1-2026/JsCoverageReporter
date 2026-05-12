@@ -390,4 +390,76 @@ public class ConfigTests
         Assert.NotNull(config.ScriptExcludes);
         Assert.Empty(config.ScriptExcludes);
     }
+
+    // -----------------------------------------------------------------------
+    // FindUnknownProperties — 不明フィールド検出のテスト（#7 修正）
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// scriptFilters を "scriptfilter"（'s' 欠落）と書き間違えた場合、
+    /// FindUnknownProperties が "scriptfilter" を返すことを確認する。
+    /// </summary>
+    [Fact]
+    public void FindUnknownProperties_TypoField_ReturnsFieldName()
+    {
+        // scriptFilters → scriptfilter（タイポ）: デシリアライズでは無視されるが警告対象
+        string json = """{"url": "https://example.com", "scriptfilter": ["app.js"]}""";
+
+        var unknowns = ScenarioConfig.FindUnknownProperties(json);
+
+        Assert.Contains("scriptfilter", unknowns);
+    }
+
+    /// <summary>
+    /// すべての既知フィールドを正しいスペルで指定した場合、
+    /// FindUnknownProperties が空リストを返すことを確認する。
+    /// </summary>
+    [Fact]
+    public void FindUnknownProperties_AllKnownFields_ReturnsEmpty()
+    {
+        // 全既知フィールドを指定（PropertyNameCaseInsensitive=true を踏まえ大文字混在でも OK）
+        string json = """
+            {
+                "url": "https://example.com",
+                "scriptFilters": ["app.js"],
+                "scriptExcludes": ["pptr:"],
+                "timeoutMs": 5000,
+                "continueOnError": false,
+                "actions": []
+            }
+            """;
+
+        var unknowns = ScenarioConfig.FindUnknownProperties(json);
+
+        Assert.Empty(unknowns);
+    }
+
+    /// <summary>
+    /// 大文字小文字の違いは「不明フィールド」として扱わないことを確認する。
+    /// PropertyNameCaseInsensitive=true と同じルールを FindUnknownProperties でも適用する。
+    /// </summary>
+    [Fact]
+    public void FindUnknownProperties_CaseDifferentField_ReturnsEmpty()
+    {
+        // "URL" は "url" と同じフィールドとみなす（case-insensitive）
+        string json = """{"URL": "https://example.com", "TimeoutMs": 3000}""";
+
+        var unknowns = ScenarioConfig.FindUnknownProperties(json);
+
+        Assert.Empty(unknowns);
+    }
+
+    /// <summary>
+    /// 完全に無関係なフィールド名が複数ある場合、すべてが返されることを確認する。
+    /// </summary>
+    [Fact]
+    public void FindUnknownProperties_MultipleUnknownFields_AllReturned()
+    {
+        string json = """{"url": "https://example.com", "foo": 1, "bar": 2}""";
+
+        var unknowns = ScenarioConfig.FindUnknownProperties(json);
+
+        Assert.Contains("foo", unknowns);
+        Assert.Contains("bar", unknowns);
+    }
 }

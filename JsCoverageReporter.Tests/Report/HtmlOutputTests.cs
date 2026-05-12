@@ -2211,6 +2211,34 @@ public class GenerateTests : IDisposable
         Assert.False(File.Exists(Path.Combine(scriptsDir, "script-1.html")),
             "script-1.html が不正に生成されている（番号がずれていた）");
     }
+
+    /// <summary>
+    /// 1行スクリプトがスキップされる際に、警告メッセージが標準エラーに出力されることを確認する（M5 修正）。
+    /// 修正前はサイレントスキップで、ユーザーがスクリプトが表示されない理由を調べられなかった。
+    /// </summary>
+    [Fact]
+    public void Generate_SingleLineScript_WarningEmittedToStderr()
+    {
+        var singleLine = MakeScript(0, "http://example.com/", "http://example.com/inline.js",
+            "var x = 1;", covered: 0); // 改行なし → 1行 → スキップされる
+
+        var captured = new System.IO.StringWriter();
+        var originalErr = Console.Error;
+        Console.SetError(captured);
+        try
+        {
+            new HtmlReportGenerator().Generate([singleLine], _outputDir);
+        }
+        finally
+        {
+            Console.SetError(originalErr);
+        }
+
+        // スキップされた旨の警告が stderr に出力されること
+        string output = captured.ToString();
+        Assert.Contains("[Warning]", output);
+        Assert.Contains("inline.js", output);
+    }
 }
 
 // -----------------------------------------------------------------------

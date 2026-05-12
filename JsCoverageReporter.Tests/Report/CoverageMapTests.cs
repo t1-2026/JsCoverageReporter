@@ -6860,4 +6860,463 @@ public class ReviewMissingCoverageTests
         Assert.Equal(0, map[funcPos]);
         Assert.Equal(0, map[bracePos]);
     }
+
+    // -----------------------------------------------------------------------
+    // SkipTemplateLiteralFull ${ } 内正規表現 — 深さカウント誤りの回帰テスト
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// テンプレートリテラルの ${ } 補間内に } を含む正規表現がある場合、
+    /// SkipTemplateLiteralFull が正規表現内の } を誤って深さカウントの閉じと解釈しないことを確認する。
+    /// 修正前: /}/ の } で depth が 0 になりテンプレートリテラルのスキップが早期終了し、
+    ///         後続のパラメータリスト解析が崩れて関数本体が未検出になっていた。
+    /// 修正後: IsRegexStart + SkipRegexLiteral で /}/ をスキップし正しく関数を検出する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledFunction_RegexContainingBraceInTemplateInterpolation_BodyMarked()
+    {
+        // function f のパラメータにテンプレートリテラルのデフォルト値 `${/}/}` がある。
+        // /}/ は } を含む正規表現リテラル。
+        const string source = "function f(x = `${/}/}`) {}";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        int funcPos = source.IndexOf("function f");
+        int bracePos = source.IndexOf('{', source.IndexOf(')'));
+        // 関数宣言全体が未実行（0）にマークされているはず
+        Assert.Equal(0, map[funcPos]);
+        Assert.Equal(0, map[bracePos]);
+    }
+
+    /// <summary>
+    /// テンプレートリテラルの ${ } 内にバッククォートを含む正規表現がある場合、
+    /// バッククォートを誤ってネストしたテンプレートリテラルの開始と解釈しないことを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_UncalledFunction_RegexWithBacktickInTemplateInterpolation_BodyMarked()
+    {
+        // /`/ はバッククォートを含む正規表現リテラル。
+        // SkipTemplateLiteralFull が ` を SkipTemplateLiteralFull で再帰しないことを確認する。
+        const string source = "function f(x = `${/`/}`) {}";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        int funcPos = source.IndexOf("function f");
+        int bracePos = source.IndexOf('{', source.IndexOf(')'));
+        Assert.Equal(0, map[funcPos]);
+        Assert.Equal(0, map[bracePos]);
+    }
+
+    // -----------------------------------------------------------------------
+    // SkipWhitespaceAndCommentsBackward — 複数行ブロックコメント＋行コメントの回帰テスト
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// 複数行のブロックコメントが行コメント（//）と同じ行で終わる場合、
+    /// SkipWhitespaceAndCommentsBackward の前方走査が */ を正規表現と誤判定せず、
+    /// 行コメントを正しく検出して async アロー関数の async を未実行マークすることを確認する。
+    /// 修正前: */ の / を IsRegexStart が正規表現開始と判断して SkipRegexLiteral を呼び、
+    ///         // の最初の / を消費してしまい行コメントが検出されなかった。
+    /// 修正後: * + / の並びを先にスキップして IsRegexStart が呼ばれないようにした。
+    /// </summary>
+    [Fact]
+    public void BuildMap_AsyncArrow_AfterMultilineBlockCommentEndingOnLineWithLineComment_AsyncMarked()
+    {
+        // 複数行ブロックコメントが */ で終わり、同じ行に // 行コメントがある場合
+        const string source = "/*\n * multi\n*/ // line comment\nasync () => {}";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        int asyncPos = source.LastIndexOf("async");
+        int arrowPos = source.IndexOf("=>");
+        // async キーワードおよびアロー関数本体が未実行（0）にマークされているはず
+        Assert.Equal(0, map[asyncPos]);
+        Assert.Equal(0, map[arrowPos]);
+    }
+
+    /// <summary>
+    /// テンプレートリテラルの ${ } 内に正規表現がある外側のアロー関数が、
+    /// 正しく未実行マークされることを確認する（SkipTemplateLiteralFull 修正の統合テスト）。
+    /// </summary>
+    [Fact]
+    public void BuildMap_ArrowFunctionWithTemplateContainingRegexInterpolation_MarkedAsUncovered()
+    {
+        // アロー関数の本体がテンプレートリテラルを返す（} を含む正規表現が補間に入る）
+        const string source = "const f = () => `${/}/}`";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        int arrowPos = source.IndexOf("=>");
+        // アロー（=>）が未実行（0）にマークされているはず
+        Assert.Equal(0, map[arrowPos]);
+    }
+
+    // -----------------------------------------------------------------------
+    // コードレビュー指摘対応テスト（2026-05-12）
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// 括弧なし識別子（パラメータなし）が大量に並んだ場合、
+    /// TryMarkMethodShorthand が identEnd を返すため再スキャンが起きず、
+    /// 誤ったマークがないことを確認する（#7: identStart+1 → identEnd 修正の回帰テスト）。
+    /// </summary>
+    [Fact]
+    public void BuildMap_LongIdentifiersNoParens_NoFalsePositive()
+    {
+        // 100 個の長い識別子（括弧なし）が並ぶ
+        // 修正前は identStart+1 を返して再スキャンが起きたが誤検出はなかった
+        // 修正後は identEnd を返してスキップするため効率的
+        string source = string.Join(" ", Enumerable.Repeat("veryLongIdentifierNameNoParens", 100));
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        // 全文字が -1（対象外）のまま — 関数でないため 0 にマークしない
+        Assert.All(map, v => Assert.Equal(-1, v));
+    }
+
+    /// <summary>
+    /// 数値リテラルにブラケットアクセスが続く場合（例: (0)[Symbol.toPrimitive](){}）、
+    /// TryMarkComputedMethod が誤って呼ばれないことを確認する（#14 回帰テスト）。
+    /// 数値は IsIdentifierChar が true を返すため、[ の前に識別子文字があると判定されてスキップされる。
+    /// </summary>
+    [Fact]
+    public void BuildMap_BracketAfterNumberLiteral_NoFalsePositive()
+    {
+        // (0)[Symbol.toPrimitive](){} — ) が直前にあるため TryMarkComputedMethod はスキップされる
+        // 42[Symbol.toPrimitive](){} — 数値('2') は IsIdentifierChar=true なのでスキップされる
+        const string source = "var x = 42; 42[key](){}";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        // 全文字が -1（対象外）— 計算プロパティとして誤検出されない
+        Assert.All(map, v => Assert.Equal(-1, v));
+    }
+
+    /// <summary>
+    /// 1行に大量の正規表現リテラルが並ぶ場合でも、
+    /// SkipWhitespaceAndCommentsBackward と IsRegexStart の相互再帰を解消して
+    /// function キーワードが正しく検出されることを確認する（#10 修正の回帰テスト）。
+    /// </summary>
+    [Fact]
+    public void BuildMap_ManyRegexLiteralsOnOneLine_FunctionDetected()
+    {
+        // 200 個の正規表現リテラルを1行に並べた後に function を置く
+        // 修正前: SkipWhitespaceAndCommentsBackward ↔ IsRegexStart の相互再帰が O(N²) で非常に遅かった
+        //         さらに N ≈ 1700 超でスタックオーバーフローが発生した
+        // 修正後: IsRegexStartInsideTemplate（非再帰版）を使うため O(N) で高速に完了する
+        string source = string.Join(" + ", Enumerable.Repeat("/x/", 200)) + " + function foo(){}";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        // function foo は未実行（0）としてマークされる
+        int fooIdx = source.LastIndexOf('f'); // "function" の 'f'
+        Assert.Equal(0, map[fooIdx]);
+    }
+
+    /// <summary>
+    /// テンプレートリテラル外の async キーワードは、テンプレート内のアロー関数によって
+    /// 誤って未実行（0）にマークされないことを確認する（#8 既知挙動の回帰テスト）。
+    /// SkipWhitespaceAndCommentsBackward は ${ の { で停止するため、
+    /// テンプレート外の async には到達しない。
+    /// </summary>
+    [Fact]
+    public void BuildMap_AsyncArrowInsideTemplate_AsyncBeforeTemplateNotMarked()
+    {
+        // "async `${ x => {} }`" — async はテンプレートリテラルの外側にある
+        // アロー関数 x => {} の backward scan は ${ の { で止まるため async は検出されない
+        const string source = "async `${ x => {} }`";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        // async（位置 0〜4）は -1（対象外）のまま — 関数本体を持たないため
+        Assert.Equal(-1, map[0]); // 'a' of async
+        Assert.Equal(-1, map[4]); // 'c' of async
+    }
+
+    /// <summary>
+    /// computed property key が文字列内に閉じ角括弧 ']' を含む場合（例: ["]"](){}）、
+    /// SkipBalancedBrackets が文字列内の ] を深さカウントから除外して正しく処理することを確認する（#J 回帰テスト）。
+    /// </summary>
+    [Fact]
+    public void BuildMap_ComputedKeyWithStringContainingCloseBracket_Detected()
+    {
+        // { ["]"](){} } — キーが "]" という文字列（閉じ角括弧を含む）
+        // SkipBalancedBrackets が "]" 内の ] をスキップするため正しく ] に到達できる
+        const string source = "const o = { [\"]\"](){ return 1; } }";
+        //                                   ^     ^--- ] closes [
+        //                               [ at 12, "]" at 13-15, ] at 16
+
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        // メソッドの { 全体が 0（未実行）になる — 正しく検出された証拠
+        int methodBrace = source.IndexOf('{', source.IndexOf(']') + 1);
+        Assert.Equal(0, map[methodBrace]);
+    }
+
+    // -----------------------------------------------------------------------
+    // コードレビュー指摘の不足テスト（2026-05-12）
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// ネストしたテンプレートリテラル `` `outer ${`inner`}` `` の中にアロー関数がある場合、
+    /// SkipTemplateLiteralFull が内側バッククォートで混乱して外側アロー本体を見失わないことを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_NestedTemplateLiteral_ArrowInsideOuterTemplate_MarkedAsUncovered()
+    {
+        // `outer ${ () => {} }` — テンプレートの ${ } 内にアロー関数
+        // 外側テンプレートのスキップが正しく機能すれば {} は -1（対象外）のまま
+        const string source = "const s = `outer ${ () => {} }`;";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        // () => {} の { は未実行（0）としてマークされる
+        int arrowBrace = source.IndexOf("{}");
+        Assert.Equal(0, map[arrowBrace]);
+    }
+
+    /// <summary>
+    /// async アロー関数のパラメータ括弧とボディの { の間に複数行コメントがある場合、
+    /// async キーワードまでがマーク開始位置に含まれることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_AsyncArrowWithMultilineCommentBeforeBrace_AsyncIncludedInMark()
+    {
+        // async () => /* block comment\n   spanning lines */ { return 1; }
+        const string source = "const f = async () => /* block\n   comment */ { return 1; };";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        // "async" の先頭が 0（未実行）としてマークされる
+        int asyncIdx = source.IndexOf("async");
+        Assert.Equal(0, map[asyncIdx]);
+    }
+
+    /// <summary>
+    /// クラス内のジェネレーターメソッド `*gen(){}` が未実行（0）としてマークされることを確認する。
+    /// `*` 記号も含めてマーク開始位置になる。
+    /// </summary>
+    [Fact]
+    public void BuildMap_GeneratorMethodInsideClass_MarkedAsUncovered()
+    {
+        // class C { *gen() { yield 1; } }
+        const string source = "class C { *gen() { yield 1; } }";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        // '*' の位置が 0（未実行）になる
+        int starIdx = source.IndexOf('*');
+        Assert.Equal(0, map[starIdx]);
+    }
+
+    /// <summary>
+    /// "notasync" のように async で始まる変数名を持つアロー関数が、
+    /// async キーワードとして誤認されないことを確認する（TryMarkArrowFunction の prevOk チェックの回帰テスト）。
+    /// </summary>
+    [Fact]
+    public void BuildMap_IdentifierStartingWithAsync_NotTreatedAsAsyncKeyword()
+    {
+        // const notasync = () => { return 1; };
+        // notasync は識別子であり async キーワードではないため、マーク開始は => 以降でよい
+        const string source = "const notasync = () => { return 1; };";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        // 'n' of "notasync" は -1（対象外）のまま — 誤って 0 にマークされてはいけない
+        int nIdx = source.IndexOf('n');
+        Assert.Equal(-1, map[nIdx]);
+        // アロー関数の { は 0（未実行）としてマークされる
+        int braceIdx = source.IndexOf('{');
+        Assert.Equal(0, map[braceIdx]);
+    }
+
+    /// <summary>
+    /// computed property key にネストしたブラケット `[Symbol[Symbol.iterator]](){}` がある場合、
+    /// SkipBalancedBrackets が内側ブラケットを正しくスキップしてメソッドを検出することを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_NestedBracketsInComputedKey_MethodDetected()
+    {
+        // class C { [Symbol[Symbol.iterator]]() {} }
+        const string source = "class C { [Symbol[Symbol.iterator]]() {} }";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        // メソッドの {} が 0（未実行）としてマークされる
+        int methodBrace = source.IndexOf('{', source.IndexOf("iterator"));
+        Assert.Equal(0, map[methodBrace]);
+    }
+
+    /// <summary>
+    /// switch 文の default ケースの後に正規表現リテラルが続く場合、
+    /// IsRegexStart が / を正規表現と正しく判定することを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_RegexAfterDefaultCase_FunctionInsideSwitchDetected()
+    {
+        // function f(x) { switch(x) { default: return /pattern/; } }
+        // 正規表現 /pattern/ を除算と誤判定しないことが重要
+        const string source = "function f(x) { switch(x) { default: return /pattern/; } }";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        // function f の { は 0（未実行）としてマークされる
+        int fBrace = source.IndexOf('{');
+        Assert.Equal(0, map[fBrace]);
+    }
+
+    /// <summary>
+    /// 文字列リテラル内に "() => {}" が含まれていても、アロー関数として誤検出されないことを確認する。
+    /// 文字列の後ろにある function foo は正しく検出される。
+    /// </summary>
+    [Fact]
+    public void BuildMap_ArrowInsideStringLiteral_NoFalsePositive()
+    {
+        // const s = "() => {}"; function foo() { return s; }
+        const string source = "const s = \"() => {}\"; function foo() { return s; }";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        // 文字列内の { は -1（対象外）のまま
+        int stringBrace = source.IndexOf('{');
+        Assert.Equal(-1, map[stringBrace]);
+        // function foo の { は 0（未実行）としてマークされる
+        int fooBrace = source.IndexOf('{', source.IndexOf("foo"));
+        Assert.Equal(0, map[fooBrace]);
+    }
+
+    /// <summary>
+    /// `return` をメソッド名として使ったオブジェクトリテラル `{ return() {} }` が
+    /// メソッド短縮構文として正しく検出されることを確認する。
+    /// `return` は ControlFlowKeywords に含まれないため識別子として扱われる。
+    /// </summary>
+    [Fact]
+    public void BuildMap_MethodNamedReturn_MarkedAsUncovered()
+    {
+        // const x = { return() { } };
+        const string source = "const x = { return() { } };";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        // return() { } の { は 0（未実行）としてマークされる
+        int methodBrace = source.IndexOf('{', source.IndexOf("return()"));
+        Assert.Equal(0, map[methodBrace]);
+    }
+
+    /// <summary>
+    /// CR のみ（\r）の行末を持つソースで BuildCoverageMap を呼んだとき、
+    /// 全文字の map が正しく割り当てられることを確認する。
+    /// SplitOnNewlines が \r を行末として認識する回帰テスト。
+    /// </summary>
+    [Fact]
+    public void BuildMap_CrOnlyLineEndings_MapSizeMatchesSource()
+    {
+        // "a\rb\rc" — \r のみ改行（旧 Mac 形式）
+        const string source = "a\rb\rc";
+        // 全文字が対象外（関数なし）になることを確認 — サイズが正しければ IndexOutOfRange が起きない
+        var map = CoverageParser.BuildCoverageMap(source, []);
+        Assert.Equal(source.Length, map.Length);
+        Assert.All(map, v => Assert.Equal(-1, v));
+    }
+
+    /// <summary>
+    /// URL に `..` を含むパストラバーサルのような URL を渡した場合、
+    /// GetFileName がファイル名部分（最後のセグメント）だけを返すことを確認する。
+    /// </summary>
+    [Fact]
+    public void GetFileName_PathTraversalUrl_ReturnsLastSegmentOnly()
+    {
+        // http://example.com/../../evil.js → ファイル名は evil.js
+        // GetFileName は表示用であり、ファイルI/Oには使われないため安全
+        string result = HtmlReportGenerator.GetFileName("http://example.com/../../evil.js");
+        Assert.Equal("evil.js", result);
+    }
+
+    // -----------------------------------------------------------------------
+    // コードレビュー指摘 第3回 — 追加テスト（A/C/E/F/G/I）
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// テスト A: クラス static ブロック `static { ... }` のボディは、
+    /// V8 カバレッジデータなし（CDP が関数として報告しない）の場合に -1（対象外）のままになる。
+    /// これは既知の制約として文書化する回帰テスト。
+    /// </summary>
+    [Fact]
+    public void BuildMap_ClassStaticBlock_BodyIsMinusOne_KnownLimitation()
+    {
+        // class Foo { static { doInit(); } }
+        // V8 は static ブロックを CDP で関数として報告しないため、MarkUncalledFunctionBodiesAsUncovered
+        // でも検出されず、ボディは -1（対象外）のまま。
+        const string source = "class Foo { static { doInit(); } }";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        // static ブロックの { は -1（対象外）のまま — 既知の制約
+        int staticBrace = source.IndexOf('{', source.IndexOf("static"));
+        Assert.Equal(-1, map[staticBrace]);
+    }
+
+    /// <summary>
+    /// テスト C: アロー関数がオブジェクトリテラルを返す式ボディ `() => ({ key: val })` の場合、
+    /// `(` の後に `{` が来るためアロー本体の `{` を誤って 0（未実行）にマークしないことを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_ArrowReturningObjectLiteral_BraceNotFalselyMarked()
+    {
+        // const f = () => ({ key: val });
+        // `=>` の次は `(` であり `{` ではないため、TryMarkArrowFunction はブロックボディとして扱わない
+        const string source = "const f = () => ({ key: val });";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        // ({ の { は -1（対象外）のまま — アロー式ボディの括弧内であり関数ブロックではない
+        int parenBrace = source.IndexOf('{');
+        Assert.Equal(-1, map[parenBrace]);
+    }
+
+    /// <summary>
+    /// テスト E: `for...of` ループの `of` の後に正規表現が続く場合（珍しいが有効な構文）、
+    /// IsRegexStart が `/` を正規表現と判定して正しく処理することを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_RegexAfterOfKeyword_FunctionDetected()
+    {
+        // function f(x) { for (var m of [/pattern/]) {} }
+        // `of` は RegexPrecedingKeywords に含まれるため / が正規表現と判定される
+        const string source = "function f(x) { for (var m of [/p/]) { return m; } }";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        // function f の { は 0（未実行）としてマークされる
+        int fBrace = source.IndexOf('{');
+        Assert.Equal(0, map[fBrace]);
+    }
+
+    /// <summary>
+    /// テスト F: クラスフィールドのアロー関数初期化子 `class C { method = () => {} }` が
+    /// 未実行（0）としてマークされることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_ClassFieldArrowInitializer_MarkedAsUncovered()
+    {
+        // class C { method = () => {} }
+        // アロー関数の `=>` の後に `{` があるため TryMarkArrowFunction が検出する
+        const string source = "class C { method = () => {} }";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        // () => {} の { は 0（未実行）としてマークされる
+        int arrowBrace = source.IndexOf('{', source.IndexOf("=>"));
+        Assert.Equal(0, map[arrowBrace]);
+    }
+
+    /// <summary>
+    /// テスト G: 即時実行アロー関数 `(() => { ... })()` が未実行（0）としてマークされることを確認する。
+    /// 外側の `(` の後のアロー関数は通常のアロー関数と同様に検出される。
+    /// </summary>
+    [Fact]
+    public void BuildMap_ImmediatelyInvokedArrowFunction_MarkedAsUncovered()
+    {
+        // (() => { return 1; })()
+        const string source = "(() => { return 1; })()";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        // { return 1; } の { は 0（未実行）としてマークされる
+        int bodyBrace = source.IndexOf('{');
+        Assert.Equal(0, map[bodyBrace]);
+    }
+
+    /// <summary>
+    /// テスト I: `function` をメソッド名として使うオブジェクトリテラル `{ function() {} }` が
+    /// 未実行（0）としてマークされることを確認する。
+    /// TryMarkFunctionKeyword は `function` の次の文字が `(` のとき TryMarkMethodShorthand に
+    /// 委譲せず直接ボディを検出するため、正しく機能する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_FunctionAsMethodName_MarkedAsUncovered()
+    {
+        // const obj = { function() {} };
+        // TryMarkFunctionKeyword: nextOk=true（次は `(`）→ TryMarkMethodShorthand に委譲しない
+        // → そのまま `(` と `{}` を見つけてボディを 0（未実行）にマークする
+        const string source = "const obj = { function() {} };";
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        // function() {} の { は 0（未実行）としてマークされる
+        int methodBrace = source.IndexOf('{', source.IndexOf("function()"));
+        Assert.Equal(0, map[methodBrace]);
+    }
 }

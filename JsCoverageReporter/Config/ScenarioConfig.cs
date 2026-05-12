@@ -19,6 +19,45 @@ internal class ScenarioConfig
         PropertyNameCaseInsensitive = true,
     };
 
+    // ScenarioConfig の既知トップレベルプロパティ名（小文字で保持して case-insensitive 比較に使う）
+    private static readonly HashSet<string> KnownPropertyNames =
+    [
+        "url", "scriptfilters", "scriptexcludes", "timeoutms", "continueonerror", "actions",
+    ];
+
+    /// <summary>
+    /// JSON 文字列を解析して、ScenarioConfig に存在しないフィールド名のリストを返す。
+    /// PropertyNameCaseInsensitive=true と同じルール（大文字小文字を区別しない）で判定する。
+    /// ユーザーのタイポ（例: "scriptfilter" → "scriptFilters"）を早期に検出するために使う。
+    /// </summary>
+    /// <param name="json">検査対象の JSON 文字列</param>
+    /// <returns>不明なフィールド名のリスト（見つからない場合は空リスト）</returns>
+    public static IReadOnlyList<string> FindUnknownProperties(string json)
+    {
+        var unknowns = new List<string>();
+        try
+        {
+            // JsonDocument でトップレベルのプロパティ名を列挙する
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object) { return unknowns; }
+
+            foreach (var prop in doc.RootElement.EnumerateObject())
+            {
+                // 大文字小文字を区別しない比較（PropertyNameCaseInsensitive=true と同じルール）
+                string nameLower = prop.Name.ToLowerInvariant();
+                if (!KnownPropertyNames.Contains(nameLower))
+                {
+                    unknowns.Add(prop.Name);
+                }
+            }
+        }
+        catch (JsonException)
+        {
+            // JSON 解析エラーは呼び出し元のデシリアライズで別途検出されるためここでは無視する
+        }
+        return unknowns;
+    }
+
     /// <summary>
     /// カバレッジを計測するページのURL。必須項目。
     /// </summary>
@@ -131,7 +170,7 @@ internal class ScenarioAction
 {
     /// <summary>
     /// アクションの種類を示す文字列。
-    /// 使用可能な値: "click", "fill", "navigate", "waitForSelector", "hover", "press", "wait", "select", "check", "uncheck", "dblclick", "scroll"
+    /// 使用可能な値: "click", "fill", "navigate", "waitForSelector", "hover", "press", "wait", "select", "check", "uncheck", "dblclick", "scroll", "close"
     /// </summary>
     [JsonPropertyName("type")]
     public string Type { get; set; } = "";

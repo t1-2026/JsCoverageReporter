@@ -22,3 +22,6 @@ test_out.txt
 # 開発中の内部設計ドキュメント（公開不要）
 docs/plans/
 docs/superpowers/
+
+# サンプル用ローカルファイル（環境固有のため公開不要）
+/sample/

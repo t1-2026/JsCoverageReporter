@@ -192,6 +192,14 @@ try
     // JSONファイルをテキストとして読み込む
     string json = File.ReadAllText(configPath);
 
+    // 不明なフィールド名を検出して警告する（タイポ検出: "scriptfilter" → "scriptFilters" など）
+    // デシリアライズは不明フィールドを無言で無視するため、先に検査してユーザーに知らせる
+    var unknownFields = ScenarioConfig.FindUnknownProperties(json);
+    foreach (var fieldName in unknownFields)
+    {
+        Console.Error.WriteLine($"[Warning] 設定ファイルに不明なフィールドがあります: \"{fieldName}\" — スペルミスの可能性があります。");
+    }
+
     // JSONテキストを ScenarioConfig オブジェクトに変換する
     ScenarioConfig? deserializedScenario = JsonSerializer.Deserialize<ScenarioConfig>(json, ScenarioConfig.JsonOptions);
 
@@ -221,6 +229,29 @@ catch (Exception ex)
 if (string.IsNullOrEmpty(scenario.Url))
 {
     Console.Error.WriteLine("エラー: 設定ファイルに \"url\" フィールドが必要です。");
+    return 1;
+}
+
+// ---- 出力ディレクトリの書き込み可能チェック ----
+
+// ブラウザ操作を開始する前に出力先が書き込み可能かを確認する。
+// 書き込み不可のまま進むと、シナリオ実行後の最終ステップでエラーになり
+// カバレッジデータが捨てられてしまうため、早期検出してフィードバックを返す。
+try
+{
+    // ディレクトリが存在しない場合は作成を試みる
+    Directory.CreateDirectory(outputDir);
+
+    // 実際に書き込めるかどうかを一時ファイルで確認する
+    string probeFile = Path.Combine(outputDir, ".write_check_" + Path.GetRandomFileName());
+    File.WriteAllText(probeFile, "");
+    // 削除失敗は書き込み成功とは無関係のため、誤ったエラーメッセージにならないよう例外を握りつぶす
+    // （プローブファイルが残ってもレポート生成には影響しない）
+    try { File.Delete(probeFile); } catch { }
+}
+catch (Exception ex)
+{
+    Console.Error.WriteLine($"エラー: 出力ディレクトリ '{outputDir}' に書き込みできません: {ex.Message}");
     return 1;
 }
 
@@ -265,7 +296,10 @@ try
     await page.GotoAsync(scenario.Url, new PageGotoOptions { Timeout = validTimeoutMs });
 
     // シナリオで定義されたアクション（クリックなど）を順番に実行する
-    await ActionRunner.RunAsync(page, scenario.Actions, validTimeoutMs, scenario.ContinueOnError);
+    // onBeforeClose: "close" アクション実行直前に CDP スナップショットを取得するコールバック
+    // （page.Close イベントは CDP セッション無効化後に発火するため、閉じる前に明示的に取得する必要がある）
+    await ActionRunner.RunAsync(page, scenario.Actions, validTimeoutMs, scenario.ContinueOnError,
+        onBeforeClose: p => collector.BeforePageCloseAsync(p));
 
     // カバレッジデータを収集して取得する
     Console.WriteLine("Collecting coverage...");
