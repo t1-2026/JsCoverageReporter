@@ -1,6 +1,7 @@
 #nullable disable
 
 using System.Text;
+using System.Text.Json;
 using JsCoverageReporter.Coverage;
 
 namespace JsCoverageReporter.Report;
@@ -49,22 +50,29 @@ internal static class CoverageParser
     {
         // null ソースは空配列を返す（BuildLines と同様の防衛処理）
         if (source == null) { return []; }
+        // 範囲を平坦化・ソートしてからコアに委譲する（functions==null は null を伝播し従来どおりスキャンしない）
+        return BuildCoverageMapFromSortedRanges(source, FlattenAndSortRanges(functions));
+    }
 
-        // まず全文字を「カバレッジ対象外(-1)」で初期化する
-        var map = new int[source.Length];
-        Array.Fill(map, -1);
-
-        // functions が null の場合は空として扱う（#nullable disable 環境の防衛処理）
-        if (functions == null) { return map; }
+    /// <summary>
+    /// 関数カバレッジデータの全範囲を1つのリストに平坦化し、「サイズ降順・同サイズは Count 昇順」で
+    /// ソートして返す。BuildCoverageMap と BuildCountMap は同一の平坦化・ソートを行うため、
+    /// 一度だけ計算して両者で共有することで重複する O(r log r) ソートと割り当てを省ける。
+    /// functions が null の場合は null を返す（呼び出し側で従来の null セマンティクスを保つため）。
+    /// </summary>
+    /// <param name="functions">関数カバレッジデータのコレクション</param>
+    /// <returns>ソート済みの範囲リスト（functions==null の場合は null）</returns>
+    internal static List<CoverageRange> FlattenAndSortRanges(IEnumerable<FunctionCoverage> functions)
+    {
+        // functions==null は null を返し、コア側で「スキャンせず返す」従来動作に分岐させる
+        if (functions == null) { return null; }
 
         // 全関数の範囲を1つのリストにまとめる
         var allRanges = new List<CoverageRange>();
-        // 各関数のカバレッジ範囲を走査してリストに追加する
         foreach (FunctionCoverage func in functions)
         {
             // func または func.Ranges が null の場合はスキップする（不正な CDP データへの防衛処理）
             if (func == null || func.Ranges == null) { continue; }
-            // 各関数が持つすべての範囲をまとめてリストに追加する
             foreach (CoverageRange range in func.Ranges)
             {
                 allRanges.Add(range);
@@ -72,19 +80,49 @@ internal static class CoverageParser
         }
 
         // 大きい範囲が先に処理されるよう降順にソートする
-        // 比較: B の範囲サイズ - A の範囲サイズ（降順なら B > A が先）
-        allRanges.Sort((a, b) =>
-        {
-            // 範囲 a のサイズ（文字数）を計算する
-            int sizeA = a.EndOffset - a.StartOffset;
-            // 範囲 b のサイズ（文字数）を計算する
-            int sizeB = b.EndOffset - b.StartOffset;
-            // 降順比較：大きい範囲が先に来るように b と a を逆に比較する
-            return sizeB.CompareTo(sizeA);
-        });
+        allRanges.Sort(CompareRangesForOverwrite);
+        return allRanges;
+    }
+
+    /// <summary>
+    /// 範囲の上書き順を決める比較関数。サイズ降順（大きい範囲が先）、同サイズは Count 昇順。
+    /// 同一スパンが異なる count で複数報告された場合に「いずれかが実行済みなら実行済み」となり、
+    /// List.Sort（不安定ソート）の内部実装に結果が依存しない決定的な動作になる。
+    /// </summary>
+    private static int CompareRangesForOverwrite(CoverageRange a, CoverageRange b)
+    {
+        // 範囲のサイズ（文字数）で降順比較する（大きい範囲が先に来るように b と a を逆に比較する）
+        int sizeA = a.EndOffset - a.StartOffset;
+        int sizeB = b.EndOffset - b.StartOffset;
+        int cmp = sizeB.CompareTo(sizeA);
+        if (cmp != 0) { return cmp; }
+        // 同サイズは Count 昇順（実行済みの範囲が後から上書きされるようにする）
+        return a.Count.CompareTo(b.Count);
+    }
+
+    /// <summary>
+    /// 事前にソート済みの範囲リストからカバレッジマップを構築するコア処理。
+    /// FlattenAndSortRanges の結果を BuildCoverageMap / BuildCountMap で共有するために分離している。
+    /// sortedRanges が null の場合（= functions が null だった場合）は範囲適用も補正スキャンも行わず、
+    /// 全文字を対象外(-1)としたマップを返す（従来の BuildCoverageMap(source, null) と同一動作）。
+    /// </summary>
+    /// <param name="source">スクリプトのソースコード全文</param>
+    /// <param name="sortedRanges">FlattenAndSortRanges が返したソート済み範囲（null 可）</param>
+    /// <returns>各文字のカバレッジ値を格納した配列</returns>
+    internal static int[] BuildCoverageMapFromSortedRanges(string source, List<CoverageRange> sortedRanges)
+    {
+        // null ソースは空配列を返す（BuildLines と同様の防衛処理）
+        if (source == null) { return []; }
+
+        // まず全文字を「カバレッジ対象外(-1)」で初期化する
+        var map = new int[source.Length];
+        Array.Fill(map, -1);
+
+        // sortedRanges==null は functions==null 相当。範囲適用も補正スキャンもせず -1 のまま返す（従来動作）
+        if (sortedRanges == null) { return map; }
 
         // 各範囲をマップに書き込む（小さい範囲が後から上書きすることで正確な分岐情報を反映する）
-        foreach (CoverageRange range in allRanges)
+        foreach (CoverageRange range in sortedRanges)
         {
             // 実行回数が1以上なら「実行済み(1)」、0なら「未実行(0)」とする
             int val;
@@ -262,7 +300,9 @@ internal static class CoverageParser
 
     /// <summary>
     /// アロー関数 =&gt; の検出と未実行マーク処理。
-    /// ブロック本体 {} を持つ場合のみ =&gt; から } まで 0（未実行）にマークする。
+    /// ブロック本体 {}、またはテンプレートリテラル本体 `...` を持つ場合に
+    /// =&gt; から本体末尾まで 0（未実行）にマークする。
+    /// （その他の式本体は終端の判定が困難なため対象外とする）
     /// async アロー関数の場合は async キーワードもマークする。
     /// </summary>
     /// <param name="source">スクリプトのソースコード全文</param>
@@ -274,20 +314,36 @@ internal static class CoverageParser
     {
         // => の後の空白・コメントをスキップする
         int afterArrow = SkipWhitespaceAndCommentsForward(source, arrowStart + 2, end);
-        // 次の文字が { でない、またはカバレッジデータがある場合はスキップ（式本体やカバー済みは対象外）
-        if (afterArrow >= end || source[afterArrow] != '{' || map[arrowStart] != -1)
+        // 本体が { ブロックでもテンプレートリテラルでもない、またはカバレッジデータがある場合は
+        // スキップする（テンプレート以外の式本体やカバー済みは対象外）
+        if (afterArrow >= end || map[arrowStart] != -1
+            || (source[afterArrow] != '{' && source[afterArrow] != '`'))
         {
             return arrowStart + 2; // => の次の位置へ進む
         }
 
-        int braceEnd = FindMatchingBrace(source, afterArrow);
-        if (braceEnd <= afterArrow)
+        // 本体の終端位置（直後のインデックス）を求める
+        int bodyEnd;
+        if (source[afterArrow] == '{')
         {
-            return arrowStart + 2; // 対応する } が見つからない場合はスキップ
+            // ブロック本体: 対応する } の直後
+            bodyEnd = FindMatchingBrace(source, afterArrow);
+        }
+        else
+        {
+            // テンプレートリテラル本体（() => `...`）: 閉じ ` の直後。
+            // V8 の遅延コンパイルではこの形の未実行アロー関数もカバレッジデータに
+            // 含まれないため、{ } ブロックと同様に補正対象とする。
+            // 閉じ ` がない構文エラーソースの場合はソース末尾までを本体とみなす。
+            bodyEnd = SkipTemplateLiteralFull(source, afterArrow);
+        }
+        if (bodyEnd <= afterArrow)
+        {
+            return arrowStart + 2; // 対応する終端が見つからない場合はスキップ
         }
 
-        // => から } まで未実行（0）にマークする（map の長さを超えないようにクランプする）
-        int arrowWriteEnd = Math.Min(braceEnd, map.Length);
+        // => から本体末尾まで未実行（0）にマークする（map の長さを超えないようにクランプする）
+        int arrowWriteEnd = Math.Min(bodyEnd, map.Length);
         for (int m = arrowStart; m < arrowWriteEnd; m++)
         {
             if (map[m] == -1) { map[m] = 0; }
@@ -403,7 +459,8 @@ internal static class CoverageParser
             }
         }
 
-        return braceEnd;
+        // 本体の直後を返し、ScanRange が本体内を二重スキャンしないようにする
+        return bodyEnd;
     }
 
     /// <summary>
@@ -787,7 +844,10 @@ internal static class CoverageParser
         if (i < 0) { return true; }
         char prev = source[i];
         // 閉じ括弧・閉じ角括弧・テンプレートリテラル閉じの後は除算演算子（式の末尾）
-        if (prev == ')' || prev == ']' || prev == '`') { return false; }
+        // 文字列リテラル終端クォート（" '）の直後も除算（例: "str" / 2、'a' / b）。
+        // SkipWhitespaceAndCommentsBackward は文字列内容を遡らないため、ここに来る " ' は
+        // 必ず文字列の「閉じ」クォートであり（開きクォートの直後に式末尾の / は来ない）、除算と確定できる。
+        if (prev == ')' || prev == ']' || prev == '`' || prev == '"' || prev == '\'') { return false; }
         // 後置インクリメント（++）の直後の / は除算演算子（正規表現ではない）
         // 例: x++ /2 の / は "x++ を評価した後に /2 で割る" 除算
         // prev（i番目の文字）が + で、その直前（i-1番目）も + であれば ++ と判断する
@@ -807,8 +867,8 @@ internal static class CoverageParser
             // それ以外の識別子・変数名の後は除算演算子
             return false;
         }
-        // 演算子・区切り文字・文字列終端クォートの後は正規表現
-        // 注: SkipWhitespaceAndCommentsBackward は文字列内容を読み飛ばさないため "str"/2 のような除算を正規表現と誤判定する可能性があるが、実用上は許容範囲
+        // 演算子・区切り文字の後は正規表現
+        // （文字列終端クォート " ' の直後は上で除算と判定済みのためここには来ない）
         return true;
     }
 
@@ -833,7 +893,8 @@ internal static class CoverageParser
         if (i < 0) { return true; }
         char p = source[i];
         // 閉じ括弧・閉じ角括弧・テンプレートリテラル閉じ の後は除算演算子（式の末尾）
-        if (p == ')' || p == ']' || p == '`') { return false; }
+        // 文字列リテラル終端クォート（" '）の直後も除算（IsRegexStart と同じ判定。例: "str" / 2）
+        if (p == ')' || p == ']' || p == '`' || p == '"' || p == '\'') { return false; }
         // 後置インクリメント/デクリメント の直後の / は除算
         if (p == '+' && i > 0 && source[i - 1] == '+') { return false; }
         if (p == '-' && i > 0 && source[i - 1] == '-') { return false; }
@@ -1176,6 +1237,81 @@ internal static class CoverageParser
     }
 
     /// <summary>
+    /// ソースコードの各文字に対して実行回数を記録した配列を作成する。
+    /// BuildCoverageMap と同じ「大きい範囲 → 小さい範囲」の上書き順で、
+    /// 各文字に最も具体的な（最小の）範囲の実行回数を書き込む。
+    /// 値はカバレッジ対象外も含めて 0 で初期化される（回数の表示にのみ使い、対象判定には使わない）。
+    /// </summary>
+    /// <param name="source">スクリプトのソースコード全文</param>
+    /// <param name="functions">関数カバレッジデータのコレクション</param>
+    /// <returns>各文字の実行回数を格納した配列（インデックス = 文字位置）</returns>
+    internal static int[] BuildCountMap(string source, IEnumerable<FunctionCoverage> functions)
+    {
+        if (source == null) { return []; }
+        // 範囲を平坦化・ソートしてからコアに委譲する（BuildCoverageMap と同じ平坦化・ソートを共有可能）
+        return BuildCountMapFromSortedRanges(source, FlattenAndSortRanges(functions));
+    }
+
+    /// <summary>
+    /// 事前にソート済みの範囲リストから実行回数マップを構築するコア処理。
+    /// FlattenAndSortRanges の結果を BuildCoverageMap と共有して重複ソートを省くために分離している。
+    /// sortedRanges が null（= functions が null だった場合）は全文字 0 のマップを返す（従来動作と同一）。
+    /// </summary>
+    /// <param name="source">スクリプトのソースコード全文</param>
+    /// <param name="sortedRanges">FlattenAndSortRanges が返したソート済み範囲（null 可）</param>
+    /// <returns>各文字の実行回数を格納した配列</returns>
+    internal static int[] BuildCountMapFromSortedRanges(string source, List<CoverageRange> sortedRanges)
+    {
+        if (source == null) { return []; }
+        var counts = new int[source.Length];
+        // sortedRanges==null は functions==null 相当。全文字 0 のまま返す（従来動作）
+        if (sortedRanges == null) { return counts; }
+
+        foreach (CoverageRange range in sortedRanges)
+        {
+            // 負の実行回数（不正データ）は 0 に丸める
+            int val = range.Count;
+            if (val < 0) { val = 0; }
+            int start = Math.Max(range.StartOffset, 0);
+            int end = Math.Min(range.EndOffset, source.Length);
+            for (int i = start; i < end; i++)
+            {
+                counts[i] = val;
+            }
+        }
+        return counts;
+    }
+
+    /// <summary>
+    /// 2つの実行回数マップを文字ごとの最大値で合成して返す。
+    /// baseMap の長さを基準とし、otherMap が短い場合は 0 として扱う。
+    /// （複数タブ・複数ナビゲーションの実行回数を「最も多く実行された値」で代表させる）
+    /// </summary>
+    /// <param name="baseMap">基準となる実行回数マップ</param>
+    /// <param name="otherMap">合成する実行回数マップ</param>
+    /// <returns>文字ごとの最大値で合成した実行回数マップ（baseMap と同じ長さ）</returns>
+    internal static int[] MergeCountMaps(int[] baseMap, int[] otherMap)
+    {
+        if (baseMap == null)
+        {
+            throw new ArgumentNullException(nameof(baseMap));
+        }
+        if (otherMap == null)
+        {
+            throw new ArgumentNullException(nameof(otherMap));
+        }
+        var merged = new int[baseMap.Length];
+        for (int i = 0; i < baseMap.Length; i++)
+        {
+            int v1 = baseMap[i];
+            int v2;
+            if (i < otherMap.Length) { v2 = otherMap[i]; } else { v2 = 0; }
+            if (v1 >= v2) { merged[i] = v1; } else { merged[i] = v2; }
+        }
+        return merged;
+    }
+
+    /// <summary>
     /// 2つのカバレッジマップを OR 合成して返す。
     /// どちらかのマップで実行済み（1）なら合成結果も実行済み（1）にする。
     /// baseMap の長さを基準とし、otherMap が短い場合は対象外（-1）として扱う。
@@ -1293,6 +1429,10 @@ internal static class CoverageParser
                 if (pos > 0) { prevNl = source.LastIndexOf('\n', pos - 1); }
                 int lp = 0;
                 if (prevNl >= 0) { lp = prevNl + 1; }
+                // ミニファイ済みファイルのような超長行での O(N²) を防ぐためスキャン範囲を
+                // 最大 4096 文字に制限する。実用上の行コメント (//) はこの範囲内に収まる
+                // （ミニファイ済みコードに // 行コメントは存在しないため実質影響なし）
+                if (pos - lp > 4096) { lp = pos - 4096; }
                 bool inLineComment = false;
                 int k = lp;
                 while (k < pos)
@@ -1380,7 +1520,8 @@ internal enum LineCoverageStatus
 /// </summary>
 /// <param name="Html">行のHTMLコンテンツ（span タグでカバレッジ状態を色付けしたもの）</param>
 /// <param name="Status">行全体のカバレッジ状態</param>
-internal record LineData(string Html, LineCoverageStatus Status);
+/// <param name="MaxCount">行内の実行済み文字の最大実行回数（0 = 回数情報なし。ツールチップ表示に使う）</param>
+internal record LineData(string Html, LineCoverageStatus Status, int MaxCount = 0);
 
 /// <summary>
 /// HTMLカバレッジレポートを生成するクラス。
@@ -1396,6 +1537,9 @@ internal class HtmlReportGenerator
     /// <returns>HTMLエスケープ済みの文字列</returns>
     internal static string HtmlEncode(string text)
     {
+        // null / 空文字は空文字を返す（#nullable disable 環境の防衛処理）
+        if (string.IsNullOrEmpty(text)) { return ""; }
+
         // 1文字ずつスキャンして HTML 特殊文字をエスケープする
         // sequential Replace では中間文字列が4つ生成されるため StringBuilder を使う（1パスで完結）
         var sb = new StringBuilder(text.Length);
@@ -1423,11 +1567,31 @@ internal class HtmlReportGenerator
             }
             else
             {
-                // その他の文字はそのまま追加する
+                // その他の文字（' を含む）はそのまま追加する。
+                // 本ツールが生成する HTML の属性値はすべてダブルクォート (class="..."、href="..." など) で
+                // 囲んでおり、シングルクォート属性は使わない。よって ' をエスケープする必要はなく、
+                // テキストノードでの ' エスケープも不要（BuildLines も ' を素通しする）。両者の挙動を一致させる。
                 sb.Append(c);
             }
         }
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// ファイルを書き出す。I/O エラー（書き込み権限なし・ディスク不足・パス不正など）が起きても
+    /// 例外を伝播させず警告ログに変換する。1ファイルの書き込み失敗で他のページ生成を巻き添えにせず、
+    /// 生成できたぶんのレポートを残すためのフォールバック。
+    /// </summary>
+    private static void WriteFileSafe(string path, string content, Encoding encoding)
+    {
+        try
+        {
+            File.WriteAllText(path, content, encoding);
+        }
+        catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+        {
+            Console.Error.WriteLine($"[Warning] Failed to write '{path}': {ex.Message}");
+        }
     }
 
     /// <summary>
@@ -1469,7 +1633,7 @@ internal class HtmlReportGenerator
         return lines.ToArray();
     }
 
-    internal static List<LineData> BuildLines(string source, int[] map)
+    internal static List<LineData> BuildLines(string source, int[] map, int[] countMap = null)
     {
         // 行データを格納する結果リスト
         var result = new List<LineData>();
@@ -1503,6 +1667,8 @@ internal class HtmlReportGenerator
             int coveredCount = 0;
             // 行内で未実行の文字数（行の状態判定に使う）
             int uncoveredCount = 0;
+            // 行内の実行済み文字の最大実行回数（ツールチップ表示用。countMap 未指定なら 0 のまま）
+            int lineMaxCount = 0;
 
             // 現在開いている <span> のカバレッジ状態（-2 = まだ <span> を開いていない）
             int currentState = -2;
@@ -1604,6 +1770,11 @@ internal class HtmlReportGenerator
                 {
                     // 実行済み文字のカウントを増やす
                     coveredCount++;
+                    // 実行済み文字の最大実行回数を更新する（実行された部分の回数だけを対象にする）
+                    if (countMap != null && idx < countMap.Length && countMap[idx] > lineMaxCount)
+                    {
+                        lineMaxCount = countMap[idx];
+                    }
                 }
                 else if (coverage == 0)
                 {
@@ -1641,8 +1812,8 @@ internal class HtmlReportGenerator
                 status = LineCoverageStatus.Partial;
             }
 
-            // 行のHTMLと状態を結果リストに追加する
-            result.Add(new LineData(sb.ToString(), status));
+            // 行のHTMLと状態を結果リストに追加する（最大実行回数はツールチップ表示に使う）
+            result.Add(new LineData(sb.ToString(), status, lineMaxCount));
 
             // 次の行の offset を計算する（rawLine.Length + 1 は分割に使った \n の1文字分を加える）
             // CRLF ファイルの場合 rawLine には末尾の \r が含まれるため rawLine.Length は "\r" 込みの長さになる。
@@ -1660,7 +1831,17 @@ internal class HtmlReportGenerator
     /// </summary>
     /// <param name="coverages">収集したスクリプトカバレッジデータのリスト</param>
     /// <param name="outputDir">レポートを出力するディレクトリのパス</param>
-    internal void Generate(IReadOnlyList<ScriptCoverage> coverages, string outputDir)
+    /// <param name="sourceMaps">スクリプト URL → 解析済みソースマップの辞書（null なら ソースマップ処理なし）</param>
+    /// <param name="writeLcov">true なら lcov.info（LCOV 形式）も出力する</param>
+    /// <param name="writeJson">true なら coverage.json（機械可読サマリー）も出力する</param>
+    /// <param name="targetUrl">計測対象ページの URL（インデックスのメタ情報に表示する。null なら省略）</param>
+    internal void Generate(
+        IReadOnlyList<ScriptCoverage> coverages,
+        string outputDir,
+        IReadOnlyDictionary<string, SourceMap> sourceMaps = null,
+        bool writeLcov = false,
+        bool writeJson = false,
+        string targetUrl = null)
     {
         // 出力ディレクトリを作成する（既に存在しても問題ない）
         Directory.CreateDirectory(outputDir);
@@ -1676,7 +1857,20 @@ internal class HtmlReportGenerator
         var scriptGroups = new List<List<ScriptCoverage>>();
         foreach (var script in coverages)
         {
-            var key = (script.Url, script.Source.TrimStart('\uFEFF'));
+            // Source は通常 Coverage.cs 側で空を除外済みだが、
+            // internal メソッドの直接呼び出し（テスト等）に備えて null を空文字に正規化して防御する。
+            // 三項演算子・null 合体演算子を使わず if/else で明示的に分岐する。
+            string scriptSource;
+            if (script.Source == null)
+            {
+                scriptSource = "";
+            }
+            else
+            {
+                scriptSource = script.Source;
+            }
+            // グループキーは (URL, BOM 除去済みソース) のタプル。先頭 BOM を除いて BOM 有無の差を吸収する。
+            var key = (script.Url, scriptSource.TrimStart('\uFEFF'));
             List<ScriptCoverage> existingGroup;
             if (scriptGroupMap.TryGetValue(key, out existingGroup))
             {
@@ -1691,14 +1885,24 @@ internal class HtmlReportGenerator
         }
 
         // インデックスページに表示するサマリー行のリスト
+        // pages: ページ URL とその詳細ページのファイル名のリスト / screenCount: このスクリプトを表示した画面数
         var summaryRows = new List<(
-            IReadOnlyList<(string label, string pageUrl, string tabFilename)> tabs,
-            string url, int covered, int partial, int total, string mergedFilename)>();
+            IReadOnlyList<(string pageUrl, string tabFilename)> pages,
+            string url, int screenCount, int covered, int partial, int total, string mergedFilename)>();
+
+        // ソースマップで解決した元ファイル行のリスト（合成ページのファイル名 → 元ファイル別サマリー）
+        var srcRowsByScript = new Dictionary<string, List<(string path, int covered, int partial, int total, string srcFilename)>>();
+
+        // LCOV / JSON エクスポート用のスクリプトデータ（--lcov / --json 指定時にファイル出力する）
+        var exportScripts = new List<ExportScriptData>();
 
         int i = 0;
         foreach (var group in scriptGroups)
         {
-            if (group.Count == 0) continue;
+            if (group.Count == 0)
+            {
+                continue;
+            }
             string scriptUrl = group[0].Url;
 
             // カノニカル（基準）スクリプトは最初のエントリとする
@@ -1708,25 +1912,59 @@ internal class HtmlReportGenerator
             // V8 は BOM を JavaScript の文字としてカウントしないため、CDP のオフセット値は
             // BOM 除去後の位置を指している。BOM を除去せずに渡すとオフセットが1ずれて
             // 末尾の文字がカバレッジ対象外（neutral）になるバグが発生する。
-            string canonicalSource = canonical.Source.TrimStart('\uFEFF');
+            // null の場合は空文字に正規化する（null 合体演算子を使わず if/else で明示的に分岐する）
+            string canonicalSourceRaw;
+            if (canonical.Source == null)
+            {
+                canonicalSourceRaw = "";
+            }
+            else
+            {
+                canonicalSourceRaw = canonical.Source;
+            }
+            string canonicalSource = canonicalSourceRaw.TrimStart('\uFEFF');
+
+            // メンバーごとのカバレッジマップ・実行回数マップを1回だけ計算してキャッシュする。
+            // BuildCoverageMap / BuildCountMap は (source, functions) の決定的な純関数であり、
+            // グループ内全メンバーのソースは canonicalSource と完全一致する（グループキーにソースを含む）。
+            // 後段の URL 別ページ生成で同じメンバーを再計算していた重複を、この配列の再利用で排除する。
+            // 各マップは MergeMaps/MergeCountMaps（新配列を返し入力を変更しない）と BuildLines（読み取りのみ）
+            // からのみ参照されるため共有しても安全で、結果は従来とビット単位で一致する。
+            var memberCovMaps   = new int[group.Count][];
+            var memberCountMaps = new int[group.Count][];
+            for (int g = 0; g < group.Count; g++)
+            {
+                // 範囲の平坦化・ソートはカバレッジマップと実行回数マップで共通のため1回だけ行い、
+                // 両コアで共有する（重複する O(r log r) ソートと割り当てを省く）。
+                // ソート済みリストは両コアで読み取りのみ参照するため共有しても安全。
+                var sortedRanges   = CoverageParser.FlattenAndSortRanges(group[g].Functions);
+                memberCovMaps[g]   = CoverageParser.BuildCoverageMapFromSortedRanges(canonicalSource, sortedRanges);
+                memberCountMaps[g] = CoverageParser.BuildCountMapFromSortedRanges(canonicalSource, sortedRanges);
+            }
 
             // 全タブ分のカバレッジマップを OR 合成する
-            var mergedMap = CoverageParser.BuildCoverageMap(canonicalSource, canonical.Functions);
+            // 実行回数マップ（行番号ガターのツールチップ表示用）も並行して構築し、文字ごとの最大値で合成する
+            var mergedMap      = memberCovMaps[0];
+            var mergedCountMap = memberCountMaps[0];
             for (int g = 1; g < group.Count; g++)
             {
-                // タブごとのソースも BOM を除去してから BuildCoverageMap に渡す
-                string otherSource = group[g].Source.TrimStart('\uFEFF');
-                var otherMap = CoverageParser.BuildCoverageMap(otherSource, group[g].Functions);
-                mergedMap = CoverageParser.MergeMaps(mergedMap, otherMap);
+                mergedMap      = CoverageParser.MergeMaps(mergedMap, memberCovMaps[g]);
+                mergedCountMap = CoverageParser.MergeCountMaps(mergedCountMap, memberCountMaps[g]);
             }
 
             // OR 合成したマップから行データを生成する（BOM 除去済みのソースを使う）
-            var mergedLines = BuildLines(canonicalSource, mergedMap);
+            var mergedLines = BuildLines(canonicalSource, mergedMap, mergedCountMap);
+
+            // このスクリプトのソースマップを取得する（あれば）
+            SourceMap srcMap = null;
+            if (sourceMaps != null) { sourceMaps.TryGetValue(scriptUrl, out srcMap); }
 
             // 1行しかないスクリプトはレポート対象外としてスキップする
             // （インライン eval や最小化された1行スクリプトなど、有意な情報が得られないため）
+            // ただしソースマップがある場合は元ファイル別の表示ができるためスキップしない
+            // （ミニファイされた本番バンドルは1行になることが多く、本機能の主用途のため）
             // i はインクリメントしない → スキップしてもファイル番号に欠番が生じない
-            if (mergedLines.Count <= 1)
+            if (mergedLines.Count <= 1 && srcMap == null)
             {
                 // スキップ理由をユーザーが把握できるよう警告を出す
                 Console.Error.WriteLine($"[Warning] Skipping 1-line script (no coverage info): {scriptUrl}");
@@ -1736,64 +1974,171 @@ internal class HtmlReportGenerator
             // 合成ページのファイル名（全タブの OR 合成カバレッジを表示する）
             var mergedFilename = $"script-{i}.html";
 
-            // 合成ページに表示する画面情報リスト（重複なし・URL 空文字除外）
-            // 画面ラベルは "画面N"（N = タブインデックス + 1）
-            var pageInfos = new List<(string label, string url)>();
-            var seenPageInfos = new HashSet<(string, string)>();
+            // ページ URL ごとにエントリをまとめる（同じ URL を複数の画面で開いた場合は1つに集約する）
+            // 挿入順を保つため List と逆引き辞書で管理する。
+            // Indices は group 内のメンバー添字を保持し、URL 別ページ生成で memberCovMaps を再利用する。
+            var urlGroups = new List<(string Url, List<ScriptCoverage> Scripts, List<int> Indices)>();
+            var urlGroupIndex = new Dictionary<string, int>();
+            // このスクリプトを表示した画面（タブ）の数（重複なし。インデックスの「表示画面数」列に使う）
+            var distinctScreens = new HashSet<int>();
+            for (int gi = 0; gi < group.Count; gi++)
+            {
+                var s = group[gi];
+                distinctScreens.Add(s.Page.Index);
+                string pageUrl = s.Page.Url;
+                if (pageUrl == null) { pageUrl = ""; }
+                int urlIdx;
+                if (!urlGroupIndex.TryGetValue(pageUrl, out urlIdx))
+                {
+                    urlIdx = urlGroups.Count;
+                    urlGroupIndex[pageUrl] = urlIdx;
+                    urlGroups.Add((pageUrl, new List<ScriptCoverage>(), new List<int>()));
+                }
+                urlGroups[urlIdx].Scripts.Add(s);
+                urlGroups[urlIdx].Indices.Add(gi);
+            }
+            int screenCount = distinctScreens.Count;
+
+            // 合成ページの見出しに表示するページ URL のリスト（空 URL は除外・重複なし）
+            var pageUrls = new List<string>();
+            foreach (var (groupUrl, _, _) in urlGroups)
+            {
+                if (!string.IsNullOrEmpty(groupUrl)) { pageUrls.Add(groupUrl); }
+            }
+
+            // エクスポート用の画面情報（タブ番号は1始まり。URL が空のタブも含めて重複なしで記録する）
+            var exportPages = new List<(int Tab, string PageUrl)>();
+            var seenExportPages = new HashSet<(int, string)>();
             foreach (var s in group)
             {
-                string screenLabel = $"画面{s.Page.Index + 1}";
-                if (!string.IsNullOrEmpty(s.Page.Url))
+                var pageKey = (s.Page.Index + 1, s.Page.Url);
+                if (seenExportPages.Add(pageKey))
                 {
-                    if (seenPageInfos.Add((screenLabel, s.Page.Url)))
-                    {
-                        pageInfos.Add((screenLabel, s.Page.Url));
-                    }
+                    exportPages.Add(pageKey);
                 }
             }
 
+            // グループ全体で一度も実行されなかった関数の一覧（詳細ページの先頭に表示する）
+            var mergedUncalled = CollectUncalledFunctions(group, canonicalSource);
+
             // 合成カバレッジの詳細ページを生成する
-            File.WriteAllText(
+            WriteFileSafe(
                 Path.Combine(scriptsDir, mergedFilename),
-                BuildScriptPage(pageInfos, scriptUrl, mergedLines),
+                BuildScriptPage(pageUrls, scriptUrl, mergedLines, mergedUncalled),
                 Encoding.UTF8);
 
-            // タブ情報リストを構築する（展開 UI 用）
-            var tabs = new List<(string label, string pageUrl, string tabFilename)>();
-            if (group.Count > 1)
+            // ページ URL 別の詳細ページリストを構築する（インデックスの展開 UI 用）
+            var pages = new List<(string pageUrl, string tabFilename)>();
+            if (urlGroups.Count > 1)
             {
-                // 複数タブの場合: 各タブ別の詳細ページも生成する
-                for (int g = 0; g < group.Count; g++)
+                // 複数のページ URL から読み込まれた場合: URL ごとに OR 合成した詳細ページを生成する
+                // （同じ URL を複数の画面で開いた場合は1ページに集約される）
+                for (int g = 0; g < urlGroups.Count; g++)
                 {
-                    var script = group[g];
-                    // タブ別ページのファイル名（グループ内インデックス g を使用して衝突を防ぐ）
+                    var (groupPageUrl, urlScripts, urlIndices) = urlGroups[g];
+                    // URL 別ページのファイル名（URL グループのインデックス g を使用して衝突を防ぐ）
                     var tabFilename = $"script-{i}-tab{g}.html";
-                    string tabLabel = $"画面{script.Page.Index + 1}";
 
-                    // このタブ単独のカバレッジマップを生成する（BOM を除去してから渡す）
-                    string tabSource = script.Source.TrimStart('\uFEFF');
-                    var tabMap = CoverageParser.BuildCoverageMap(tabSource, script.Functions);
-                    var tabLines = BuildLines(tabSource, tabMap);
-
-                    // タブ別詳細ページを生成する（このタブの画面ラベルと URL を渡す）
-                    var tabPageInfos = new List<(string label, string url)>();
-                    if (!string.IsNullOrEmpty(script.Page.Url))
+                    // この URL で読み込まれた全エントリ（複数画面・複数ナビゲーション分）を OR 合成する。
+                    // メンバーマップは合成ループで計算済みのため memberCovMaps/memberCountMaps を再利用し、
+                    // BuildCoverageMap/BuildCountMap の再計算を省く（結果は従来と完全に一致する）。
+                    var urlMap      = memberCovMaps[urlIndices[0]];
+                    var urlCountMap = memberCountMaps[urlIndices[0]];
+                    for (int k = 1; k < urlIndices.Count; k++)
                     {
-                        tabPageInfos.Add((tabLabel, script.Page.Url));
+                        urlMap      = CoverageParser.MergeMaps(urlMap, memberCovMaps[urlIndices[k]]);
+                        urlCountMap = CoverageParser.MergeCountMaps(urlCountMap, memberCountMaps[urlIndices[k]]);
                     }
-                    File.WriteAllText(
+                    var urlLines = BuildLines(canonicalSource, urlMap, urlCountMap);
+
+                    // この URL のエントリだけで未実行だった関数の一覧
+                    var urlUncalled = CollectUncalledFunctions(urlScripts, canonicalSource);
+                    // URL 別ページから全ページ合成ページへ戻れるようにナビゲーションリンクを付ける
+                    var urlNavLinks = new List<(string Text, string Href)> { ("全ページ合成のカバレッジを見る", mergedFilename) };
+                    var urlPageUrls = new List<string>();
+                    if (!string.IsNullOrEmpty(groupPageUrl)) { urlPageUrls.Add(groupPageUrl); }
+                    WriteFileSafe(
                         Path.Combine(scriptsDir, tabFilename),
-                        BuildScriptPage(tabPageInfos, scriptUrl, tabLines),
+                        BuildScriptPage(urlPageUrls, scriptUrl, urlLines, urlUncalled, urlNavLinks),
                         Encoding.UTF8);
 
-                    tabs.Add((tabLabel, script.Page.Url, tabFilename));
+                    pages.Add((groupPageUrl, tabFilename));
                 }
             }
             else
             {
-                // 単一タブの場合: タブ別ページは合成ページと同じ（別ファイルは生成しない）
-                string singleLabel = $"画面{group[0].Page.Index + 1}";
-                tabs.Add((singleLabel, group[0].Page.Url, mergedFilename));
+                // ページ URL が1種類（単一画面、または全画面が同じ URL）の場合:
+                // URL 別ページは合成ページと同内容になるため別ファイルは生成しない
+                string singleUrl = "";
+                if (urlGroups.Count > 0) { singleUrl = urlGroups[0].Url; }
+                pages.Add((singleUrl, mergedFilename));
+            }
+
+            // エクスポート用の元ファイル別データ（ソースマップ解決時に下のブロックで蓄積する）
+            var exportSourceFiles = new List<ExportSourceFileData>();
+
+            // ソースマップがある場合: 元ファイル別の行カバレッジを集計し、詳細ページを生成する
+            if (srcMap != null)
+            {
+                // OR 合成済みマップを元ファイルの行単位に射影する
+                var projected = SourceMapProjector.Project(canonicalSource, mergedMap, srcMap);
+
+                // sources 配列の順序はバンドラー依存のため、パスの辞書順で安定して表示する
+                var srcIndices = new List<int>(projected.Keys);
+                srcIndices.Sort((a, b) => string.CompareOrdinal(srcMap.Sources[a], srcMap.Sources[b]));
+
+                var srcFileRows = new List<(string path, int covered, int partial, int total, string srcFilename)>();
+                foreach (int srcIndex in srcIndices)
+                {
+                    var lineFlags = projected[srcIndex];
+
+                    // 行ステータスを集計する（covered/partial/uncovered すべてが「対象行」になる）
+                    int srcCovered = 0;
+                    int srcPartial = 0;
+                    int srcTotal   = 0;
+                    foreach (int flags in lineFlags.Values)
+                    {
+                        if (flags == (SourceMapProjector.CoveredFlag | SourceMapProjector.UncoveredFlag))
+                        {
+                            srcPartial++;
+                        }
+                        else if (flags == SourceMapProjector.CoveredFlag)
+                        {
+                            srcCovered++;
+                        }
+                        srcTotal++;
+                    }
+
+                    string srcPath = srcMap.Sources[srcIndex];
+
+                    // sourcesContent があれば色付きの元ソース詳細ページを生成する
+                    // （ない場合は集計のみインデックスに表示し、リンクなしにする）
+                    string srcContent  = srcMap.SourcesContent[srcIndex];
+                    string srcFilename = null;
+                    if (!string.IsNullOrEmpty(srcContent))
+                    {
+                        srcFilename = $"script-{i}-src-{srcIndex}.html";
+                        var srcLines = BuildOriginalSourceLines(srcContent, lineFlags);
+                        // 見出しにはバンドル（生成コード）の URL を表示する
+                        var srcPageUrls = new List<string> { scriptUrl };
+                        // 元ファイルページからバンドル（生成コード）のページへ移動できるようにする
+                        var srcNavLinks = new List<(string Text, string Href)> { ("バンドル（生成コード）のカバレッジを見る", mergedFilename) };
+                        WriteFileSafe(
+                            Path.Combine(scriptsDir, srcFilename),
+                            BuildScriptPage(srcPageUrls, srcPath, srcLines, null, srcNavLinks),
+                            Encoding.UTF8);
+                    }
+
+                    srcFileRows.Add((srcPath, srcCovered, srcPartial, srcTotal, srcFilename));
+
+                    // エクスポート用に行フラグの詳細を保持する（LCOV の DA レコード生成に使う）
+                    exportSourceFiles.Add(new ExportSourceFileData(srcPath, lineFlags));
+                }
+
+                if (srcFileRows.Count > 0)
+                {
+                    srcRowsByScript[mergedFilename] = srcFileRows;
+                }
             }
 
             // 合成データの行数を集計する
@@ -1816,76 +2161,202 @@ internal class HtmlReportGenerator
                 }
             }
 
-            summaryRows.Add((tabs, scriptUrl, covered, partial, total, mergedFilename));
+            summaryRows.Add((pages, scriptUrl, screenCount, covered, partial, total, mergedFilename));
+
+            // エクスポート用データを蓄積する（HTML に出力したスクリプトと同じ範囲をエクスポートする）
+            var lineStatuses = new List<LineCoverageStatus>(mergedLines.Count);
+            foreach (var line in mergedLines)
+            {
+                lineStatuses.Add(line.Status);
+            }
+            exportScripts.Add(new ExportScriptData(scriptUrl, exportPages, lineStatuses, exportSourceFiles));
+
             i++;
         }
 
-        // インデックスページを生成してファイルに書き出す
-        File.WriteAllText(
+        // インデックスページを生成してファイルに書き出す（メタ情報として対象 URL と生成日時を渡す）
+        WriteFileSafe(
             Path.Combine(outputDir, "index.html"),
-            BuildIndexPage(summaryRows),
+            BuildIndexPage(summaryRows, srcRowsByScript, targetUrl, DateTimeOffset.Now),
             Encoding.UTF8);
+
+        // LCOV 形式（lcov.info）を出力する（--lcov 指定時）
+        // BOM があると lcov 系ツールが先頭の SF レコードを読めないため BOM なし UTF-8 で書き出す
+        if (writeLcov)
+        {
+            WriteFileSafe(
+                Path.Combine(outputDir, "lcov.info"),
+                CoverageExporter.BuildLcov(exportScripts),
+                new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+        }
+
+        // JSON 形式（coverage.json）を出力する（--json 指定時）
+        if (writeJson)
+        {
+            WriteFileSafe(
+                Path.Combine(outputDir, "coverage.json"),
+                CoverageExporter.BuildJson(exportScripts, DateTimeOffset.Now),
+                new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+        }
+    }
+
+    /// <summary>
+    /// 元ファイル（ソースマップで解決した TypeScript 等）のソースを行単位カバレッジで色付けした行データを生成する。
+    /// ソースマップの精度は行単位のため、BuildLines と違い行全体を1つの span で包む。
+    /// 部分実行（実行済みと未実行が混在）の行はテキストを中立色にし、行番号の色（黄）で示す。
+    /// </summary>
+    /// <param name="content">元ファイルのソース全文（sourcesContent の値）</param>
+    /// <param name="lineFlags">行番号（0始まり）→ SourceMapProjector のフラグ の辞書</param>
+    /// <returns>行ごとの LineData オブジェクトのリスト</returns>
+    internal static List<LineData> BuildOriginalSourceLines(string content, IReadOnlyDictionary<int, int> lineFlags)
+    {
+        var result = new List<LineData>();
+        if (string.IsNullOrEmpty(content)) { return result; }
+
+        // BuildLines と同じ規則で行分割する（\n、\r\n、\r に対応）
+        var rawLines = SplitOnNewlines(content);
+        int lineCount = rawLines.Length;
+        // ソースが改行で終わる場合の末尾空要素を除く（BuildLines と同じ扱い）
+        if (lineCount > 0 && (content.EndsWith('\n') || content.EndsWith('\r')))
+        {
+            lineCount--;
+        }
+
+        for (int li = 0; li < lineCount; li++)
+        {
+            // CRLF の \r が行末に残っている場合は表示から除く
+            string text = rawLines[li].TrimEnd('\r');
+
+            int flags = 0;
+            if (lineFlags != null) { lineFlags.TryGetValue(li, out flags); }
+
+            // フラグから行ステータスとテキストの CSS クラスを決める
+            LineCoverageStatus status;
+            string cls;
+            if (flags == (SourceMapProjector.CoveredFlag | SourceMapProjector.UncoveredFlag))
+            {
+                // 部分実行: テキストは中立色（どの部分が実行されたかは行単位では分からないため）
+                status = LineCoverageStatus.Partial;
+                cls    = "neutral";
+            }
+            else if (flags == SourceMapProjector.CoveredFlag)
+            {
+                status = LineCoverageStatus.Covered;
+                cls    = "covered";
+            }
+            else if (flags == SourceMapProjector.UncoveredFlag)
+            {
+                status = LineCoverageStatus.Uncovered;
+                cls    = "uncovered";
+            }
+            else
+            {
+                // カバレッジ情報なし（コメント・空行・マッピング外の行）
+                status = LineCoverageStatus.Neutral;
+                cls    = "neutral";
+            }
+
+            string html = $"<span class=\"{cls}\">{HtmlEncode(text)}</span>";
+            result.Add(new LineData(html, status));
+        }
+        return result;
     }
 
     /// <summary>
     /// スクリプト詳細ページ（行ごとに色付けされたソースコード表示）のHTMLを生成する。
     /// </summary>
-    /// <param name="pageInfos">このスクリプトが読み込まれた画面情報のリスト（label="画面N", url=ページURL）</param>
+    /// <param name="pageUrls">このスクリプトが読み込まれたページ URL のリスト（重複なし）</param>
     /// <param name="scriptUrl">スクリプトのURL（ページタイトルと見出しに使用）</param>
     /// <param name="lines">BuildLines が返した行データのリスト</param>
+    /// <param name="uncalledFunctions">一度も実行されなかった関数の一覧（名前と1始まり行番号）。null または空なら一覧を表示しない</param>
+    /// <param name="navLinks">関連ページへのナビゲーションリンク（例: URL 別ページから合成ページへ）。null または空なら表示しない</param>
     /// <returns>スクリプト詳細ページの完全なHTML文字列</returns>
-    internal static string BuildScriptPage(IReadOnlyList<(string label, string url)> pageInfos, string scriptUrl, List<LineData> lines)
+    internal static string BuildScriptPage(
+        IReadOnlyList<string> pageUrls,
+        string scriptUrl,
+        List<LineData> lines,
+        IReadOnlyList<(string Name, int Line)> uncalledFunctions = null,
+        IReadOnlyList<(string Text, string Href)> navLinks = null)
     {
         // HTMLを構築するための文字列ビルダー
         var sb = new StringBuilder();
 
-        // HTMLヘッダーとスタイルシートを出力する
-        sb.AppendLine(HtmlTemplates.ScriptPageHeader);
-
-        // 画面ラベルと URL の表示文字列を決める
-        // 形式: "画面N (URL)" — URL が空の場合は "画面N" のみ
-        string pageDisplay;
-        if (pageInfos.Count == 0)
+        // ブラウザのタブ・履歴で区別できるよう、ページタイトルにスクリプト名を入れる
+        // GetFileName は内部で文字列操作・Uri.UnescapeDataString を行うため、同一 scriptUrl に対しては
+        // 1回だけ計算してローカルに保持し、見出し・URL 比較で再利用する（重複呼び出しを避ける）
+        string titleName = GetFileName(scriptUrl);
+        string pageTitle;
+        if (string.IsNullOrEmpty(titleName))
         {
-            // 画面情報が取得できなかった場合のフォールバック表示
-            pageDisplay = "(不明)";
-        }
-        else if (pageInfos.Count == 1)
-        {
-            // 1画面の場合: "画面N (URL)" または URL なしなら "画面N"
-            string lbl = HtmlEncode(pageInfos[0].label);
-            if (string.IsNullOrEmpty(pageInfos[0].url))
-            {
-                pageDisplay = lbl;
-            }
-            else
-            {
-                pageDisplay = $"{lbl} ({HtmlEncode(pageInfos[0].url)})";
-            }
+            pageTitle = "JS カバレッジ";
         }
         else
         {
-            // 複数画面の場合: "画面N (URL), 画面M (URL)" カンマ区切り
+            pageTitle = $"{HtmlEncode(titleName)} — JS カバレッジ";
+        }
+
+        // HTMLヘッダーとスタイルシートを出力する（__TITLE__ をスクリプト名入りタイトルに置換する）
+        sb.AppendLine(HtmlTemplates.ScriptPageHeader.Replace("__TITLE__", pageTitle));
+
+        // ページ URL の表示文字列を決める（URL のみ。複数の場合はカンマ区切り）
+        string pageDisplay;
+        if (pageUrls == null || pageUrls.Count == 0)
+        {
+            // ページ情報が取得できなかった場合のフォールバック表示
+            pageDisplay = "(不明)";
+        }
+        else
+        {
             var parts = new List<string>();
-            foreach (var (lbl, u) in pageInfos)
+            foreach (var u in pageUrls)
             {
-                string encodedLbl = HtmlEncode(lbl);
                 if (string.IsNullOrEmpty(u))
                 {
-                    parts.Add(encodedLbl);
+                    // URL が取得できなかったページ（about:blank やクローズ直前など）
+                    parts.Add("(URL なし)");
                 }
                 else
                 {
-                    parts.Add($"{encodedLbl} ({HtmlEncode(u)})");
+                    parts.Add(HtmlEncode(u));
                 }
             }
             pageDisplay = string.Join(", ", parts);
         }
         // 画面情報とスクリプトファイル名をページ見出しとして出力する
-        sb.AppendLine($"<h1>{pageDisplay} / {HtmlEncode(GetFileName(scriptUrl))}</h1>");
+        sb.AppendLine($"<h1>{pageDisplay} / {HtmlEncode(titleName)}</h1>");
+
+        // スクリプトの完全な URL を表示する（同名ファイルが複数あってもどのスクリプトか識別できるようにする）
+        // ファイル名と完全 URL が同じ場合（GetFileName がそのまま返すケース）は重複表示を避ける
+        if (!string.IsNullOrEmpty(scriptUrl) && scriptUrl != titleName)
+        {
+            sb.AppendLine($"<div class=\"script-url\">{HtmlEncode(scriptUrl)}</div>");
+        }
+
+        // 関連ページへのナビゲーションリンクを出力する（タブ別ページ → 合成ページ など）
+        if (navLinks != null && navLinks.Count > 0)
+        {
+            var navParts = new List<string>();
+            foreach (var (text, href) in navLinks)
+            {
+                navParts.Add($"<a href=\"{HtmlEncode(href)}\">{HtmlEncode(text)}</a>");
+            }
+            sb.AppendLine($"<div class=\"subnav\">{string.Join(" ｜ ", navParts)}</div>");
+        }
 
         // 各色の意味を説明する凡例バーを出力する
         sb.AppendLine(HtmlTemplates.ScriptPageLegend);
+
+        // 一度も実行されなかった関数の一覧を出力する（1件以上ある場合のみ）
+        // 行番号リンクをクリックすると該当行（id="L行番号"）にジャンプできる
+        if (uncalledFunctions != null && uncalledFunctions.Count > 0)
+        {
+            sb.AppendLine($"<details class=\"uncalled\"><summary>未実行関数 ({uncalledFunctions.Count})</summary><ul>");
+            foreach (var (funcName, funcLine) in uncalledFunctions)
+            {
+                sb.AppendLine($"<li><a href=\"#L{funcLine}\">{funcLine}行目</a> {HtmlEncode(funcName)}</li>");
+            }
+            sb.AppendLine("</ul></details>");
+        }
 
         // ソースコード表示エリアを開く
         sb.AppendLine("<div class=\"source\">");
@@ -1919,8 +2390,29 @@ internal class HtmlReportGenerator
                 cls = "line";
             }
 
+            // 行番号ガターのツールチップ（実行回数が分かる行のみ title 属性を付ける）
+            string gutterTitle = "";
+            if (line.MaxCount > 0)
+            {
+                // 実行回数が int の範囲（約21億）を超えた場合、Coverage 側で int.MaxValue にフォールバックしている。
+                // 生の 2147483647 をそのまま出すと実際の回数と誤解されるため「21億回以上」と表示する。
+                // 三項演算子を使わず if/else で実行回数の表示文字列を決める
+                string countText;
+                if (line.MaxCount == int.MaxValue)
+                {
+                    // int の範囲（約21億）を超えた回数は Coverage 側で int.MaxValue に丸めているため、固定文言で示す
+                    countText = "21億回以上";
+                }
+                else
+                {
+                    countText = line.MaxCount.ToString();
+                }
+                gutterTitle = $" title=\"実行回数: {countText}\"";
+            }
+
             // 行番号（i+1, 1始まり）と行のHTMLを div タグで囲んで出力する
-            sb.AppendLine($"<div class=\"{cls}\"><span class=\"gutter\">{i + 1}</span><span class=\"code\">{line.Html}</span></div>");
+            // id="L行番号" は未実行関数一覧からのジャンプ先アンカーとして使う
+            sb.AppendLine($"<div class=\"{cls}\" id=\"L{i + 1}\"><span class=\"gutter\"{gutterTitle}>{i + 1}</span><span class=\"code\">{line.Html}</span></div>");
         }
 
         // ページの閉じタグを出力する
@@ -1933,10 +2425,16 @@ internal class HtmlReportGenerator
     /// 複数タブで同じスクリプトが読み込まれた場合は展開ボタン付きで表示する。
     /// </summary>
     /// <param name="rows">各スクリプトのサマリー情報のリスト</param>
+    /// <param name="srcRowsByScript">合成ページのファイル名 → ソースマップで解決した元ファイル別サマリーのリスト（null 可）</param>
+    /// <param name="targetUrl">計測対象ページの URL（シナリオの url。null なら表示しない）</param>
+    /// <param name="generatedAt">レポート生成日時（null なら表示しない）</param>
     /// <returns>インデックスページの完全なHTML文字列</returns>
     internal static string BuildIndexPage(
-        List<(IReadOnlyList<(string label, string pageUrl, string tabFilename)> tabs,
-              string url, int covered, int partial, int total, string mergedFilename)> rows)
+        List<(IReadOnlyList<(string pageUrl, string tabFilename)> pages,
+              string url, int screenCount, int covered, int partial, int total, string mergedFilename)> rows,
+        IReadOnlyDictionary<string, List<(string path, int covered, int partial, int total, string srcFilename)>> srcRowsByScript = null,
+        string targetUrl = null,
+        DateTimeOffset? generatedAt = null)
     {
         // 全スクリプトの実行済み行数の合計
         int totalCovered = 0;
@@ -1946,7 +2444,7 @@ internal class HtmlReportGenerator
         int totalLines = 0;
 
         // 各スクリプトの行数を合計する（タプル要素名が変わるため分割代入を使う）
-        foreach (var (_, _, covered, partial, total, _) in rows)
+        foreach (var (_, _, _, covered, partial, total, _) in rows)
         {
             totalCovered += covered;
             totalPartial += partial;
@@ -1972,6 +2470,23 @@ internal class HtmlReportGenerator
         // HTMLヘッダーとスタイルシートを出力する
         sb.AppendLine(HtmlTemplates.IndexPageHeader);
 
+        // 実行メタ情報（生成日時・対象 URL・ツール名）を出力する
+        // 後日レポートを見返したときに「いつ・何に対する計測か」が分かるようにする
+        var metaParts = new List<string>();
+        if (generatedAt != null)
+        {
+            metaParts.Add($"生成日時: {generatedAt.Value:yyyy-MM-dd HH:mm:ss}");
+        }
+        if (!string.IsNullOrEmpty(targetUrl))
+        {
+            metaParts.Add($"対象 URL: {HtmlEncode(targetUrl)}");
+        }
+        if (metaParts.Count > 0)
+        {
+            metaParts.Add("JsCoverageReporter");
+            sb.AppendLine($"<p class=\"meta\">{string.Join(" ｜ ", metaParts)}</p>");
+        }
+
         // レポートの見方・凡例セクションを出力する（HtmlTemplates 定数を使用して重複を避ける）
         sb.AppendLine(HtmlTemplates.IndexPageGuide);
 
@@ -1981,21 +2496,15 @@ internal class HtmlReportGenerator
         // スクリプト一覧テーブルのヘッダー行を出力する
         sb.AppendLine("""
             <table class="data">
-            <tr><th>ページ URL</th><th>スクリプト</th><th class="num">実行済み</th><th class="num">部分実行</th><th class="num">対象行数</th><th class="num">カバレッジ率<br><small style="font-weight:normal;font-size:11px">※部分実行は0.5行換算</small></th></tr>
+            <tr><th>ページ URL</th><th class="num">表示画面数</th><th>スクリプト</th><th class="num">実行済み</th><th class="num">部分実行</th><th class="num">対象行数</th><th class="num">カバレッジ率<br><small style="font-weight:normal;font-size:11px">※部分実行は0.5行換算</small></th></tr>
             """);
 
         // 重複ファイル名の連番管理: 同名ファイル名が複数行に現れる場合に "(2)" "(3)" を付ける
-        var filenameCount = new Dictionary<string, int>();
-        foreach (var (_, u, _, _, _, _) in rows)
-        {
-            string fn = GetFileName(u);
-            if (!filenameCount.ContainsKey(fn)) { filenameCount[fn] = 0; }
-            filenameCount[fn]++;
-        }
+        // （1件目はサフィックスなし、2件目以降に出現順の連番を付ける）
         var filenameSeen = new Dictionary<string, int>();
 
         // スクリプトごとのデータ行を出力する
-        foreach (var (tabs, url, covered, partial, total, mergedFilename) in rows)
+        foreach (var (pages, url, screenCount, covered, partial, total, mergedFilename) in rows)
         {
             // このスクリプトのカバレッジ率を計算する（ゼロ除算を避ける）
             double pct;
@@ -2010,47 +2519,37 @@ internal class HtmlReportGenerator
             }
 
             // ページ URL セルの表示を決める
-            // タブが1件: "画面N — URL" を直接表示する
-            // タブが2件以上: <details>/<summary> で展開表示する
+            // URL が1件: URL をそのまま表示する
+            // URL が2件以上: <details>/<summary> で展開表示し、URL 別ページへのリンクを並べる
             string pageUrlCell;
-            if (tabs.Count <= 1)
+            if (pages.Count <= 1)
             {
-                // 単一タブ: "画面N — URL" を直接表示する（XSS 対策のため HTML エスケープする）
-                string singleDisplay;
-                if (tabs.Count == 0)
+                // 単一 URL: URL を直接表示する（XSS 対策のため HTML エスケープする）
+                if (pages.Count == 0 || string.IsNullOrEmpty(pages[0].pageUrl))
                 {
-                    singleDisplay = "(不明)";
+                    pageUrlCell = "(不明)";
                 }
                 else
                 {
-                    string lbl = HtmlEncode(tabs[0].label);
-                    if (string.IsNullOrEmpty(tabs[0].pageUrl))
-                    {
-                        singleDisplay = lbl;
-                    }
-                    else
-                    {
-                        singleDisplay = $"{lbl} — {HtmlEncode(tabs[0].pageUrl)}";
-                    }
+                    pageUrlCell = HtmlEncode(pages[0].pageUrl);
                 }
-                pageUrlCell = singleDisplay;
             }
             else
             {
-                // 複数タブ: <details>/<summary> で展開できるようにする
+                // 複数 URL: <details>/<summary> で展開できるようにする
                 var sbDetails = new StringBuilder();
-                sbDetails.Append($"<details><summary>複数ページ ({tabs.Count})</summary><ul>");
-                foreach (var (label, pageUrl, tabFilename) in tabs)
+                sbDetails.Append($"<details><summary>複数ページ ({pages.Count})</summary><ul>");
+                foreach (var (pageUrl, tabFilename) in pages)
                 {
-                    // リンクテキストは "画面N — URL" 形式（URL が空の場合は画面ラベルのみ）
+                    // リンクテキストは URL（取得できなかった場合は "(URL なし)"）
                     string displayText;
                     if (string.IsNullOrEmpty(pageUrl))
                     {
-                        displayText = HtmlEncode(label);
+                        displayText = "(URL なし)";
                     }
                     else
                     {
-                        displayText = $"{HtmlEncode(label)} — {HtmlEncode(pageUrl)}";
+                        displayText = HtmlEncode(pageUrl);
                     }
                     sbDetails.Append($"<li><a href=\"scripts/{tabFilename}\">{displayText}</a></li>");
                 }
@@ -2073,20 +2572,188 @@ internal class HtmlReportGenerator
                 displayName = baseName;
             }
 
-            // ページ URL・スクリプトファイル名（合成ページへのリンク付き）・各行数・カバレッジ率を出力する
-            sb.AppendLine($"<tr><td>{pageUrlCell}</td>" +
+            // ソート用のキー（data 属性）を準備する
+            // data-rate は JavaScript の parseFloat で読むため、カルチャに依存しない小数点表記にする
+            string dataPage;
+            if (pages.Count > 0)
+            {
+                dataPage = HtmlEncode(pages[0].pageUrl);
+            }
+            else
+            {
+                dataPage = "";
+            }
+            string dataRate = pct.ToString("F1", System.Globalization.CultureInfo.InvariantCulture);
+
+            // カバレッジ率に応じたセルの色分けクラス（80% 以上 = 緑系、50% 以上 = 黄系、それ未満 = 赤系）
+            string rateClass = RateClass(pct, total);
+
+            // ページ URL・表示画面数・スクリプトファイル名（合成ページへのリンク付き）・各行数・カバレッジ率を出力する
+            sb.AppendLine($"<tr class=\"script\" data-page=\"{dataPage}\" data-screens=\"{screenCount}\" data-name=\"{HtmlEncode(displayName)}\" " +
+                          $"data-covered=\"{covered}\" data-partial=\"{partial}\" data-total=\"{total}\" data-rate=\"{dataRate}\">" +
+                          $"<td>{pageUrlCell}</td>" +
+                          $"<td class=\"num\">{screenCount}</td>" +
                           $"<td><a href=\"scripts/{mergedFilename}\">{HtmlEncode(displayName)}</a></td>" +
                           $"<td class=\"num\">{covered}</td><td class=\"num\">{partial}</td>" +
-                          $"<td class=\"num\">{total}</td><td class=\"num\">{pct:F1}%</td></tr>");
+                          $"<td class=\"num\">{total}</td><td class=\"num {rateClass}\">{pct:F1}%</td></tr>");
+
+            // ソースマップで解決された元ファイルの一覧をバンドル行の直下に折りたたみ表示する
+            // （実バンドルは数百ファイルを含むことがあるため常時展開しない。
+            //   行数・カバレッジ率は元ファイルの行単位集計。全体集計には含めない — バンドル行と二重計上になるため）
+            if (srcRowsByScript != null && srcRowsByScript.TryGetValue(mergedFilename, out var srcRows))
+            {
+                sb.AppendLine($"<tr class=\"srcfiles\"><td colspan=\"7\">" +
+                              $"<details><summary>元ファイル ({srcRows.Count})</summary>" +
+                              $"<table class=\"srcfiles-table\">");
+                foreach (var (srcPath, srcCovered, srcPartial, srcTotal, srcFilename) in srcRows)
+                {
+                    // 元ファイルのカバレッジ率（ゼロ除算を避ける。Partial は 0.5 行換算で本体と同じ計算式）
+                    double srcPct;
+                    if (srcTotal > 0)
+                    {
+                        srcPct = 100.0 * (srcCovered + srcPartial * 0.5) / srcTotal;
+                    }
+                    else
+                    {
+                        srcPct = 0;
+                    }
+
+                    // sourcesContent があれば詳細ページへのリンク、なければテキストのみ表示する
+                    string nameCell;
+                    if (srcFilename != null)
+                    {
+                        nameCell = $"<a href=\"scripts/{srcFilename}\">{HtmlEncode(srcPath)}</a>";
+                    }
+                    else
+                    {
+                        nameCell = $"{HtmlEncode(srcPath)} <small>（ソース内容なし）</small>";
+                    }
+
+                    sb.AppendLine($"<tr><td>{nameCell}</td>" +
+                                  $"<td class=\"num\">{srcCovered}</td><td class=\"num\">{srcPartial}</td>" +
+                                  $"<td class=\"num\">{srcTotal}</td><td class=\"num {RateClass(srcPct, srcTotal)}\">{srcPct:F1}%</td></tr>");
+                }
+                sb.AppendLine("</table></details></td></tr>");
+            }
         }
 
         // テーブルの閉じタグを出力する
         sb.AppendLine("</table>");
 
+        // 列見出しクリックでの並べ替え用 JavaScript を出力する
+        sb.AppendLine(HtmlTemplates.IndexSortScript);
+
         // 制約・計測対象外パターンのセクションを出力する（レポート末尾に配置）
         sb.AppendLine(HtmlTemplates.IndexPageConstraints);
         sb.AppendLine("</body></html>");
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// カバレッジ率に応じたセルの色分け CSS クラスを返す。
+    /// 80% 以上 = rate-high（緑系）、50% 以上 = rate-mid（黄系）、それ未満 = rate-low（赤系）。
+    /// 対象行が 0 の場合は色分けしない（空文字を返す）。
+    /// </summary>
+    private static string RateClass(double pct, int total)
+    {
+        if (total <= 0) { return ""; }
+        if (pct >= 80.0) { return "rate-high"; }
+        if (pct >= 50.0) { return "rate-mid"; }
+        return "rate-low";
+    }
+
+    /// <summary>
+    /// グループ（同一スクリプトの全タブ・全ナビゲーション分）から一度も実行されなかった関数の一覧を作る。
+    /// 関数は先頭範囲のオフセット（開始・終了）で同一性を判定し、
+    /// グループ内のいずれかのエントリで実行されていれば「実行済み」として除外する。
+    /// V8 が常に報告するスクリプト全体を覆うトップレベルエントリ（無名・全範囲）は関数ではないため除外する。
+    /// </summary>
+    /// <param name="group">同一スクリプトの ScriptCoverage のリスト（1件でもよい）</param>
+    /// <param name="source">スクリプトのソースコード全文（BOM 除去済み。行番号計算に使う）</param>
+    /// <returns>（関数名, 1始まり行番号）のリスト。行番号順（同行は名前順）でソート済み</returns>
+    internal static List<(string Name, int Line)> CollectUncalledFunctions(IReadOnlyList<ScriptCoverage> group, string source)
+    {
+        var result = new List<(string Name, int Line)>();
+        if (group == null || string.IsNullOrEmpty(source)) { return result; }
+
+        // 関数の範囲（開始・終了オフセット） → (名前, 実行されたか) を集約する
+        var functions = new Dictionary<(int Start, int End), (string Name, bool Executed)>();
+        foreach (var script in group)
+        {
+            if (script == null || script.Functions == null) { continue; }
+            foreach (var func in script.Functions)
+            {
+                if (func == null || func.Ranges == null || func.Ranges.Count == 0) { continue; }
+
+                // 先頭の範囲が関数全体のスパン（V8 精密カバレッジの仕様: ranges[0] = 関数全体）
+                var root = func.Ranges[0];
+
+                // スクリプト全体を覆うトップレベルエントリは関数定義ではないため除外する
+                if (root.StartOffset <= 0 && root.EndOffset >= source.Length) { continue; }
+
+                // いずれかの範囲が1回でも実行されていれば実行済みとみなす
+                // （関数が呼ばれていなければ内側の範囲も実行されないため、この判定で漏れはない）
+                bool executed = false;
+                foreach (var range in func.Ranges)
+                {
+                    if (range.Count > 0) { executed = true; break; }
+                }
+
+                var key = (root.StartOffset, root.EndOffset);
+                if (functions.TryGetValue(key, out var existing))
+                {
+                    // 同じ範囲が複数エントリにある場合: 名前は最初に見つかった非空のものを使い、実行状態は OR 合成する
+                    string mergedName = existing.Name;
+                    if (string.IsNullOrEmpty(mergedName)) { mergedName = func.FunctionName; }
+                    functions[key] = (mergedName, existing.Executed || executed);
+                }
+                else
+                {
+                    functions[key] = (func.FunctionName, executed);
+                }
+            }
+        }
+
+        // 行番号計算用に各行の開始オフセットを前計算する（'\n'・'\r\n'・'\r' 区切り・0始まり）
+        // SplitOnNewlines と同じ規則で \r のみの改行（旧 Mac 形式）にも対応する
+        var lineStarts = new List<int> { 0 };
+        for (int i = 0; i < source.Length; i++)
+        {
+            if (source[i] == '\n')
+            {
+                lineStarts.Add(i + 1);
+            }
+            else if (source[i] == '\r' && (i + 1 >= source.Length || source[i + 1] != '\n'))
+            {
+                // CR のみ（CRLF の \r は後続の \n 側で処理されるため、ここでは \n が後続しない場合のみ）
+                lineStarts.Add(i + 1);
+            }
+        }
+
+        // 未実行の関数だけを行番号付きで結果に追加する
+        foreach (var kv in functions)
+        {
+            if (kv.Value.Executed) { continue; }
+
+            int start = kv.Key.Start;
+            if (start < 0) { start = 0; }
+            // start を含む行を二分探索で求める（見つからない場合は挿入位置の1つ前の行）
+            int lineIndex = lineStarts.BinarySearch(start);
+            if (lineIndex < 0) { lineIndex = ~lineIndex - 1; }
+
+            string name = kv.Value.Name;
+            if (string.IsNullOrEmpty(name)) { name = "(無名関数)"; }
+            result.Add((name, lineIndex + 1));
+        }
+
+        // 行番号順（同行は名前順）に並べて表示を安定させる
+        result.Sort((a, b) =>
+        {
+            int cmp = a.Line.CompareTo(b.Line);
+            if (cmp != 0) { return cmp; }
+            return string.CompareOrdinal(a.Name, b.Name);
+        });
+        return result;
     }
 
     /// <summary>
@@ -2202,50 +2869,79 @@ internal class HtmlReportGenerator
 /// </summary>
 internal static class HtmlTemplates
 {
+    /// <summary>
+    /// スクリプト詳細ページのヘッダーテンプレート。
+    /// __TITLE__ は BuildScriptPage がスクリプト名入りのタイトルに置換する。
+    /// </summary>
     public const string ScriptPageHeader = """
-        <!DOCTYPE html><html><head><meta charset="utf-8">
-        <title>JS カバレッジ</title>
+        <!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <link rel="icon" href="data:,">
+        <title>__TITLE__</title>
         <style>
         body{font-family:monospace;font-size:13px;margin:0;background:#fff}
         h1{padding:8px 12px;background:#2d2d2d;color:#fff;margin:0;font-size:13px;word-break:break-all}
+        .script-url{padding:4px 12px;background:#3d3d3d;color:#bbb;font-size:11px;word-break:break-all}
+        .subnav{padding:4px 12px;background:#f0f0f0;border-bottom:1px solid #ddd;
+                font-size:12px;font-family:sans-serif}
+        .subnav a{color:#1a7a4a;text-decoration:none}
+        .subnav a:hover{text-decoration:underline}
         .legend{display:flex;flex-wrap:wrap;gap:8px 24px;padding:8px 12px;
                 background:#f7f7f7;border-bottom:1px solid #ddd;
-                font-size:12px;font-family:sans-serif;align-items:center}
+                font-size:12px;font-family:sans-serif;align-items:center;
+                position:sticky;top:0;z-index:2}
         .legend-item{display:inline-flex;align-items:center;gap:5px;color:#444}
         .swatch{display:inline-block;width:16px;height:12px;
                 border:1px solid rgba(0,0,0,.18);border-radius:2px;flex-shrink:0}
         .back-link{color:#1a7a4a;text-decoration:none;white-space:nowrap}
         .back-link:hover{text-decoration:underline}
-        .source{white-space:pre}
-        .line{display:flex;line-height:1.6}
+        .source{white-space:pre;overflow-x:auto}
+        .line{display:flex;line-height:1.6;width:max-content;min-width:100%;
+              scroll-margin-top:6em}
+        .line:target{outline:2px solid #f5a623;outline-offset:-2px}
         .gutter{min-width:48px;padding:0 8px;text-align:right;user-select:none;
-                background:#f5f5f5;color:#aaa;border-right:2px solid #e0e0e0}
-        .code{padding:0 8px;flex:1;overflow-x:auto}
+                background:#f5f5f5;color:#aaa;border-right:2px solid #e0e0e0;
+                position:sticky;left:0;z-index:1}
+        .gutter::after{display:inline-block;width:14px;content:""}
+        .line-covered   .gutter::after{content:"✓"}
+        .line-uncovered .gutter::after{content:"✗"}
+        .line-partial   .gutter::after{content:"◐"}
+        .code{padding:0 8px;flex:1}
         .line-covered   .gutter{background:#c6efc6;color:#3a7d3a;border-color:#8fc98f}
         .line-uncovered .gutter{background:#f0c6c6;color:#7d3a3a;border-color:#c98f8f}
         .line-partial   .gutter{background:#f0e8a0;color:#6b6000;border-color:#c9b800}
         span.covered  {background:#d4f8d4}
         span.uncovered{background:#f8d4d4}
         span.neutral  {}
+        .uncalled{padding:8px 12px;background:#fff6f6;border-bottom:1px solid #ddd;
+                  font-size:12px;font-family:sans-serif;color:#444}
+        .uncalled summary{cursor:pointer;color:#a33;font-weight:600}
+        .uncalled ul{margin:6px 0 2px;padding-left:20px;max-height:200px;overflow-y:auto}
+        .uncalled li{margin:2px 0}
+        .uncalled a{color:#1a7a4a;text-decoration:none}
+        .uncalled a:hover{text-decoration:underline}
         </style></head><body>
         """;
 
     public const string ScriptPageLegend = """
         <div class="legend">
           <a class="back-link" href="../index.html">← 一覧に戻る</a>
-          <span class="legend-item"><span class="swatch" style="background:#c6efc6"></span>実行済み — 行内すべてのブロックが実行された</span>
-          <span class="legend-item"><span class="swatch" style="background:#f0e8a0"></span>部分実行 — 実行済みと未実行が混在（if/else の片側など）</span>
-          <span class="legend-item"><span class="swatch" style="background:#f0c6c6"></span>未実行 — 一度も実行されなかった</span>
+          <span class="legend-item"><span class="swatch" style="background:#c6efc6"></span>✓ 実行済み — 行内すべてのブロックが実行された</span>
+          <span class="legend-item"><span class="swatch" style="background:#f0e8a0"></span>◐ 部分実行 — 実行済みと未実行が混在（if/else の片側など）</span>
+          <span class="legend-item"><span class="swatch" style="background:#f0c6c6"></span>✗ 未実行 — 一度も実行されなかった</span>
           <span class="legend-item"><span class="swatch" style="background:#e8e8e8"></span>対象外 — コメント・空行・変数宣言のみの行など</span>
         </div>
         """;
 
     public const string IndexPageHeader = """
-        <!DOCTYPE html><html><head><meta charset="utf-8">
+        <!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <link rel="icon" href="data:,">
         <title>JS カバレッジレポート</title>
         <style>
         body{font-family:sans-serif;padding:24px;color:#333}
         h1{font-size:20px;margin-bottom:16px}
+        .meta{color:#777;font-size:12px;margin:-8px 0 16px}
         .guide{background:#f9f9f9;border:1px solid #e0e0e0;border-radius:6px;
                padding:16px 20px;margin-bottom:24px;font-size:14px;color:#444}
         .guide h2{font-size:15px;margin:0 0 10px;color:#222}
@@ -2268,6 +2964,15 @@ internal static class HtmlTemplates
         details[open] > summary::before { content:"▼ " }
         details ul { margin:4px 0 0;padding-left:16px;list-style:disc;font-size:12px }
         details ul li { margin:2px 0 }
+        table.data th.sortable{cursor:pointer;user-select:none}
+        table.data th.sortable:hover{background:#ececec}
+        td.rate-high{background:#e7f6e7}
+        td.rate-mid{background:#fdf6dd}
+        td.rate-low{background:#fbe9e9}
+        tr.srcfiles > td{background:#fbfbfb;padding:4px 12px}
+        table.srcfiles-table{border-collapse:collapse;width:100%;font-size:12px;color:#555;margin:4px 0}
+        table.srcfiles-table td{border:none;padding:3px 12px 3px 0}
+        table.srcfiles-table td.num{text-align:right;font-variant-numeric:tabular-nums;width:80px}
         </style></head><body>
         <h1>JS カバレッジレポート</h1>
         """;
@@ -2279,7 +2984,10 @@ internal static class HtmlTemplates
           スクリプト名をクリックすると、行ごとの実行状況を色分け表示で確認できます。</p>
           <p><strong>カバレッジ率の計算式</strong><br>
           <span class="formula">（実行済み行数 ＋ 部分実行行数 × 0.5）÷ 対象行数 × 100</span><br>
-          ※ 対象行数にはコメント・空行・実装を持たない行など（対象外）は含みません。</p>
+          ※ 対象行数にはコメント・空行・実装を持たない行など（対象外）は含みません。<br>
+          ※ ソースマップで解決した元ファイル（「元ファイル (N)」内の行）の数値は参考情報であり、
+          バンドル行との二重計上を避けるため全体カバレッジには含めません。<br>
+          ※ 一覧の列見出しをクリックすると、その列で並べ替えできます。</p>
           <table class="legend-table">
             <tr>
               <td><span class="swatch" style="background:#c6efc6"></span><strong>実行済み</strong></td>
@@ -2301,6 +3009,71 @@ internal static class HtmlTemplates
         </div>
         """;
 
+    /// <summary>
+    /// インデックスページのテーブルソート用 JavaScript。
+    /// 列見出しのクリックで昇順/降順を切り替える。バンドル行（tr.script）と
+    /// その直後の元ファイル行（tr.srcfiles）をひとまとまりとして並べ替える。
+    /// </summary>
+    public const string IndexSortScript = """
+        <script type="text/javascript">
+        (function () {
+          var table = document.querySelector('table.data');
+          if (!table) { return; }
+          var headerCells = table.rows[0].cells;
+          var keys = ['page', 'screens', 'name', 'covered', 'partial', 'total', 'rate'];
+          // 文字列として比較する列（ページ URL とスクリプト名）。それ以外は数値として比較する
+          var stringColumns = { 0: true, 2: true };
+          var ascending = {};
+          function collectGroups() {
+            var groups = [];
+            table.querySelectorAll('tr.script').forEach(function (row) {
+              var unit = [row];
+              var next = row.nextElementSibling;
+              if (next) {
+                if (next.classList.contains('srcfiles')) { unit.push(next); }
+              }
+              groups.push(unit);
+            });
+            return groups;
+          }
+          var i;
+          var columnCount = Math.min(headerCells.length, keys.length);
+          for (i = 0; i < columnCount; i++) {
+            (function (col) {
+              headerCells[col].classList.add('sortable');
+              headerCells[col].title = 'クリックで並べ替え';
+              headerCells[col].addEventListener('click', function () {
+                var key = keys[col];
+                var numeric = true;
+                if (stringColumns[col]) { numeric = false; }
+                var dir = ascending[col] = !ascending[col];
+                var groups = collectGroups();
+                groups.sort(function (a, b) {
+                  var va = a[0].getAttribute('data-' + key) || '';
+                  var vb = b[0].getAttribute('data-' + key) || '';
+                  var cmp;
+                  if (numeric) { cmp = parseFloat(va) - parseFloat(vb); }
+                  else {
+                    // 三項演算子を使わず文字列比較の大小を if/else で求める
+                    if (va < vb) { cmp = -1; }
+                    else if (va > vb) { cmp = 1; }
+                    else { cmp = 0; }
+                  }
+                  // 昇順 (dir=true) はそのまま、降順は符号を反転して返す（三項演算子を使わない）
+                  if (dir) { return cmp; }
+                  else { return -cmp; }
+                });
+                var body = table.tBodies[0];
+                groups.forEach(function (unit) {
+                  unit.forEach(function (row) { body.appendChild(row); });
+                });
+              });
+            })(i);
+          }
+        })();
+        </script>
+        """;
+
     public const string IndexPageConstraints = """
         <div class="guide">
           <h2>制約・計測対象外パターン</h2>
@@ -2314,9 +3087,11 @@ internal static class HtmlTemplates
               Worker は別スレッドで動作するため、このツールの CDP セッションの対象外です。
             </li>
             <li>
-              <strong>ソースマップ非対応</strong> —
-              TypeScript や webpack などでバンドルされた JavaScript は、変換後のコードがそのまま計測対象になります。
-              元のソースファイルへのマッピングは行いません。
+              <strong>ソースマップ対応は行単位</strong> —
+              //# sourceMappingURL が取得できるスクリプトは、元ファイル（TypeScript 等）別の行カバレッジを
+              バンドル行の下に表示します。元ソースの色分けは行単位です（文字単位の色分けはバンドル後コードのページのみ）。
+              sourcesContent を含まないマップは集計のみ表示し、ソース表示はできません。
+              マップが取得できないスクリプトは従来どおり変換後のコードが計測対象になります。
             </li>
             <li>
               <strong>外側関数が実行された場合の内側未実行関数</strong> —
@@ -2332,4 +3107,632 @@ internal static class HtmlTemplates
           </ul>
         </div>
         """;
+}
+
+// ============================================================================
+// 以下は旧 SourceMap.cs から統合した型（Source Map v3 の解析と行単位カバレッジ射影）。
+// ルール「関連機能は全てこのソース内に収める」に従い Report.cs へ取り込んだ。
+// ============================================================================
+
+/// <summary>
+/// Source Map v3 の1セグメント（生成コードの位置 → 元ファイルの位置の対応）を表すレコード。
+/// 元ファイルの列情報は行単位集計には不要なため保持しない。
+/// </summary>
+/// <param name="GenColumn">生成コードの列（0始まり・UTF-16 コードユニット単位）</param>
+/// <param name="SourceIndex">sources 配列のインデックス</param>
+/// <param name="SourceLine">元ファイルの行（0始まり）</param>
+internal readonly record struct SourceMapSegment(
+    int GenColumn,   // 生成コードの列（0始まり）
+    int SourceIndex, // sources 配列のインデックス
+    int SourceLine   // 元ファイルの行（0始まり）
+);
+
+/// <summary>
+/// Source Map v3 を解析した結果を保持するクラス。
+/// 生成コードの行ごとに「列 → 元ファイル位置」のセグメントリストを持つ。
+/// </summary>
+internal sealed class SourceMap
+{
+    /// <summary>元ファイルのパス一覧（sourceRoot 適用済み）</summary>
+    public IReadOnlyList<string> Sources { get; }
+
+    /// <summary>元ファイルのソース本文一覧（マップに埋め込まれていない場合は null。Sources と同じ長さ）</summary>
+    public IReadOnlyList<string> SourcesContent { get; }
+
+    /// <summary>生成コードの行ごとのセグメントリスト（インデックス = 生成コードの行番号、0始まり）</summary>
+    public IReadOnlyList<IReadOnlyList<SourceMapSegment>> GeneratedLines { get; }
+
+    private SourceMap(
+        IReadOnlyList<string> sources,
+        IReadOnlyList<string> sourcesContent,
+        IReadOnlyList<IReadOnlyList<SourceMapSegment>> generatedLines)
+    {
+        Sources        = sources;
+        SourcesContent = sourcesContent;
+        GeneratedLines = generatedLines;
+    }
+
+    /// <summary>
+    /// Source Map v3 の JSON を解析する。
+    /// 解析できない場合（不正な JSON・sections 形式・必須フィールド欠落）は null を返す。
+    /// </summary>
+    /// <param name="json">ソースマップの JSON 文字列</param>
+    /// <returns>解析結果。失敗時は null</returns>
+    public static SourceMap Parse(string json)
+    {
+        if (string.IsNullOrEmpty(json)) { return null; }
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object) { return null; }
+
+            // sections（インデックスマップ形式）は非対応のため null を返す
+            if (root.TryGetProperty("sections", out _)) { return null; }
+
+            // version フィールドがあれば 3 であることを確認する（欠落は許容する）
+            if (root.TryGetProperty("version", out var verProp)
+                && verProp.ValueKind == JsonValueKind.Number
+                && verProp.TryGetInt32(out int version)
+                && version != 3)
+            {
+                return null;
+            }
+
+            // sources（必須）を取り出す
+            if (!root.TryGetProperty("sources", out var sourcesProp) || sourcesProp.ValueKind != JsonValueKind.Array)
+            {
+                return null;
+            }
+
+            // sourceRoot があれば各 sources エントリの前に連結する（仕様どおり）
+            string sourceRoot = "";
+            if (root.TryGetProperty("sourceRoot", out var rootProp) && rootProp.ValueKind == JsonValueKind.String)
+            {
+                string rootTmp = rootProp.GetString();
+                if (rootTmp != null) { sourceRoot = rootTmp; }
+            }
+
+            var sources = new List<string>();
+            foreach (var s in sourcesProp.EnumerateArray())
+            {
+                string path = "";
+                if (s.ValueKind == JsonValueKind.String)
+                {
+                    string pathTmp = s.GetString();
+                    if (pathTmp != null) { path = pathTmp; }
+                }
+                // sourceRoot を連結する（区切りスラッシュは重複・欠落しないよう補完する）
+                if (sourceRoot.Length > 0)
+                {
+                    if (!sourceRoot.EndsWith('/') && !path.StartsWith('/'))
+                    {
+                        path = sourceRoot + "/" + path;
+                    }
+                    else
+                    {
+                        path = sourceRoot + path;
+                    }
+                }
+                sources.Add(path);
+            }
+
+            // sourcesContent（任意）を取り出す。sources と同じ長さになるよう null で埋める
+            var contents = new List<string>();
+            if (root.TryGetProperty("sourcesContent", out var contentProp) && contentProp.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var c in contentProp.EnumerateArray())
+                {
+                    if (c.ValueKind == JsonValueKind.String) { contents.Add(c.GetString()); }
+                    else { contents.Add(null); }
+                }
+            }
+            while (contents.Count < sources.Count) { contents.Add(null); }
+
+            // mappings（必須）をデコードする
+            if (!root.TryGetProperty("mappings", out var mappingsProp) || mappingsProp.ValueKind != JsonValueKind.String)
+            {
+                return null;
+            }
+            string mappings = mappingsProp.GetString();
+            if (mappings == null) { mappings = ""; }
+
+            var lines = DecodeMappings(mappings, sources.Count);
+            return new SourceMap(sources, contents, lines);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// mappings 文字列（Base64 VLQ）をデコードして生成行ごとのセグメントリストを作る。
+    /// セグメントは 1・4・5 フィールドのいずれか。元ファイル情報を持つ 4・5 フィールドのみ保持する。
+    /// 壊れた VLQ に遭遇した場合はその時点までのデコード結果を返す（部分的なマップとして利用する）。
+    /// </summary>
+    /// <param name="mappings">mappings フィールドの文字列</param>
+    /// <param name="sourceCount">sources 配列の要素数（範囲外参照のセグメントを捨てるために使う）</param>
+    private static List<IReadOnlyList<SourceMapSegment>> DecodeMappings(string mappings, int sourceCount)
+    {
+        var lines = new List<IReadOnlyList<SourceMapSegment>>();
+        var current = new List<SourceMapSegment>();
+
+        // VLQ のデルタ累積値（仕様: genCol は行ごとにリセット、src 系は行をまたいで累積）
+        int genCol  = 0;
+        int srcIdx  = 0;
+        int srcLine = 0;
+        int srcCol  = 0;
+        int nameIdx = 0;
+
+        int pos = 0;
+        while (true)
+        {
+            // 行末（';'）または文字列終端で現在の行を確定する
+            if (pos >= mappings.Length || mappings[pos] == ';')
+            {
+                lines.Add(current);
+                current = new List<SourceMapSegment>();
+                genCol = 0; // 生成列は行ごとにリセットする
+                if (pos >= mappings.Length) { break; }
+                pos++;
+                continue;
+            }
+            // セグメント区切り
+            if (mappings[pos] == ',') { pos++; continue; }
+
+            // フィールド1: 生成コードの列デルタ
+            if (!TryDecodeVlq(mappings, ref pos, out int dGenCol)) { lines.Add(current); return lines; }
+            genCol += dGenCol;
+
+            // フィールド2〜4（元ファイル情報）があるかどうかを次の文字で判定する
+            bool hasSourceInfo = pos < mappings.Length && mappings[pos] != ',' && mappings[pos] != ';';
+            if (hasSourceInfo)
+            {
+                if (!TryDecodeVlq(mappings, ref pos, out int dSrcIdx))  { lines.Add(current); return lines; }
+                if (!TryDecodeVlq(mappings, ref pos, out int dSrcLine)) { lines.Add(current); return lines; }
+                if (!TryDecodeVlq(mappings, ref pos, out int dSrcCol))  { lines.Add(current); return lines; }
+                srcIdx  += dSrcIdx;
+                srcLine += dSrcLine;
+                srcCol  += dSrcCol;
+
+                // フィールド5（名前インデックス）があれば消費する（行単位集計では使わない）
+                if (pos < mappings.Length && mappings[pos] != ',' && mappings[pos] != ';')
+                {
+                    if (!TryDecodeVlq(mappings, ref pos, out int dNameIdx)) { lines.Add(current); return lines; }
+                    nameIdx += dNameIdx;
+                }
+                _ = nameIdx; // 累積は仕様上必要だが値自体は未使用
+
+                // 範囲外の参照（壊れたマップ）は捨てる
+                if (srcIdx >= 0 && srcIdx < sourceCount && srcLine >= 0 && genCol >= 0)
+                {
+                    current.Add(new SourceMapSegment(genCol, srcIdx, srcLine));
+                }
+            }
+        }
+        return lines;
+    }
+
+    /// <summary>
+    /// Base64 VLQ の1値をデコードする。pos はデコードした分だけ進む。
+    /// </summary>
+    /// <returns>デコードに成功したら true</returns>
+    private static bool TryDecodeVlq(string s, ref int pos, out int value)
+    {
+        int result = 0;
+        int shift  = 0;
+        while (true)
+        {
+            if (pos >= s.Length) { value = 0; return false; }
+            int digit = Base64Value(s[pos]);
+            if (digit < 0) { value = 0; return false; }
+            pos++;
+            result |= (digit & 31) << shift;
+            // 継続ビット（32）が立っていなければ終端
+            if ((digit & 32) == 0) { break; }
+            shift += 5;
+            // 32bit を超える値は壊れたマップとみなす（シフトオーバーフロー防止）
+            if (shift > 30) { value = 0; return false; }
+        }
+        // 最下位ビットが符号（1 = 負）
+        bool negative = (result & 1) == 1;
+        result >>= 1;
+        if (negative) { value = -result; } else { value = result; }
+        return true;
+    }
+
+    /// <summary>
+    /// Base64 文字（A-Za-z0-9+/）を 0〜63 の値に変換する。不正な文字は -1。
+    /// </summary>
+    private static int Base64Value(char c)
+    {
+        if (c >= 'A' && c <= 'Z') { return c - 'A'; }
+        if (c >= 'a' && c <= 'z') { return c - 'a' + 26; }
+        if (c >= '0' && c <= '9') { return c - '0' + 52; }
+        if (c == '+') { return 62; }
+        if (c == '/') { return 63; }
+        return -1;
+    }
+}
+
+/// <summary>
+/// スクリプトソース末尾の sourceMappingURL コメントを抽出する静的クラス。
+/// </summary>
+internal static class SourceMapUrlExtractor
+{
+    /// <summary>
+    /// ソースコードから sourceMappingURL コメントの値を抽出する。
+    /// 対応形式: //# sourceMappingURL=URL および //@ sourceMappingURL=URL（レガシー）。
+    /// 複数ある場合は最後の出現を使う（バンドラーが末尾に付け直すため）。
+    /// </summary>
+    /// <param name="source">スクリプトのソースコード全文</param>
+    /// <returns>マップの URL（相対・絶対・data: のいずれか）。見つからない場合は null</returns>
+    public static string Extract(string source)
+    {
+        if (string.IsNullOrEmpty(source)) { return null; }
+
+        const string marker = "sourceMappingURL=";
+        int idx = source.LastIndexOf(marker, StringComparison.Ordinal);
+        if (idx < 0) { return null; }
+
+        // marker の前方の空白（スペース・タブ）をスキップして '#' または '@' を探す
+        // （仕様の形式は "//# sourceMappingURL=..." で # の後に空白が入る）
+        int hashPos = idx - 1;
+        while (hashPos >= 0 && (source[hashPos] == ' ' || source[hashPos] == '\t')) { hashPos--; }
+        if (hashPos < 0) { return null; }
+        char h = source[hashPos];
+        if (h != '#' && h != '@') { return null; }
+
+        // さらにその直前に "//" が連続していること（//# / //@ 形式のコメントのみ受け付ける）
+        if (hashPos < 2 || source[hashPos - 1] != '/' || source[hashPos - 2] != '/')
+        {
+            return null;
+        }
+
+        // 値部分: marker の直後から空白・改行の手前まで
+        int valStart = idx + marker.Length;
+        int valEnd   = valStart;
+        while (valEnd < source.Length && !char.IsWhiteSpace(source[valEnd])) { valEnd++; }
+        if (valEnd == valStart) { return null; }
+        return source.Substring(valStart, valEnd - valStart);
+    }
+}
+
+/// <summary>
+/// 生成コードの文字単位カバレッジマップを、ソースマップを使って元ファイルの行単位カバレッジに射影する静的クラス。
+/// </summary>
+internal static class SourceMapProjector
+{
+    /// <summary>この元ファイル行に対応する生成コードに実行済み（1）の文字があったことを示すフラグ</summary>
+    public const int CoveredFlag = 1;
+
+    /// <summary>この元ファイル行に対応する生成コードに未実行（0）の文字があったことを示すフラグ</summary>
+    public const int UncoveredFlag = 2;
+
+    /// <summary>
+    /// 生成コードのカバレッジマップを元ファイルの行単位に集計する。
+    /// 各セグメントの生成コード範囲（このセグメントの列から同じ行の次のセグメントの列まで）の
+    /// カバレッジ値を調べ、対応する元ファイルの行にフラグを立てる。
+    /// </summary>
+    /// <param name="generatedSource">生成コード（バンドル後 JS）の全文。BOM 除去済みであること</param>
+    /// <param name="map">BuildCoverageMap が返した文字単位カバレッジマップ（generatedSource と同じ長さ）</param>
+    /// <param name="sourceMap">解析済みソースマップ</param>
+    /// <returns>sourceIndex → (元ファイルの行番号 → フラグ) の辞書。カバレッジ情報のない行は含まれない</returns>
+    public static Dictionary<int, Dictionary<int, int>> Project(string generatedSource, int[] map, SourceMap sourceMap)
+    {
+        var result = new Dictionary<int, Dictionary<int, int>>();
+        if (string.IsNullOrEmpty(generatedSource) || map == null || sourceMap == null) { return result; }
+
+        // 生成コードの各行の開始オフセットを求める（ソースマップの行・列は 0 始まり、行は '\n' 区切り）
+        var lineStarts = new List<int> { 0 };
+        for (int i = 0; i < generatedSource.Length; i++)
+        {
+            if (generatedSource[i] == '\n') { lineStarts.Add(i + 1); }
+        }
+
+        int lineCount = Math.Min(lineStarts.Count, sourceMap.GeneratedLines.Count);
+        for (int line = 0; line < lineCount; line++)
+        {
+            var segments = sourceMap.GeneratedLines[line];
+            if (segments.Count == 0) { continue; }
+
+            int lineStart = lineStarts[line];
+            // 行末オフセット（'\n' 自体は含めない）
+            int lineEnd;
+            if (line + 1 < lineStarts.Count) { lineEnd = lineStarts[line + 1] - 1; }
+            else { lineEnd = generatedSource.Length; }
+
+            for (int j = 0; j < segments.Count; j++)
+            {
+                var seg = segments[j];
+                // このセグメントが対応する生成コードの範囲: [自分の列, 次のセグメントの列)（最後は行末まで）
+                int spanStart = lineStart + seg.GenColumn;
+                int spanEnd;
+                if (j + 1 < segments.Count) { spanEnd = lineStart + segments[j + 1].GenColumn; }
+                else { spanEnd = lineEnd; }
+
+                // マップ範囲・行範囲にクランプする（壊れたマップへの防衛処理）
+                if (spanStart < 0) { spanStart = 0; }
+                if (spanEnd > lineEnd) { spanEnd = lineEnd; }
+                if (spanEnd > map.Length) { spanEnd = map.Length; }
+                if (spanStart >= spanEnd) { continue; }
+
+                // 範囲内のカバレッジ値を調べる（1 = 実行済み、0 = 未実行、-1 = 対象外）
+                bool hasCovered   = false;
+                bool hasUncovered = false;
+                for (int k = spanStart; k < spanEnd; k++)
+                {
+                    if (map[k] == 1) { hasCovered = true; }
+                    else if (map[k] == 0) { hasUncovered = true; }
+                    if (hasCovered && hasUncovered) { break; }
+                }
+                if (!hasCovered && !hasUncovered) { continue; } // 全文字が対象外 → 集計しない
+
+                // 元ファイルの行にフラグを集約する
+                Dictionary<int, int> lineFlags;
+                if (!result.TryGetValue(seg.SourceIndex, out lineFlags))
+                {
+                    lineFlags = new Dictionary<int, int>();
+                    result[seg.SourceIndex] = lineFlags;
+                }
+                lineFlags.TryGetValue(seg.SourceLine, out int flags);
+                if (hasCovered)   { flags |= CoveredFlag; }
+                if (hasUncovered) { flags |= UncoveredFlag; }
+                lineFlags[seg.SourceLine] = flags;
+            }
+        }
+        return result;
+    }
+}
+
+// ============================================================================
+// 以下は旧 CoverageExporter.cs から統合した型（LCOV / JSON 形式のエクスポート）。
+// ルール「関連機能は全てこのソース内に収める」に従い Report.cs へ取り込んだ。
+// ============================================================================
+
+/// <summary>
+/// エクスポート用に1スクリプト（URL ごとの合成済みグループ）分のデータをまとめるレコード。
+/// HtmlReportGenerator.Generate がレポート生成中に蓄積する。
+/// </summary>
+/// <param name="Url">スクリプトの URL</param>
+/// <param name="Pages">読み込まれた画面のリスト（タブ番号は1始まり）</param>
+/// <param name="LineStatuses">合成（OR マージ済み）カバレッジの行ステータス（インデックス = 0始まり行番号）</param>
+/// <param name="SourceFiles">ソースマップで解決した元ファイルのリスト（マップなしの場合は空）</param>
+internal sealed record ExportScriptData(
+    string                                       Url,          // スクリプトの URL
+    IReadOnlyList<(int Tab, string PageUrl)>     Pages,        // 画面（タブ番号・URL）のリスト
+    IReadOnlyList<LineCoverageStatus>            LineStatuses, // 合成カバレッジの行ステータス
+    IReadOnlyList<ExportSourceFileData>          SourceFiles   // 元ファイル別データ（ソースマップ解決時のみ）
+);
+
+/// <summary>
+/// エクスポート用に元ファイル1つ分の行カバレッジをまとめるレコード。
+/// </summary>
+/// <param name="Path">元ファイルのパス（ソースマップの sources の値）</param>
+/// <param name="LineFlags">行番号（0始まり）→ SourceMapProjector のフラグ の辞書</param>
+internal sealed record ExportSourceFileData(
+    string                          Path,      // 元ファイルのパス
+    IReadOnlyDictionary<int, int>   LineFlags  // 行番号 → カバレッジフラグ
+);
+
+/// <summary>
+/// カバレッジデータを機械可読形式（LCOV・JSON）に変換する静的クラス。
+/// LCOV は VSCode Coverage Gutters・Codecov・SonarQube・ReportGenerator などの既存ツール連携用、
+/// JSON はしきい値判定・ベースライン比較・独自集計などのスクリプト処理用。
+/// </summary>
+internal static class CoverageExporter
+{
+    /// <summary>
+    /// LCOV 形式（lcov.info）の文字列を生成する。
+    /// ソースマップが解決できたスクリプトは元ファイル（TypeScript 等）単位で出力し、
+    /// 解決できなかったスクリプトはスクリプト URL を SF パスとして出力する。
+    /// 行の変換規則: 実行済み・部分実行 → DA:行,1 / 未実行 → DA:行,0 / 対象外 → レコードなし。
+    /// </summary>
+    /// <param name="scripts">エクスポート用スクリプトデータのリスト</param>
+    /// <returns>LCOV 形式の文字列</returns>
+    internal static string BuildLcov(IReadOnlyList<ExportScriptData> scripts)
+    {
+        var sb = new StringBuilder();
+        if (scripts == null) { return ""; }
+
+        foreach (var script in scripts)
+        {
+            if (script.SourceFiles.Count > 0)
+            {
+                // ソースマップ解決済み: 元ファイル単位で出力する
+                // （バンドル行は出力しない — 元ファイルと二重計上になり、ミニファイ行は連携先で意味を持たないため）
+                foreach (var sourceFile in script.SourceFiles)
+                {
+                    EmitLcovRecord(sb, sourceFile.Path, BuildLinesFromFlags(sourceFile.LineFlags));
+                }
+            }
+            else
+            {
+                // マップなし: スクリプト URL をパスとして合成カバレッジを出力する
+                EmitLcovRecord(sb, script.Url, BuildLinesFromStatuses(script.LineStatuses));
+            }
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// LCOV の1レコード（SF / DA / LF / LH / end_of_record）を書き出す。
+    /// </summary>
+    /// <param name="sb">出力先の StringBuilder</param>
+    /// <param name="path">SF レコードのパス</param>
+    /// <param name="lines">（1始まり行番号, 実行回数）のリスト</param>
+    private static void EmitLcovRecord(StringBuilder sb, string path, List<(int Line, int Hits)> lines)
+    {
+        // パスに改行が含まれると LCOV が壊れるため除去する（防衛処理）
+        string safePath = path;
+        if (safePath == null) { safePath = ""; }
+        safePath = safePath.Replace("\r", "").Replace("\n", "");
+
+        sb.Append("SF:").Append(safePath).Append('\n');
+
+        // 行番号順に DA レコードを出力する
+        lines.Sort((a, b) => a.Line.CompareTo(b.Line));
+        int hitLines = 0;
+        foreach (var (line, hits) in lines)
+        {
+            sb.Append("DA:").Append(line).Append(',').Append(hits).Append('\n');
+            if (hits > 0) { hitLines++; }
+        }
+
+        // LF = 計測対象の行数、LH = 実行された行数
+        sb.Append("LF:").Append(lines.Count).Append('\n');
+        sb.Append("LH:").Append(hitLines).Append('\n');
+        sb.Append("end_of_record\n");
+    }
+
+    /// <summary>
+    /// 行ステータスのリストから LCOV の DA 行リストを作る。
+    /// </summary>
+    private static List<(int Line, int Hits)> BuildLinesFromStatuses(IReadOnlyList<LineCoverageStatus> statuses)
+    {
+        var lines = new List<(int Line, int Hits)>();
+        if (statuses == null) { return lines; }
+        for (int i = 0; i < statuses.Count; i++)
+        {
+            // 実行済み・部分実行 → 1、未実行 → 0、対象外 → レコードなし
+            if (statuses[i] == LineCoverageStatus.Covered || statuses[i] == LineCoverageStatus.Partial)
+            {
+                lines.Add((i + 1, 1));
+            }
+            else if (statuses[i] == LineCoverageStatus.Uncovered)
+            {
+                lines.Add((i + 1, 0));
+            }
+        }
+        return lines;
+    }
+
+    /// <summary>
+    /// SourceMapProjector のフラグ辞書から LCOV の DA 行リストを作る。
+    /// </summary>
+    private static List<(int Line, int Hits)> BuildLinesFromFlags(IReadOnlyDictionary<int, int> lineFlags)
+    {
+        var lines = new List<(int Line, int Hits)>();
+        if (lineFlags == null) { return lines; }
+        foreach (var kv in lineFlags)
+        {
+            // 実行済みフラグが立っていれば（部分実行含む）1、未実行のみなら 0
+            if ((kv.Value & SourceMapProjector.CoveredFlag) != 0)
+            {
+                lines.Add((kv.Key + 1, 1));
+            }
+            else if ((kv.Value & SourceMapProjector.UncoveredFlag) != 0)
+            {
+                lines.Add((kv.Key + 1, 0));
+            }
+        }
+        return lines;
+    }
+
+    // -----------------------------------------------------------------------
+    // JSON エクスポート
+    // -----------------------------------------------------------------------
+
+    // JSON シリアライズ設定（camelCase・インデント付き）
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        WriteIndented        = true,
+    };
+
+    // JSON 出力用の DTO（シリアライズ専用のため private record にする）
+    private sealed record JsonReport(string GeneratedAt, JsonTotals Overall, List<JsonScript> Scripts);
+    private sealed record JsonTotals(int Covered, int Partial, int Total, double Rate);
+    private sealed record JsonScript(string Url, List<JsonPage> Pages, JsonTotals Lines, List<JsonSourceFile> SourceFiles);
+    private sealed record JsonPage(int Tab, string Url);
+    private sealed record JsonSourceFile(string Path, int Covered, int Partial, int Total, double Rate);
+
+    /// <summary>
+    /// JSON 形式（coverage.json）の文字列を生成する。
+    /// 全体集計・スクリプト別の行数とカバレッジ率・画面情報・元ファイル別集計を含む。
+    /// カバレッジ率は HTML レポートと同じ計算式（部分実行 = 0.5 行換算）で小数1桁に丸める。
+    /// </summary>
+    /// <param name="scripts">エクスポート用スクリプトデータのリスト</param>
+    /// <param name="generatedAt">レポート生成日時</param>
+    /// <returns>JSON 形式の文字列</returns>
+    internal static string BuildJson(IReadOnlyList<ExportScriptData> scripts, DateTimeOffset generatedAt)
+    {
+        var jsonScripts  = new List<JsonScript>();
+        int totalCovered = 0;
+        int totalPartial = 0;
+        int totalLines   = 0;
+
+        if (scripts != null)
+        {
+            foreach (var script in scripts)
+            {
+                // 合成カバレッジの行数を集計する（HTML レポートのサマリーと同じ規則）
+                int covered = 0;
+                int partial = 0;
+                int total   = 0;
+                foreach (var status in script.LineStatuses)
+                {
+                    if (status == LineCoverageStatus.Covered)        { covered++; total++; }
+                    else if (status == LineCoverageStatus.Partial)   { partial++; total++; }
+                    else if (status == LineCoverageStatus.Uncovered) { total++; }
+                }
+                totalCovered += covered;
+                totalPartial += partial;
+                totalLines   += total;
+
+                // 画面情報を DTO に変換する
+                var pages = new List<JsonPage>();
+                foreach (var (tab, pageUrl) in script.Pages)
+                {
+                    pages.Add(new JsonPage(tab, pageUrl));
+                }
+
+                // 元ファイル別の集計を DTO に変換する
+                var sourceFiles = new List<JsonSourceFile>();
+                foreach (var sourceFile in script.SourceFiles)
+                {
+                    int srcCovered = 0;
+                    int srcPartial = 0;
+                    int srcTotal   = 0;
+                    foreach (int flags in sourceFile.LineFlags.Values)
+                    {
+                        if (flags == (SourceMapProjector.CoveredFlag | SourceMapProjector.UncoveredFlag))
+                        {
+                            srcPartial++;
+                        }
+                        else if (flags == SourceMapProjector.CoveredFlag)
+                        {
+                            srcCovered++;
+                        }
+                        srcTotal++;
+                    }
+                    sourceFiles.Add(new JsonSourceFile(sourceFile.Path, srcCovered, srcPartial, srcTotal, CalcRate(srcCovered, srcPartial, srcTotal)));
+                }
+
+                jsonScripts.Add(new JsonScript(
+                    script.Url,
+                    pages,
+                    new JsonTotals(covered, partial, total, CalcRate(covered, partial, total)),
+                    sourceFiles));
+            }
+        }
+
+        var report = new JsonReport(
+            generatedAt.ToString("yyyy-MM-dd'T'HH:mm:sszzz"),
+            new JsonTotals(totalCovered, totalPartial, totalLines, CalcRate(totalCovered, totalPartial, totalLines)),
+            jsonScripts);
+
+        return JsonSerializer.Serialize(report, JsonOptions);
+    }
+
+    /// <summary>
+    /// カバレッジ率を計算する（部分実行 = 0.5 行換算・小数1桁丸め・対象行0のときは 0）。
+    /// HTML レポートと同じ計算式を使う。
+    /// </summary>
+    private static double CalcRate(int covered, int partial, int total)
+    {
+        if (total <= 0) { return 0; }
+        return Math.Round(100.0 * (covered + partial * 0.5) / total, 1);
+    }
 }

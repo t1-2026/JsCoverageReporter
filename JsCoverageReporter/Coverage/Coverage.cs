@@ -1,4 +1,8 @@
-#nullable disable
+// annotations コンテキストのみ有効化する:
+// このファイルは ICDPSession? のような null 許容注釈を使用しており、
+// #nullable disable のままだと CS8632 警告がビルドのたびに12件出ていた。
+// 警告分析 (warnings) は従来どおり無効のため、既存コードの挙動・警告は変わらない。
+#nullable enable annotations
 
 using Microsoft.Playwright;
 
@@ -47,9 +51,17 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
     private readonly Dictionary<IPage, long>                   _lastSnapshotTick    = [];
     // ページごとのタブ番号（SetupPageAsync で登録順に付番。O(1) で取得するため Dictionary を使う）
     private readonly Dictionary<IPage, int>                    _tabIndices          = [];
+    // ページごとのスナップショット直列化セマフォ（同一ページの CDP 操作の並行実行を防ぐ）。
+    // reqHandler/closeHandler の中間スナップショットと BeforePageCloseAsync が同一 CDP セッションに
+    // 対して Profiler.takePreciseCoverage / Debugger.getScriptSource を並行発行すると、
+    // 同一 scriptId の二重処理（無駄な往復・キャッシュの TOCTOU）が起きうるため、ページ単位で直列化する。
+    // ページが異なれば別 CDP セッションのため並行実行を許す（グローバルロックにしない）。
+    private readonly Dictionary<IPage, SemaphoreSlim>          _pageSnapshotLocks   = [];
     // スナップショットのスロットリング間隔（ミリ秒）（この間隔内の連続スナップショットはスキップする）
     // テストからインスタンスごとに 0 に設定することでスロットリングを無効化できる（internal にしてテスト性を確保）
-    internal long SnapshotThrottleMs = 500;
+    // volatile: reqHandler の _lock 内で読まれるためメモリ可視性を保証する。
+    //           C# では long に volatile を付けられないため int を使用（500ms は int で十分）
+    internal volatile int SnapshotThrottleMs = 500;
 
     // window.close() オーバーライドが fetch を送る特殊 URL。
     // Playwright がこの URL をインターセプトしてスナップショットを取り、応答後に close を実行させる。
@@ -76,16 +88,15 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
     /// </summary>
     /// <param name="scriptFilters">URLにいずれかの文字列を含むスクリプトだけを返す（null または省略で全部）</param>
     /// <param name="scriptExcludes">URLにいずれかの文字列を含むスクリプトを除外する（null または省略で除外なし）</param>
-    public async Task StartAsync(IReadOnlyList<string> scriptFilters = null, IReadOnlyList<string> scriptExcludes = null)
+    public async Task StartAsync(IReadOnlyList<string>? scriptFilters = null, IReadOnlyList<string>? scriptExcludes = null)
     {
         // null の場合はフィルターなし（全スクリプト対象）として扱う
         // フィルターをインスタンスフィールドに保存する（中間スナップショット時にも参照する）
         // 参照型の代入は .NET のメモリモデル上アトミックなため、バックグラウンドタスクとのロック不要
-        if (scriptFilters == null) { _scriptFilters = []; } else { _scriptFilters = scriptFilters; }
-        if (scriptExcludes == null) { _scriptExcludes = []; } else { _scriptExcludes = scriptExcludes; }
-
-        // 最初のページ（コンストラクタで渡されたページ）のカバレッジを開始する
-        await SetupPageAsync(page);
+        // ToArray で防衛コピーする（呼び出し元が渡したリストを後から変更しても
+        // バックグラウンドのスナップショットタスクが読むフィルターは変わらないようにする）
+        if (scriptFilters == null) { _scriptFilters = []; } else { _scriptFilters = scriptFilters.ToArray(); }
+        if (scriptExcludes == null) { _scriptExcludes = []; } else { _scriptExcludes = scriptExcludes.ToArray(); }
 
         // 既存のイベントハンドラがあれば先に解除する（StartAsync の二重呼び出し対策）
         if (_pageEventHandler != null)
@@ -97,15 +108,33 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
         // 新しいタブが開いたとき自動でカバレッジを開始するイベントハンドラを定義する
         _pageEventHandler = (_, newPage) =>
         {
+            // StopAsync / DisposeAsync 完了後に in-flight のイベントが届いた場合は何もしない
+            // （停止後に SetupPageAsync が走ると Profiler が有効なまま残り、
+            //   ハンドラが解除パスの後に登録されて永久にリークするため）
+            lock (_lock)
+            {
+                if (_stopped) { return; }
+            }
             var task = SetupPageAsync(newPage);
             lock (_lock)
             {
+                // タスク開始後に StopAsync が完了していた場合は追加しない。
+                // 追加しても既にドレイン済みのループには届かず、
+                // SetupPageAsync 先頭の _stopped チェックが早期リターンするため実害は
+                // 最小だが、不要な登録によるリークを避ける。
+                if (_stopped) { return; }
                 _pageSetupTasks.Add(task);
             }
         };
 
-        // 新しいタブが開いたときのイベントを購読する
+        // 初期ページのセットアップより先にイベントを購読する。
+        // 後から購読すると、初期ページのスクリプトがセットアップ中（CDP セッション作成等の await 中）に
+        // window.open で開いたタブの Page イベントを取りこぼし、そのタブが追跡されない。
+        // SetupPageAsync は追跡済みページをスキップするため、先に購読しても二重セットアップは起きない。
         page.Context.Page += _pageEventHandler;
+
+        // 最初のページ（コンストラクタで渡されたページ）のカバレッジを開始する
+        await SetupPageAsync(page);
     }
 
     /// <summary>
@@ -118,6 +147,10 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
         // 追跡ページリストにこのページを追加する（追加順がタブ番号になる）
         lock (_lock)
         {
+            // StopAsync / DisposeAsync 完了後に呼ばれた場合は何もしない
+            // （停止後にセットアップすると Profiler が停止されないまま残り、
+            //   登録したイベントハンドラも解除されずリークするため）
+            if (_stopped) { return; }
             // 既に追跡中のページはスキップする（_scriptCache は _trackedPages と同時追加なので O(1) で判定できる）
             if (_scriptCache.ContainsKey(targetPage)) { return; }
             _trackedPages.Add(targetPage);
@@ -125,14 +158,30 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
             _scriptCache[targetPage] = new Dictionary<string, ScriptCoverage>();
             // タブ番号を Dictionary に記録する（_trackedPages.IndexOf より O(1) で取得できる）
             _tabIndices[targetPage] = _trackedPages.Count - 1;
+            // このページのスナップショット直列化セマフォを初期化する（同一ページの CDP 操作の並行実行を防ぐ）
+            _pageSnapshotLocks[targetPage] = new SemaphoreSlim(1, 1);
         }
 
         // ページに接続したCDPセッションを作成する
         var cdp = await targetPage.Context.NewCDPSessionAsync(targetPage);
 
+        // await 中に StopAsync / DisposeAsync が完了していた場合、Profiler の開始を省略して返る。
+        // _trackedPages / _scriptCache への追加は既に完了しているが、
+        // Profiler/Debugger を有効化しないことでリソースリークを防ぐ。
+        // イベントハンドラも登録しないため StopAsync 後のハンドラリークが起きない。
+        bool stoppedAfterCdp;
         lock (_lock)
         {
-            _cdpSessions[targetPage] = cdp;
+            stoppedAfterCdp = _stopped;
+            if (!_stopped)
+            {
+                _cdpSessions[targetPage] = cdp;
+            }
+        }
+        if (stoppedAfterCdp)
+        {
+            try { await cdp.DisposeAsync(); } catch (Exception) { }
+            return;
         }
 
         // V8 Profilerを有効にする
@@ -324,49 +373,62 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
     /// <param name="pageUrl">スナップショット時点のページ URL（ナビゲーション前の URL）</param>
     private async Task TakeIntermediateSnapshotAsync(IPage targetPage, string pageUrl)
     {
-        // このページの CDP セッションとタブ番号を取得する
+        // このページの CDP セッション・タブ番号・直列化セマフォを取得する
         ICDPSession? cdp;
         int tabIndex;
+        SemaphoreSlim? snapshotLock;
         lock (_lock)
         {
             _cdpSessions.TryGetValue(targetPage, out cdp);
             // _tabIndices は SetupPageAsync で O(1) で登録済み（_trackedPages.IndexOf より高速）
             if (!_tabIndices.TryGetValue(targetPage, out tabIndex)) { tabIndex = -1; }
+            _pageSnapshotLocks.TryGetValue(targetPage, out snapshotLock);
         }
         if (cdp == null) { return; }
 
-        // スナップショットを取得する（Profiler は停止しない）
-        // takePreciseCoverage はカウントをリセットしないため、複数回呼んでも実行数は累積される。
-        // StopAsync の最終収集（FinalCollectFromPageAsync）でも同じ API を呼ぶが、
-        // キャッシュ更新時に最新の functions で上書きするため問題ない。
-        // 中間スナップショットの目的は「ナビゲーション前に確定したスクリプトを正確な URL で記録する」ことであり、
-        // 実行数の精度より URL の正確性を優先している。
-        System.Text.Json.JsonElement? result = null;
+        // 同一ページの CDP 操作を直列化する（reqHandler/closeHandler/BeforePageCloseAsync の
+        // スナップショットが同一セッションへ並行発行されるのを防ぐ）。
+        // snapshotLock は cdp が非 null なら SetupPageAsync で必ず初期化済みだが、防御的に null も許容する。
+        if (snapshotLock != null) { await snapshotLock.WaitAsync(); }
         try
         {
-            result = await cdp.SendAsync("Profiler.takePreciseCoverage");
+            // スナップショットを取得する（Profiler は停止しない）
+            // takePreciseCoverage はカウントをリセットしないため、複数回呼んでも実行数は累積される。
+            // StopAsync の最終収集（FinalCollectFromPageAsync）でも同じ API を呼ぶが、
+            // キャッシュ更新時に最新の functions で上書きするため問題ない。
+            // 中間スナップショットの目的は「ナビゲーション前に確定したスクリプトを正確な URL で記録する」ことであり、
+            // 実行数の精度より URL の正確性を優先している。
+            System.Text.Json.JsonElement? result = null;
+            try
+            {
+                result = await cdp.SendAsync("Profiler.takePreciseCoverage");
+            }
+            catch (Exception ex)
+            {
+                // ナビゲーション中の CDP エラーは警告として記録してスキップする
+                Console.Error.WriteLine($"[Warning] Intermediate snapshot failed for tab {tabIndex}: {ex.Message}");
+                return;
+            }
+
+            if (result == null) { return; }
+
+            // この時点でのページ情報（ナビゲーション前の URL）でスクリプトを記録する
+            var pageInfo = new PageInfo(tabIndex, pageUrl);
+
+            // このページのキャッシュマップを取得する
+            Dictionary<string, ScriptCoverage>? scriptCache;
+            lock (_lock)
+            {
+                _scriptCache.TryGetValue(targetPage, out scriptCache);
+            }
+            if (scriptCache == null) { return; }
+
+            await ProcessNewScriptsAsync(result.Value, cdp, pageInfo, scriptCache);
         }
-        catch (Exception ex)
+        finally
         {
-            // ナビゲーション中の CDP エラーは警告として記録してスキップする
-            Console.Error.WriteLine($"[Warning] Intermediate snapshot failed for tab {tabIndex}: {ex.Message}");
-            return;
+            if (snapshotLock != null) { snapshotLock.Release(); }
         }
-
-        if (result == null) { return; }
-
-        // この時点でのページ情報（ナビゲーション前の URL）でスクリプトを記録する
-        var pageInfo = new PageInfo(tabIndex, pageUrl);
-
-        // このページのキャッシュマップを取得する
-        Dictionary<string, ScriptCoverage>? scriptCache;
-        lock (_lock)
-        {
-            _scriptCache.TryGetValue(targetPage, out scriptCache);
-        }
-        if (scriptCache == null) { return; }
-
-        await ProcessNewScriptsAsync(result.Value, cdp, pageInfo, scriptCache);
     }
 
     /// <summary>
@@ -385,6 +447,12 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
         {
             return;
         }
+
+        // volatile フィールドをローカルに1回だけ読む。
+        // ループ中に StartAsync が再呼び出しされても、このスナップショット処理内では
+        // 同一のフィルター・除外リストで一貫して判定する。
+        IReadOnlyList<string> scriptFilters  = _scriptFilters;
+        IReadOnlyList<string> scriptExcludes = _scriptExcludes;
 
         foreach (var entry in resultArray.EnumerateArray())
         {
@@ -416,13 +484,13 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
             if (string.IsNullOrEmpty(scriptId)) { continue; }
 
             // scriptFilters に一致するスクリプトのみ処理する
-            if (_scriptFilters.Count > 0 && !_scriptFilters.Any(f => url.Contains(f, StringComparison.OrdinalIgnoreCase)))
+            if (scriptFilters.Count > 0 && !scriptFilters.Any(f => url.Contains(f, StringComparison.OrdinalIgnoreCase)))
             {
                 continue;
             }
 
             // scriptExcludes に一致するスクリプトは除外する
-            if (_scriptExcludes.Any(e => url.Contains(e, StringComparison.OrdinalIgnoreCase)))
+            if (scriptExcludes.Any(e => url.Contains(e, StringComparison.OrdinalIgnoreCase)))
             {
                 continue;
             }
@@ -487,14 +555,26 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
                         foreach (var r in rangesArray.EnumerateArray())
                         {
                             // フォールバック値の設計:
-                        //   プロパティ不在 → 0（デフォルト値として安全。BuildCoverageMap でクランプされる）
-                        //   パース失敗(文字列等) → int.MaxValue（範囲をクランプで無効化して安全にスキップする）
-                        int start;
-                            if (r.TryGetProperty("startOffset", out var sProp)) { if (!sProp.TryGetInt32(out start)) { start = int.MaxValue; } } else { start = 0; }
-                            int end;
-                            if (r.TryGetProperty("endOffset",   out var eProp)) { if (!eProp.TryGetInt32(out end))   { end   = int.MaxValue; } } else { end   = 0; }
+                            //   プロパティ不在 → 0（デフォルト値として安全。BuildCoverageMap でクランプされる）
+                            //   start/end のパース失敗(文字列等) → 範囲を空(start==end==0)にして無効化する。
+                            //     旧実装は int.MaxValue をフォールバックしていたが、(a) endOffset だけ失敗した場合
+                            //     Math.Min(end, source.Length) によってソース末尾までの範囲に化け「無効化」にならず、
+                            //     (b) 片方を int.MaxValue にすると size = EndOffset - StartOffset の計算が
+                            //     オーバーフローしてソート比較が不安定になる恐れがあった。両方 0 にそろえれば
+                            //     size 0 の空範囲となり、書き込みもオーバーフローも起きず安全。
+                            //   count のパース失敗 → int.MaxValue（V8 のホットな関数は呼び出し回数が int の範囲
+                            //     (約21億) を超えることがあり TryGetInt32 が失敗する。0 にすると「未実行」と
+                            //     誤判定されるため、実行済み (count > 0) を保ちつつ最大回数として扱う。
+                            //     この int.MaxValue は実行回数ツールチップで「21億回以上」と表示される（Report 側で対応）。
+                            int start = 0;
+                            int end   = 0;
+                            bool offsetsValid = true;
+                            if (r.TryGetProperty("startOffset", out var sProp)) { if (!sProp.TryGetInt32(out start)) { offsetsValid = false; } }
+                            if (r.TryGetProperty("endOffset",   out var eProp)) { if (!eProp.TryGetInt32(out end))   { offsetsValid = false; } }
+                            // オフセットがパースできない異常データは範囲を空にして無効化する
+                            if (!offsetsValid) { start = 0; end = 0; }
                             int count;
-                            if (r.TryGetProperty("count",       out var cProp)) { if (!cProp.TryGetInt32(out count)) { count = 1;           } } else { count = 0; }
+                            if (r.TryGetProperty("count",       out var cProp)) { if (!cProp.TryGetInt32(out count)) { count = int.MaxValue; } } else { count = 0; }
                             ranges.Add(new CoverageRange(start, end, count));
                         }
                     }
@@ -562,25 +642,24 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
 
         // スナップショットタスクを _snapTasks に登録してから await する。
         // StopAsync は _snapTasks をドレインしてから _scriptCache を読み出すため、
-        // 登録しないと並走する StopAsync がスナップショット書き込み前に allScripts を返し
-        // 閉じたタブのカバレッジデータが欠落する可能性がある。
+        // 登録することで並走する StopAsync がドレイン中ならスナップショット完了を確実に待てる。
+        // ドレイン済みの場合でも常に await することで _scriptCache への書き込みが
+        // allScripts 組み立て前に完了することを保証する。
+        // （_stopped が true でもタスクは既に開始済みのため await が必要。
+        //   CDP セッションが解放済みの場合は TakeIntermediateSnapshotAsync 内の
+        //   try-catch で吸収される）
         var snapTask = TakeIntermediateSnapshotAsync(targetPage, currentUrl);
-        bool shouldAwait;
         lock (_lock)
         {
-            // lock 内で _stopped を再確認する（先頭チェック後に StopAsync が完了した場合の TOCTOU 対策）
+            // _stopped が false なら StopAsync のドレインループがこのタスクを拾う。
+            // _stopped が true（StopAsync が既にドレイン済み）なら登録不要だが、
+            // 下の await で書き込みを保証するため追加しない。
             if (!_stopped)
             {
                 _snapTasks.Add(snapTask);
-                shouldAwait = true;
-            }
-            else
-            {
-                // _stopped が true の場合は解放済み CDP セッションへの await を避ける
-                shouldAwait = false;
             }
         }
-        if (shouldAwait) { await snapTask; }
+        await snapTask;
     }
 
     /// <summary>
@@ -733,9 +812,17 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
                 _scriptCache.TryGetValue(targetPage, out scriptCache);
             }
 
-            if (cdp == null || scriptCache == null)
+            // cdp == null は「SetupPageAsync が NewCDPSessionAsync の await 中に StopAsync に追い越され、
+            // Profiler を開始せずに返った」正常系のレースで起こりうる。この場合 Profiler/Debugger は
+            // 有効化されておらず収集すべきデータもないため、警告を出さず静かにスキップする。
+            if (cdp == null)
             {
-                Console.Error.WriteLine($"[Warning] No CDP session or cache for tab {i} — skipping.");
+                continue;
+            }
+            // scriptCache == null は _scriptCache への追加（SetupPageAsync 冒頭）が漏れた異常系のため警告を残す。
+            if (scriptCache == null)
+            {
+                Console.Error.WriteLine($"[Warning] No script cache for tab {i} — skipping.");
                 continue;
             }
 
@@ -751,6 +838,15 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
             {
                 allScripts.AddRange(cache.Values);
             }
+            // CDP セッションは DisposeAsync で解放するため、ここでは参照をクリアしない。
+            // 以前は _cdpSessions.Clear() していたが、そうすると DisposeAsync 時に辞書が空になり
+            // 各セッションの DisposeAsync() が一度も呼ばれずに滞留していた（リーク）。
+            // StopAsync 後は新たなスナップショットが走らないため、参照を保持し続けても安全で、
+            // DisposeAsync が確実にセッションを解放できる（Profiler/Debugger は FinalCollect で停止済み）。
+            // StopAsync 後は不要になるページ単位の補助マップも解放する（長時間プロセスでの滞留を防ぐ）
+            // _scriptCache は戻り値生成に使い終えているが、DisposeAsync 等の再参照に備えて保持する
+            _tabIndices.Clear();
+            _lastSnapshotTick.Clear();
         }
 
         return allScripts;
@@ -933,6 +1029,19 @@ internal class CoverageCollector(IPage page) : IAsyncDisposable
             }
             try { await cdp.DisposeAsync(); }
             catch (Exception ex) { Console.Error.WriteLine($"[Warning] DisposeAsync: CDPSession.DisposeAsync failed: {ex.Message}"); }
+        }
+
+        // スナップショット直列化セマフォを解放する。
+        // ここに到達する時点で全 snapTask は上のループで待機済みのため、セマフォを保持しているタスクはない。
+        List<SemaphoreSlim> snapshotLocks;
+        lock (_lock)
+        {
+            snapshotLocks = new List<SemaphoreSlim>(_pageSnapshotLocks.Values);
+            _pageSnapshotLocks.Clear();
+        }
+        foreach (var snapshotLock in snapshotLocks)
+        {
+            snapshotLock.Dispose();
         }
     }
 }

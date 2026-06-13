@@ -26,6 +26,15 @@ public class HtmlOutputTests
     }
 
     /// <summary>
+    /// null を渡した場合、例外を投げずに空文字を返すことを確認する（防衛処理の検証）。
+    /// </summary>
+    [Fact]
+    public void HtmlEncode_Null_ReturnsEmpty()
+    {
+        Assert.Equal("", HtmlReportGenerator.HtmlEncode(null));
+    }
+
+    /// <summary>
     /// 全文字が実行済み（値=1）の1行ソースを渡した場合、
     /// 1行だけ生成されて "covered" クラスと文字が含まれることを確認する。
     /// </summary>
@@ -546,11 +555,11 @@ public class HtmlOutputTests
     public void BuildIndexPage_IncludesPageUrlColumnHeader()
     {
         // 1タブ分のサマリー行を渡す（新シグネチャ）
-        var rows = new List<(IReadOnlyList<(string label, string pageUrl, string tabFilename)> tabs,
-                             string url, int covered, int partial, int total, string mergedFilename)>
+        var rows = new List<(IReadOnlyList<(string pageUrl, string tabFilename)> pages,
+                             string url, int screenCount, int covered, int partial, int total, string mergedFilename)>
         {
-            ([("画面1", "https://example.com", "script-0.html")],
-             "https://example.com/app.js", 5, 0, 10, "script-0.html")
+            ([("https://example.com", "script-0.html")],
+             "https://example.com/app.js", 1, 5, 0, 10, "script-0.html")
         };
 
         var html = HtmlReportGenerator.BuildIndexPage(rows);
@@ -575,7 +584,7 @@ public class HtmlOutputTests
     {
         // ページ URL リストを渡す（旧: PageInfo(1, ...) → 新: リスト）
         var html = HtmlReportGenerator.BuildScriptPage(
-            [("画面1", "https://example.com/page2")],
+            [("https://example.com/page2")],
             "https://example.com/js/app.js",
             []);
 
@@ -593,7 +602,7 @@ public class HtmlOutputTests
     {
         // ページ URL リストが空の場合は「(不明)」と表示されるはず
         var html = HtmlReportGenerator.BuildScriptPage(
-            new List<(string label, string url)>(),
+            new List<string>(),
             "https://example.com/js/app.js",
             []);
 
@@ -679,7 +688,7 @@ public class HtmlOutputTests
 
         // BuildScriptPage を呼び出して HTML 出力を確認する
         var scriptPage = HtmlReportGenerator.BuildScriptPage(
-            [("画面1", "http://example.com/test.js")], "test.js", lines);
+            [("http://example.com/test.js")], "test.js", lines);
 
         // <script> タグが &lt;script&gt; にエンコードされているべき
         Assert.Contains("&lt;script&gt;", scriptPage);
@@ -695,10 +704,10 @@ public class HtmlOutputTests
     {
         // スクリプト URL 内の < > が HTML エンコードされることを確認する（XSS 防止）
         const string url = "http://example.com/<script>alert(1)</script>";
-        var rows = new List<(IReadOnlyList<(string label, string pageUrl, string tabFilename)> tabs,
-                             string url, int covered, int partial, int total, string mergedFilename)>
+        var rows = new List<(IReadOnlyList<(string pageUrl, string tabFilename)> pages,
+                             string url, int screenCount, int covered, int partial, int total, string mergedFilename)>
         {
-            ([("画面1", "http://example.com", "test.html")], url, 10, 0, 10, "test.html")
+            ([("http://example.com", "test.html")], url, 1, 10, 0, 10, "test.html")
         };
         var scriptPage = HtmlReportGenerator.BuildIndexPage(rows);
 
@@ -720,7 +729,7 @@ public class HtmlOutputTests
         var lines = HtmlReportGenerator.BuildLines(source, map);
         // スクリプト URL に XSS ペイロードを埋め込む
         var scriptPage = HtmlReportGenerator.BuildScriptPage(
-            [("画面1", "http://example.com/test.js")], "<evil>name</evil>", lines);
+            [("http://example.com/test.js")], "<evil>name</evil>", lines);
 
         // スクリプト URL の < > が &lt; &gt; にエンコードされているべき
         Assert.Contains("&lt;evil&gt;", scriptPage);
@@ -868,8 +877,8 @@ public class HtmlOutputTests
     public void BuildIndexPage_EmptyRows_ReturnsValidHtml()
     {
         // スクリプト行が空のリストを渡す（新シグネチャ）
-        var rows = new List<(IReadOnlyList<(string label, string pageUrl, string tabFilename)> tabs,
-                             string url, int covered, int partial, int total, string mergedFilename)>();
+        var rows = new List<(IReadOnlyList<(string pageUrl, string tabFilename)> pages,
+                             string url, int screenCount, int covered, int partial, int total, string mergedFilename)>();
 
         var html = HtmlReportGenerator.BuildIndexPage(rows);
 
@@ -886,12 +895,12 @@ public class HtmlOutputTests
     public void BuildIndexPage_MultipleRows_AllIncluded()
     {
         // 3スクリプト分のサマリー行を用意する（新シグネチャ・新ファイル名形式）
-        var rows = new List<(IReadOnlyList<(string label, string pageUrl, string tabFilename)> tabs,
-                             string url, int covered, int partial, int total, string mergedFilename)>
+        var rows = new List<(IReadOnlyList<(string pageUrl, string tabFilename)> pages,
+                             string url, int screenCount, int covered, int partial, int total, string mergedFilename)>
         {
-            ([("画面1", "https://example.com", "script-0.html")], "https://example.com/a.js",  5,  0, 10, "script-0.html"),
-            ([("画面1", "https://example.com", "script-1.html")], "https://example.com/b.js",  3,  2, 10, "script-1.html"),
-            ([("画面1", "https://example.com", "script-2.html")], "https://example.com/c.js",  0,  0, 10, "script-2.html"),
+            ([("https://example.com", "script-0.html")], "https://example.com/a.js", 1, 5,  0, 10, "script-0.html"),
+            ([("https://example.com", "script-1.html")], "https://example.com/b.js", 1, 3,  2, 10, "script-1.html"),
+            ([("https://example.com", "script-2.html")], "https://example.com/c.js", 1, 0,  0, 10, "script-2.html"),
         };
 
         var html = HtmlReportGenerator.BuildIndexPage(rows);
@@ -911,7 +920,7 @@ public class HtmlOutputTests
     {
         // 2つのページ URL を渡す
         var html = HtmlReportGenerator.BuildScriptPage(
-            [("画面1", "https://page-a.com/"), ("画面2", "https://page-b.com/")],
+            [("https://page-a.com/"), ("https://page-b.com/")],
             "app.js",
             []);
 
@@ -932,15 +941,15 @@ public class HtmlOutputTests
     public void BuildIndexPage_MultiTabScript_ShowsDetailsElement()
     {
         // 2タブで同じスクリプトが読み込まれた場合を想定する
-        var tabs = new List<(string label, string pageUrl, string tabFilename)>
+        var tabs = new List<(string pageUrl, string tabFilename)>
         {
-            ("画面1", "https://page-a.com/", "script-0-tab0.html"),
-            ("画面2", "https://page-b.com/", "script-0-tab1.html"),
+            ("https://page-a.com/", "script-0-tab0.html"),
+            ("https://page-b.com/", "script-0-tab1.html"),
         };
-        var rows = new List<(IReadOnlyList<(string label, string pageUrl, string tabFilename)> tabs,
-                             string url, int covered, int partial, int total, string mergedFilename)>
+        var rows = new List<(IReadOnlyList<(string pageUrl, string tabFilename)> pages,
+                             string url, int screenCount, int covered, int partial, int total, string mergedFilename)>
         {
-            (tabs, "https://example.com/app.js", 80, 5, 100, "script-0.html"),
+            (tabs, "https://example.com/app.js", 2, 80, 5, 100, "script-0.html"),
         };
 
         var html = HtmlReportGenerator.BuildIndexPage(rows);
@@ -965,11 +974,11 @@ public class HtmlOutputTests
     public void BuildIndexPage_SingleTabScript_NoDetailsElement()
     {
         // 1タブのみの場合は展開 UI が不要
-        var rows = new List<(IReadOnlyList<(string label, string pageUrl, string tabFilename)> tabs,
-                             string url, int covered, int partial, int total, string mergedFilename)>
+        var rows = new List<(IReadOnlyList<(string pageUrl, string tabFilename)> pages,
+                             string url, int screenCount, int covered, int partial, int total, string mergedFilename)>
         {
-            ([("画面1", "https://example.com/", "script-0.html")],
-             "https://example.com/app.js", 80, 5, 100, "script-0.html"),
+            ([("https://example.com/", "script-0.html")],
+             "https://example.com/app.js", 1, 80, 5, 100, "script-0.html"),
         };
 
         var html = HtmlReportGenerator.BuildIndexPage(rows);
@@ -1146,38 +1155,32 @@ public class HtmlOutputTests
     // -----------------------------------------------------------------------
 
     /// <summary>
-    /// ページ URL が空文字列の場合、ラベルだけが表示され
-    /// 括弧や余分な区切り文字が含まれないことを確認する。
+    /// ページ URL が空文字列の場合、プレースホルダー "(URL なし)" が表示されることを確認する。
     /// </summary>
     [Fact]
-    public void BuildScriptPage_SinglePageWithEmptyUrl_ShowsLabelOnly()
+    public void BuildScriptPage_SinglePageWithEmptyUrl_ShowsPlaceholder()
     {
         var html = HtmlReportGenerator.BuildScriptPage(
-            [("画面1", "")],
+            [("")],
             "app.js",
             []);
 
-        // ラベルが含まれているか確認する
-        Assert.Contains("画面1", html);
-        // URL が空のとき括弧や区切り文字が付かないことを確認する
-        Assert.DoesNotContain("画面1 (", html);
+        // URL が空のときはプレースホルダーが表示されることを確認する
+        Assert.Contains("(URL なし)", html);
     }
 
     /// <summary>
-    /// 複数の pageInfos がある場合、すべてのラベルと URL がカンマ区切りで表示されることを確認する。
+    /// 複数のページ URL がある場合、すべての URL がカンマ区切りで表示されることを確認する。
     /// </summary>
     [Fact]
-    public void BuildScriptPage_MultiplePageInfos_ShowsAllLabelsAndUrls()
+    public void BuildScriptPage_MultiplePageUrls_CommaSeparated()
     {
         var html = HtmlReportGenerator.BuildScriptPage(
-            [("画面1", "http://example.com/page1"), ("画面2", "http://example.com/page2")],
+            [("http://example.com/page1"), ("http://example.com/page2")],
             "app.js",
             []);
 
-        // 両方のラベルが含まれているか確認する
-        Assert.Contains("画面1", html);
-        Assert.Contains("画面2", html);
-        // URL も含まれているか確認する
+        // 両方の URL が含まれているか確認する
         Assert.Contains("http://example.com/page1", html);
         Assert.Contains("http://example.com/page2", html);
         // カンマ区切りで複数エントリが並んでいるか確認する
@@ -1185,24 +1188,20 @@ public class HtmlOutputTests
     }
 
     /// <summary>
-    /// 3つ以上の pageInfos がある場合、すべてのラベルと URL がカンマ区切りで表示されることを確認する。
+    /// 3つ以上のページ URL がある場合、すべての URL がカンマ区切りで表示されることを確認する。
     /// 2件テストは既にあるが、3件以上のループ動作を明示的に確認する。
     /// </summary>
     [Fact]
-    public void BuildScriptPage_ThreePageInfos_AllLabelsAndUrlsIncluded()
+    public void BuildScriptPage_ThreePageUrls_AllUrlsIncluded()
     {
         var html = HtmlReportGenerator.BuildScriptPage(
-            [("画面1", "http://example.com/page1"),
-             ("画面2", "http://example.com/page2"),
-             ("画面3", "http://example.com/page3")],
+            [("http://example.com/page1"),
+             ("http://example.com/page2"),
+             ("http://example.com/page3")],
             "app.js",
             []);
 
-        // すべてのラベルが含まれているか確認する
-        Assert.Contains("画面1", html);
-        Assert.Contains("画面2", html);
-        Assert.Contains("画面3", html);
-        // すべての URL も含まれているか確認する
+        // すべての URL が含まれているか確認する
         Assert.Contains("http://example.com/page1", html);
         Assert.Contains("http://example.com/page2", html);
         Assert.Contains("http://example.com/page3", html);
@@ -1215,23 +1214,21 @@ public class HtmlOutputTests
     // -----------------------------------------------------------------------
 
     /// <summary>
-    /// 単一タブで pageUrl が空の場合、ラベルのみ表示され " — " 区切りが付かないことを確認する。
+    /// 単一ページで pageUrl が空の場合、"(不明)" が表示されることを確認する。
     /// </summary>
     [Fact]
-    public void BuildIndexPage_SingleTabWithEmptyUrl_ShowsLabelOnly()
+    public void BuildIndexPage_SinglePageWithEmptyUrl_ShowsUnknown()
     {
-        var rows = new List<(IReadOnlyList<(string label, string pageUrl, string tabFilename)> tabs,
-                             string url, int covered, int partial, int total, string mergedFilename)>
+        var rows = new List<(IReadOnlyList<(string pageUrl, string tabFilename)> pages,
+                             string url, int screenCount, int covered, int partial, int total, string mergedFilename)>
         {
-            ([("画面1", "", "script-0.html")], "http://example.com/app.js", 5, 0, 10, "script-0.html"),
+            ([("", "script-0.html")], "http://example.com/app.js", 1, 5, 0, 10, "script-0.html"),
         };
 
         var html = HtmlReportGenerator.BuildIndexPage(rows);
 
-        // ラベルが含まれているか確認する
-        Assert.Contains("画面1", html);
-        // URL が空のとき " — " 区切りが付かないことを確認する
-        Assert.DoesNotContain("画面1 —", html);
+        // URL が空のときは "(不明)" が表示されることを確認する
+        Assert.Contains("(不明)", html);
     }
 
     /// <summary>
@@ -1241,10 +1238,10 @@ public class HtmlOutputTests
     [Fact]
     public void BuildIndexPage_CoveragePercentage_DisplayedInOutput()
     {
-        var rows = new List<(IReadOnlyList<(string label, string pageUrl, string tabFilename)> tabs,
-                             string url, int covered, int partial, int total, string mergedFilename)>
+        var rows = new List<(IReadOnlyList<(string pageUrl, string tabFilename)> pages,
+                             string url, int screenCount, int covered, int partial, int total, string mergedFilename)>
         {
-            ([("画面1", "https://example.com", "script-0.html")], "https://example.com/app.js", 5, 0, 10, "script-0.html"),
+            ([("https://example.com", "script-0.html")], "https://example.com/app.js", 1, 5, 0, 10, "script-0.html"),
         };
 
         var html = HtmlReportGenerator.BuildIndexPage(rows);
@@ -1260,11 +1257,11 @@ public class HtmlOutputTests
     [Fact]
     public void BuildIndexPage_OverallCoveragePercentage_Correct()
     {
-        var rows = new List<(IReadOnlyList<(string label, string pageUrl, string tabFilename)> tabs,
-                             string url, int covered, int partial, int total, string mergedFilename)>
+        var rows = new List<(IReadOnlyList<(string pageUrl, string tabFilename)> pages,
+                             string url, int screenCount, int covered, int partial, int total, string mergedFilename)>
         {
-            ([("画面1", "https://example.com", "script-0.html")], "https://example.com/a.js", 3, 0, 5, "script-0.html"),
-            ([("画面1", "https://example.com", "script-1.html")], "https://example.com/b.js", 2, 0, 5, "script-1.html"),
+            ([("https://example.com", "script-0.html")], "https://example.com/a.js", 1, 3, 0, 5, "script-0.html"),
+            ([("https://example.com", "script-1.html")], "https://example.com/b.js", 1, 2, 0, 5, "script-1.html"),
         };
 
         var html = HtmlReportGenerator.BuildIndexPage(rows);
@@ -1289,12 +1286,13 @@ public class HtmlOutputTests
     {
         // covered=1, partial=2, uncovered=1（total=4）
         var rows = new List<(
-            IReadOnlyList<(string label, string pageUrl, string tabFilename)> tabs,
-            string url, int covered, int partial, int total, string mergedFilename)>
+            IReadOnlyList<(string pageUrl, string tabFilename)> pages,
+            string url, int screenCount, int covered, int partial, int total, string mergedFilename)>
         {
             (
-                [("画面1", "http://example.com/", "script-0.html")],
+                [("http://example.com/", "script-0.html")],
                 "http://example.com/app.js",
+                1,  // screenCount
                 1,  // covered
                 2,  // partial
                 4,  // total
@@ -2033,13 +2031,13 @@ public class GenerateTests : IDisposable
     {
         // covered=0, partial=0, total=0 のスクリプト → pct=0（ゼロ除算防止パスを通る）
         var rows = new List<(
-            IReadOnlyList<(string label, string pageUrl, string tabFilename)> tabs,
-            string url, int covered, int partial, int total, string mergedFilename)>
+            IReadOnlyList<(string pageUrl, string tabFilename)> pages,
+            string url, int screenCount, int covered, int partial, int total, string mergedFilename)>
         {
             (
-                new List<(string, string, string)> { ("画面1", "http://example.com/", "script-0.html") },
+                new List<(string, string)> { ("http://example.com/", "script-0.html") },
                 "http://example.com/app.js",
-                0, 0, 0,
+                1, 0, 0, 0,
                 "script-0.html"
             ),
         };
@@ -2073,8 +2071,8 @@ public class GenerateTests : IDisposable
     {
         // 全スクリプト total=0 → overallPct = 0（全体集計のゼロ除算防止パスを通る）
         var rows = new List<(
-            IReadOnlyList<(string label, string pageUrl, string tabFilename)> tabs,
-            string url, int covered, int partial, int total, string mergedFilename)>();
+            IReadOnlyList<(string pageUrl, string tabFilename)> pages,
+            string url, int screenCount, int covered, int partial, int total, string mergedFilename)>();
 
         string html = HtmlReportGenerator.BuildIndexPage(rows);
 
@@ -2379,15 +2377,15 @@ public class GenerateReviewTests : IDisposable
     public void BuildIndexPage_JavascriptSchemeInPageUrl_NotUsedAsHref()
     {
         // tab の pageUrl に javascript: スキームを含む文字列を渡す
-        var tabs = new List<(string label, string pageUrl, string tabFilename)>
+        var tabs = new List<(string pageUrl, string tabFilename)>
         {
-            ("画面1", "javascript:alert(1)", "script-0.html"),
+            ("javascript:alert(1)", "script-0.html"),
         };
         var rows = new List<(
-            IReadOnlyList<(string label, string pageUrl, string tabFilename)> tabs,
-            string url, int covered, int partial, int total, string mergedFilename)>
+            IReadOnlyList<(string pageUrl, string tabFilename)> pages,
+            string url, int screenCount, int covered, int partial, int total, string mergedFilename)>
         {
-            (tabs, "http://example.com/app.js", 5, 0, 10, "script-0.html"),
+            (tabs, "http://example.com/app.js", 1, 5, 0, 10, "script-0.html"),
         };
 
         string html = HtmlReportGenerator.BuildIndexPage(rows);
@@ -2470,15 +2468,15 @@ public class GetFileNameEdgeCaseTests
     public void BuildIndexPage_CoveredPlusHalfPartialExceedsTotal_OverHundredPercentDisplayed()
     {
         // covered=10, partial=10, total=10 → pct = 100 * (10 + 5) / 10 = 150.0%
-        var tabs = new List<(string label, string pageUrl, string tabFilename)>
+        var tabs = new List<(string pageUrl, string tabFilename)>
         {
-            ("画面1", "http://example.com/", "script-0.html"),
+            ("http://example.com/", "script-0.html"),
         };
         var rows = new List<(
-            IReadOnlyList<(string label, string pageUrl, string tabFilename)> tabs,
-            string url, int covered, int partial, int total, string mergedFilename)>
+            IReadOnlyList<(string pageUrl, string tabFilename)> pages,
+            string url, int screenCount, int covered, int partial, int total, string mergedFilename)>
         {
-            (tabs, "http://example.com/app.js", 10, 10, 10, "script-0.html"),
+            (tabs, "http://example.com/app.js", 1, 10, 10, 10, "script-0.html"),
         };
 
         string html = HtmlReportGenerator.BuildIndexPage(rows);
@@ -2504,25 +2502,22 @@ public class GetFileNameEdgeCaseTests
     }
 
     /// <summary>
-    /// BuildScriptPage に複数 pageInfos を渡した場合、URL が空のエントリはラベルのみ表示され
-    /// URL が非空のエントリはラベルと URL が両方表示されることを確認する。
+    /// BuildScriptPage に複数のページ URL を渡した場合、空のエントリはプレースホルダーで表示され
+    /// 非空のエントリは URL が表示されることを確認する。
     /// </summary>
     [Fact]
-    public void BuildScriptPage_TwoPageInfosOneEmptyUrl_LabelOnlyForEmpty()
+    public void BuildScriptPage_TwoPageUrlsOneEmpty_PlaceholderForEmpty()
     {
-        // 1件目: URL なし（ラベルのみ）、2件目: URL あり
+        // 1件目: URL なし（プレースホルダー表示）、2件目: URL あり
         var html = HtmlReportGenerator.BuildScriptPage(
-            [("画面1", ""), ("画面2", "https://example.com/page")],
+            [(""), ("https://example.com/page")],
             "https://example.com/app.js",
             []);
 
-        // 両方のラベルが含まれること
-        Assert.Contains("画面1", html);
-        Assert.Contains("画面2", html);
+        // 空 URL のエントリはプレースホルダーで表示されること
+        Assert.Contains("(URL なし)", html);
         // 2件目の URL が含まれること
         Assert.Contains("https://example.com/page", html);
-        // 空 URL のエントリは "()" のような空括弧が付かないこと
-        Assert.DoesNotContain("画面1 ()", html);
     }
 
     // ─── TC-4: BuildLines — 行中の \0 文字 ──────────────────────────────────────
@@ -2580,11 +2575,11 @@ public class GetFileNameEdgeCaseTests
     {
         // 全行 Neutral → covered=0, partial=0, total=0
         var rows = new List<(
-            IReadOnlyList<(string label, string pageUrl, string tabFilename)> tabs,
-            string url, int covered, int partial, int total, string mergedFilename)>
+            IReadOnlyList<(string pageUrl, string tabFilename)> pages,
+            string url, int screenCount, int covered, int partial, int total, string mergedFilename)>
         {
-            ([("画面1", "https://example.com/", "script-0.html")],
-             "https://example.com/app.js", 0, 0, 0, "script-0.html"),
+            ([("https://example.com/", "script-0.html")],
+             "https://example.com/app.js", 1, 0, 0, 0, "script-0.html"),
         };
 
         string html = HtmlReportGenerator.BuildIndexPage(rows);
@@ -2722,14 +2717,14 @@ public class GetFileNameEdgeCaseTests
     [Fact]
     public void BuildIndexPage_AllUncovered_ShowsZeroPercent()
     {
-        var tabs = new List<(string label, string pageUrl, string tabFilename)>
+        var tabs = new List<(string pageUrl, string tabFilename)>
         {
-            ("画面1", "http://example.com/", "script-0.html"),
+            ("http://example.com/", "script-0.html"),
         };
-        var rows = new List<(IReadOnlyList<(string label, string pageUrl, string tabFilename)> tabs,
-                             string url, int covered, int partial, int total, string mergedFilename)>
+        var rows = new List<(IReadOnlyList<(string pageUrl, string tabFilename)> pages,
+                             string url, int screenCount, int covered, int partial, int total, string mergedFilename)>
         {
-            (tabs, "http://example.com/app.js", 0, 0, 10, "script-0.html"),
+            (tabs, "http://example.com/app.js", 1, 0, 0, 10, "script-0.html"),
         };
 
         string html = HtmlReportGenerator.BuildIndexPage(rows);
@@ -2744,14 +2739,14 @@ public class GetFileNameEdgeCaseTests
     [Fact]
     public void BuildIndexPage_AllCovered_ShowsHundredPercent()
     {
-        var tabs = new List<(string label, string pageUrl, string tabFilename)>
+        var tabs = new List<(string pageUrl, string tabFilename)>
         {
-            ("画面1", "http://example.com/", "script-0.html"),
+            ("http://example.com/", "script-0.html"),
         };
-        var rows = new List<(IReadOnlyList<(string label, string pageUrl, string tabFilename)> tabs,
-                             string url, int covered, int partial, int total, string mergedFilename)>
+        var rows = new List<(IReadOnlyList<(string pageUrl, string tabFilename)> pages,
+                             string url, int screenCount, int covered, int partial, int total, string mergedFilename)>
         {
-            (tabs, "http://example.com/app.js", 10, 0, 10, "script-0.html"),
+            (tabs, "http://example.com/app.js", 1, 10, 0, 10, "script-0.html"),
         };
 
         string html = HtmlReportGenerator.BuildIndexPage(rows);
@@ -2792,16 +2787,16 @@ public class GetFileNameEdgeCaseTests
     public void BuildIndexPage_DuplicateFilename_AppendsCounter()
     {
         // 同じファイル名 "app.js" を持つが異なるホストの URL を持つ 2 件のスクリプト
-        var tabs = new List<(string label, string pageUrl, string tabFilename)>
+        var tabs = new List<(string pageUrl, string tabFilename)>
         {
-            ("画面1", "http://example.com/", "script-0.html"),
+            ("http://example.com/", "script-0.html"),
         };
         var rows = new List<(
-            IReadOnlyList<(string label, string pageUrl, string tabFilename)> tabs,
-            string url, int covered, int partial, int total, string mergedFilename)>
+            IReadOnlyList<(string pageUrl, string tabFilename)> pages,
+            string url, int screenCount, int covered, int partial, int total, string mergedFilename)>
         {
-            (tabs, "http://host1.com/app.js", 5, 0, 10, "script-0.html"),
-            (tabs, "http://host2.com/app.js", 3, 0, 10, "script-1.html"),
+            (tabs, "http://host1.com/app.js", 1, 5, 0, 10, "script-0.html"),
+            (tabs, "http://host2.com/app.js", 1, 3, 0, 10, "script-1.html"),
         };
 
         string html = HtmlReportGenerator.BuildIndexPage(rows);

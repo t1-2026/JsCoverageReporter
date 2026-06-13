@@ -849,4 +849,130 @@ public class CoverageCollectorTests
         var ex = await Record.ExceptionAsync(() => all);
         Assert.Null(ex);
     }
+
+    /// <summary>
+    /// StartAsync に渡したフィルターリストを呼び出し元が後から変更しても、
+    /// フィルタリング結果に影響しないことを確認する（StartAsync の防衛コピーの検証）。
+    /// </summary>
+    [Fact]
+    public async Task StartAsync_FilterListMutatedAfterStart_DoesNotAffectFiltering()
+    {
+        const string appJs    = "function appFunc()    { window._app    = 'app';    }";
+        const string vendorJs = "function vendorFunc() { window._vendor = 'vendor'; }";
+        const string html = """
+            <!DOCTYPE html>
+            <html>
+            <head>
+            <script src="/app.js"></script>
+            <script src="/vendor.js"></script>
+            </head>
+            <body>
+            <button id="btn" onclick="appFunc(); vendorFunc()">Run</button>
+            </body>
+            </html>
+            """;
+
+        var routes = new Dictionary<string, (string, string)>
+        {
+            ["/"]          = (html,     "text/html; charset=utf-8"),
+            ["/app.js"]    = (appJs,    "application/javascript"),
+            ["/vendor.js"] = (vendorJs, "application/javascript"),
+        };
+
+        using var server = new MultiPathTestServer(routes);
+        using var playwright = await Playwright.CreateAsync();
+        await using var browser = await playwright.Chromium.LaunchAsync();
+        var page = await browser.NewPageAsync();
+
+        // ページを先にロードする（V8 コンテキストが確定する）
+        await page.GotoAsync(server.BaseUrl);
+
+        // 変更可能なリストでフィルターを渡してカバレッジを開始する
+        var filters = new List<string> { "app.js" };
+        await using var collector = new CoverageCollector(page);
+        await collector.StartAsync(filters, []);
+
+        // 呼び出し元がリストを変更する（防衛コピーされていれば結果に影響しないはず）
+        filters.Clear();
+        filters.Add("vendor.js");
+
+        // ボタンをクリックして両スクリプトの関数を再実行する
+        await page.ClickAsync("#btn");
+        var scripts = await collector.StopAsync();
+
+        // StartAsync 時点のフィルター（app.js のみ許可）が引き続き適用されていること
+        Assert.Contains(scripts, s => s.Url.Contains("app.js"));
+        Assert.DoesNotContain(scripts, s => s.Url.Contains("vendor.js"));
+    }
+
+    /// <summary>
+    /// StopAsync 完了後に新しいページ（タブ）を開いても、
+    /// 追跡が開始されず例外も発生しないことを確認する。
+    /// （Context.Page ハンドラの解除と、停止後 SetupPageAsync の _stopped ガードの検証）
+    /// </summary>
+    [Fact]
+    public async Task NewPageOpenedAfterStopAsync_IsIgnoredWithoutException()
+    {
+        using var playwright = await Playwright.CreateAsync();
+        await using var browser = await playwright.Chromium.LaunchAsync();
+        // browser.NewPageAsync() の暗黙コンテキストは Context.NewPageAsync() を許可しないため
+        // 明示的にコンテキストを作成する
+        await using var context = await browser.NewContextAsync();
+        var page = await context.NewPageAsync();
+
+        await using var collector = new CoverageCollector(page);
+        await collector.StartAsync([], []);
+        await collector.StopAsync();
+
+        // StopAsync 後に新しいページを開いて閉じる → 追跡・例外なしで完了すること
+        var ex = await Record.ExceptionAsync(async () =>
+        {
+            var newPage = await context.NewPageAsync();
+            await newPage.CloseAsync();
+        });
+        Assert.Null(ex);
+    }
+
+    /// <summary>
+    /// Issue ①: ナビゲーション由来の中間スナップショットと BeforePageCloseAsync を
+    /// 同一ページに対して並行させても、ページ単位のスナップショット直列化により
+    /// 例外なく完了することを確認する（同一 CDP セッションへの並行発行防止の回帰テスト）。
+    /// </summary>
+    [Fact]
+    public async Task BeforePageCloseAsync_ConcurrentWithNavigationSnapshot_DoesNotThrow()
+    {
+        const string html = """
+            <!DOCTYPE html>
+            <html><body>
+            <a id="link" href="/nocontent">click</a>
+            <script>function foo() { return 1; }</script>
+            </body></html>
+            """;
+
+        using var server = new TestServer(html);
+        using var playwright = await Playwright.CreateAsync();
+        await using var browser = await playwright.Chromium.LaunchAsync();
+        var page = await browser.NewPageAsync();
+        await page.GotoAsync(server.Url);
+
+        await using var collector = new CoverageCollector(page);
+        // スロットリングを無効化して中間スナップショットを確実に発火させる
+        collector.SnapshotThrottleMs = 0;
+        await collector.StartAsync([], []);
+
+        // ナビゲーションを開始して reqHandler の中間スナップショットを発火させ、
+        // そのリクエスト到着直後に BeforePageCloseAsync を並行で呼んで同一ページの
+        // スナップショットを重ねる（直列化セマフォがなければ同一 CDP セッションへ並行発行される）
+        var ex = await Record.ExceptionAsync(async () =>
+        {
+            var reqTask = page.WaitForRequestAsync("**/nocontent");
+            _ = page.ClickAsync("#link");
+            await reqTask;
+
+            var closeTask = collector.BeforePageCloseAsync(page);
+            var stopTask  = collector.StopAsync();
+            await Task.WhenAll(closeTask, stopTask);
+        });
+        Assert.Null(ex);
+    }
 }

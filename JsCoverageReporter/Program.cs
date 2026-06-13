@@ -25,6 +25,8 @@ if (Array.IndexOf(args, "--help") >= 0 || Array.IndexOf(args, "-h") >= 0)
           --output <dir>      レポートの出力先ディレクトリ（デフォルト: ./report）
           --headed            ブラウザウィンドウを表示して実行する（デフォルト: 非表示）
           --channel <name>    ブラウザチャンネルを指定する（例: msedge, chrome）
+          --lcov              lcov.info（LCOV 形式）も出力する（VSCode Coverage Gutters・CI 連携用）
+          --json              coverage.json（機械可読サマリー）も出力する
           --verbose           エラー発生時に詳細なスタックトレースを表示する
           --help, -h          このヘルプを表示する
 
@@ -77,6 +79,18 @@ string? channel = null;
 
 // --channel が既に指定済みかどうかを示すフラグ（重複指定の検知に使う）
 bool channelSet = false;
+
+// --lcov が指定された場合は true（lcov.info を出力する）
+bool writeLcov = false;
+
+// --lcov が既に指定済みかどうかを示すフラグ（重複指定の検知に使う）
+bool lcovSet = false;
+
+// --json が指定された場合は true（coverage.json を出力する）
+bool writeJson = false;
+
+// --json が既に指定済みかどうかを示すフラグ（重複指定の検知に使う）
+bool jsonSet = false;
 
 // コマンドライン引数を1つずつ走査する
 for (int i = 0; i < args.Length; i++)
@@ -172,6 +186,30 @@ for (int i = 0; i < args.Length; i++)
         channelSet = true;
         // 値として消費した次の引数をスキップする
         i++;
+    }
+
+    // --lcov オプションを検出する（値なし・LCOV 形式の lcov.info も出力する）
+    else if (args[i] == "--lcov")
+    {
+        // 同じオプションが複数回指定された場合は警告する
+        if (lcovSet)
+        {
+            Console.Error.WriteLine("[Warning] --lcov が複数回指定されました。");
+        }
+        writeLcov = true;
+        lcovSet   = true;
+    }
+
+    // --json オプションを検出する（値なし・機械可読サマリーの coverage.json も出力する）
+    else if (args[i] == "--json")
+    {
+        // 同じオプションが複数回指定された場合は警告する
+        if (jsonSet)
+        {
+            Console.Error.WriteLine("[Warning] --json が複数回指定されました。");
+        }
+        writeJson = true;
+        jsonSet   = true;
     }
 }
 
@@ -308,10 +346,28 @@ try
     // 取得したスクリプト数を表示する
     Console.WriteLine($"  {coverages.Count} script(s) captured.");
 
-    // HTMLレポートを生成して出力ディレクトリに書き出す
-    new HtmlReportGenerator().Generate(coverages, outputDir);
+    // ソースマップ（//# sourceMappingURL）の取得を試みる
+    // 取得できたスクリプトは元ファイル（TypeScript 等）別の行カバレッジもレポートに表示される
+    // 取得・解析の失敗は警告のみでレポート生成は続行する
+    var sourceMaps = await SourceMapLoader.LoadAllAsync(coverages);
+    if (sourceMaps.Count > 0)
+    {
+        Console.WriteLine($"  {sourceMaps.Count} source map(s) resolved.");
+    }
+
+    // HTMLレポートを生成して出力ディレクトリに書き出す（--lcov / --json 指定時は機械可読形式も出力する）
+    // 対象 URL を渡してインデックスのメタ情報（いつ・何に対する計測か）に表示する
+    new HtmlReportGenerator().Generate(coverages, outputDir, sourceMaps, writeLcov, writeJson, scenario.Url);
     // 生成したレポートのパスを表示する
     Console.WriteLine($"Report: {Path.Combine(outputDir, "index.html")}");
+    if (writeLcov)
+    {
+        Console.WriteLine($"LCOV:   {Path.Combine(outputDir, "lcov.info")}");
+    }
+    if (writeJson)
+    {
+        Console.WriteLine($"JSON:   {Path.Combine(outputDir, "coverage.json")}");
+    }
 
     // 正常終了を示す 0 を返す
     return 0;

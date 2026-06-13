@@ -5866,8 +5866,9 @@ public class EdgeCaseParserTests
 
     /// <summary>
     /// count が int.MaxValue の CoverageRange は「実行済み（1）」として扱われることを確認する。
-    /// Coverage.cs では TryGetInt32 失敗時のフォールバックとして count = 1 を設定するが、
-    /// 明示的に int.MaxValue が count に入った場合も count > 0 として val = 1 になることを文書化する。
+    /// Coverage.cs では TryGetInt32 失敗時（V8 の呼び出し回数が int 範囲を超えた場合）のフォールバックとして
+    /// count = int.MaxValue を設定する。明示的に int.MaxValue が count に入った場合も count > 0 として
+    /// val = 1 になることを文書化する。
     /// </summary>
     [Fact]
     public void BuildCoverageMap_RangeCountIntMaxValue_TreatedAsExecuted()
@@ -5884,6 +5885,29 @@ public class EdgeCaseParserTests
         // int.MaxValue > 0 なので val = 1（実行済み）になること
         Assert.Equal(1, map[0]);
         Assert.Equal(1, map[source.Length - 1]);
+    }
+
+    /// <summary>
+    /// 同一スパンの range が異なる count で複数報告された場合、
+    /// 入力順に関係なく「実行済み（count &gt; 0）」が優先されることを確認する。
+    /// （サイズ降順ソートのタイブレーク: 同サイズは Count 昇順 → 実行済みが後から書き込まれて勝つ。
+    ///   タイブレークがないと List.Sort（不安定ソート）の内部実装と入力順に結果が依存する）
+    /// </summary>
+    [Fact]
+    public void BuildCoverageMap_IdenticalRangesDifferentCounts_ExecutedWinsRegardlessOfOrder()
+    {
+        const string source = "var x = 1;";
+        var executed   = new FunctionCoverage("", new List<CoverageRange> { new CoverageRange(0, source.Length, 3) });
+        var unexecuted = new FunctionCoverage("", new List<CoverageRange> { new CoverageRange(0, source.Length, 0) });
+
+        // 実行済み → 未実行 の順で渡す
+        var map1 = CoverageParser.BuildCoverageMap(source, new[] { executed, unexecuted });
+        // 未実行 → 実行済み の順で渡す
+        var map2 = CoverageParser.BuildCoverageMap(source, new[] { unexecuted, executed });
+
+        // どちらの入力順でも全文字が実行済み（1）になること
+        Assert.All(map1, v => Assert.Equal(1, v));
+        Assert.All(map2, v => Assert.Equal(1, v));
     }
 
     // -----------------------------------------------------------------------
@@ -7318,5 +7342,70 @@ public class ReviewMissingCoverageTests
         // function() {} の { は 0（未実行）としてマークされる
         int methodBrace = source.IndexOf('{', source.IndexOf("function()"));
         Assert.Equal(0, map[methodBrace]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue ② — IsRegexStart の「文字列リテラル直後の除算」誤判定修正
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// 二重引用符の文字列リテラル直後の / が除算として扱われ、
+    /// 同一行のその後に続く function キーワードが正しく検出されることを確認する。
+    /// 修正前: prev が '"'（文字列終端クォート）のとき IsRegexStart が true を返し、
+    ///         SkipRegexLiteral が次の / または改行まで読み進めて function を呑み込む
+    ///         （対の / がない単独除算では行末まで読み、function が一切検出されない）。
+    /// 修正後: '"' の直後の / は除算と判定され、function が 0（未実行）にマークされる。
+    /// </summary>
+    [Fact]
+    public void BuildMap_DivisionAfterDoubleQuotedString_FunctionAfterCorrectlyDetected()
+    {
+        // var x = "abc" / 2; function foo() { }
+        //  0         1         2         3
+        //  0123456789012345678901234567890123456
+        // " 終端=12, / =14, function 'f'=19, } =36
+        const string source = "var x = \"abc\" / 2; function foo() { }";
+
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        // 修正前は map[19] が -1（function が SkipRegexLiteral に呑まれて未検出）になる
+        Assert.Equal(0, map[19]); // 'f' of function
+        Assert.Equal(0, map[36]); // '}' (関数本体の終端)
+    }
+
+    /// <summary>
+    /// 単一引用符の文字列リテラル直後の / が除算として扱われ、
+    /// 同一行のその後に続く function キーワードが正しく検出されることを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_DivisionAfterSingleQuotedString_FunctionAfterCorrectlyDetected()
+    {
+        // var x = 'abc' / 2; function foo() { }
+        // インデックスは二重引用符版と同一（クォート文字の幅は同じ）
+        const string source = "var x = 'abc' / 2; function foo() { }";
+
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        Assert.Equal(0, map[19]); // 'f' of function
+        Assert.Equal(0, map[36]); // '}'
+    }
+
+    /// <summary>
+    /// 回帰防止: 文字列リテラルとは無関係な「キーワード直後の正規表現」（return /re/）は
+    /// 引き続き正規表現として扱われ、誤って除算扱いにならないことを確認する。
+    /// </summary>
+    [Fact]
+    public void BuildMap_RegexAfterReturnKeyword_StillTreatedAsRegex()
+    {
+        // function f() { return /a}b/; } — 正規表現内の } を関数終端と誤認しない
+        //  0         1         2         3
+        //  0123456789012345678901234567890
+        // f=0, 本体 { =13, 正規表現 /a}b/ を跨いで真の } =28
+        const string source = "function f() { return /a}b/; }";
+
+        var map = CoverageParser.BuildCoverageMap(source, []);
+
+        // 正規表現内の } (index 24) を関数終端と誤認しなければ、末尾の } まで 0 が続く
+        Assert.Equal(0, map[0]);  // 'f'
+        Assert.Equal(0, map[29]); // 真の関数終端 '}'
     }
 }
