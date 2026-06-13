@@ -25,3 +25,6 @@ docs/superpowers/
 
 # サンプル用ローカルファイル（環境固有のため公開不要）
 /sample/
+
+# 生成済みデモレポート（第三者サイトのminified JSを含むため公開不要）
+/report-edge/
