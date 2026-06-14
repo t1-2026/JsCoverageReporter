@@ -255,8 +255,11 @@ public static class LocatorResolver
     }
 
     /// <summary>
-    /// Try系の共通処理。定義エラー (ArgumentException / FormatException) だけを
+    /// Try系の共通処理。定義エラー
+    /// (ArgumentException / FormatException / InvalidOperationException) だけを
     /// 捕捉し、それ以外 (Playwright実行時例外等) はそのまま伝播させる。
+    /// InvalidOperationException は「メソッドが null を返した」等の内部不整合で、
+    /// これも一括検証時には例外でなくエラー文字列として返したいため含める。
     /// </summary>
     private static bool TryCore<T>(Func<T> resolve,
         [NotNullWhen(true)] out T? result, [NotNullWhen(false)] out string? error)
@@ -268,7 +271,7 @@ public static class LocatorResolver
             error = null;
             return true;
         }
-        catch (Exception ex) when (ex is ArgumentException or FormatException)
+        catch (Exception ex) when (ex is ArgumentException or FormatException or InvalidOperationException)
         {
             result = null;
             error = ex.Message;
@@ -408,7 +411,16 @@ public static class LocatorResolver
                     $"'{prop.Name}' はプロパティのため引数 '{parameters}' は指定できません。");
             }
 
-            return prop.GetValue(target)!;
+            // メソッド呼び出し側 (下のステップ6) と同様に null を明示的に検出する。
+            // ここで握りつぶすと、後続の KindName / GetInterfaceType が
+            // null を受け取って NRE になり、Try系の検証を素通りしてしまう。
+            var propValue = prop.GetValue(target);
+            if (propValue == null)
+            {
+                throw new InvalidOperationException($"'{prop.Name}' が null を返しました。");
+            }
+
+            return propValue;
         }
 
         // -----------------------------------------------
@@ -499,11 +511,23 @@ public static class LocatorResolver
     {
         MethodInfo? best = null;
         var bestScore = int.MaxValue;
+        var bestParamCount = int.MaxValue;
+        var bestSig = "";
+
+        // リフレクションの列挙順はランタイム/バージョン間で安定保証がないため、
+        // スコア同点時は (引数の少なさ → シグネチャの序数順) で決定的に選ぶ。
+        static string SigKey(ParameterInfo[] ps) =>
+            string.Join(",", ps.Select(p => p.ParameterType.FullName));
 
         foreach (var m in candidates)
         {
+            // GetParameters() は呼ぶたびに配列をアロケートし、ランタイムでも
+            // キャッシュされないため、候補ごとに一度だけ取得して使い回す
+            // (データ駆動で数千回呼ばれてもアロケーションを最小に保つ)。
+            var mparams = m.GetParameters();
+
             // Options型以外のパラメータ (= primaryで埋めるべき引数)
-            var required = m.GetParameters()
+            var required = mparams
                 .Where(p => !IsOptionsType(p.ParameterType))
                 .ToArray();
 
@@ -516,7 +540,7 @@ public static class LocatorResolver
                     // 必須引数のないオーバーロードが最優先
                     score = 0;
                 }
-                else if (required.All(p =>
+                else if (required.Length == 1 && required.All(p =>
                 {
                     // Nullable<T> なら中身の型 T を取り出してから string かどうかを見る
                     var paramType = Nullable.GetUnderlyingType(p.ParameterType);
@@ -527,8 +551,11 @@ public static class LocatorResolver
                     return paramType == typeof(string);
                 }))
                 {
-                    // string引数だけなら空文字列で埋めて呼び出せる
-                    // (GetByLabel等でExcelのセルが空のケースに対応)
+                    // 必須引数が string 1個だけなら空文字列で埋めて呼び出せる
+                    // (GetByLabel等でExcelのセルが空のケースに対応)。
+                    // BuildArguments の空文字埋めは1個までなので、必須stringが
+                    // 2個以上あるオーバーロードはここで候補から外し、
+                    // 「選択は通るが実行直前で失敗」する不整合を防ぐ。
                     score = 50 + required.Length;
                 }
                 else
@@ -555,9 +582,32 @@ public static class LocatorResolver
                 score = score * 10 + (required.Length - 1) * 1000;
             }
 
-            if (score < bestScore)
+            var paramCount = mparams.Length;
+
+            var better = best == null || score < bestScore;
+            string? sig = null;
+            if (!better && score == bestScore)
+            {
+                // 同点 → 引数の少ない方、それも同じならシグネチャ序数順で決める
+                if (paramCount < bestParamCount)
+                {
+                    better = true;
+                }
+                else if (paramCount == bestParamCount)
+                {
+                    sig = SigKey(mparams);
+                    if (string.CompareOrdinal(sig, bestSig) < 0)
+                    {
+                        better = true;
+                    }
+                }
+            }
+
+            if (better)
             {
                 bestScore = score;
+                bestParamCount = paramCount;
+                bestSig = sig ?? SigKey(mparams);
                 best = m;
             }
         }
@@ -614,7 +664,8 @@ public static class LocatorResolver
             {
                 return 0;
             }
-            if (pt == typeof(double) || pt == typeof(float))
+            if (pt == typeof(long) || pt == typeof(double)
+                || pt == typeof(float) || pt == typeof(decimal))
             {
                 return 1;
             }
@@ -676,11 +727,11 @@ public static class LocatorResolver
             {
                 return 1;
             }
-            if (pt == typeof(int))
+            if (pt == typeof(int) || pt == typeof(long))
             {
                 return 2;
             }
-            if (pt == typeof(double) || pt == typeof(float))
+            if (pt == typeof(double) || pt == typeof(float) || pt == typeof(decimal))
             {
                 return 3;
             }
@@ -727,6 +778,7 @@ public static class LocatorResolver
 
         var primaryConsumed = primary == null;
         var optionsConsumed = options.Count == 0;
+        var emptyFilled = false;
 
         for (var i = 0; i < methodParams.Length; i++)
         {
@@ -755,11 +807,15 @@ public static class LocatorResolver
                 }
                 primaryConsumed = true;
             }
-            else if (primary == null && mp.ParameterType == typeof(string))
+            else if (primary == null && mp.ParameterType == typeof(string) && !emptyFilled)
             {
                 // パラメータ未指定の文字列引数は空文字列で埋める
                 // (例: Resolve(page, "GetByLabel") → page.GetByLabel(""))
+                // ただし埋めるのは1個目だけ。2個以上の必須string引数を持つメソッドを
+                // 黙って全部 "" で埋めると意図しない呼び出しになるため、2個目以降は
+                // 下の else に落として明示エラーにする。
                 args[i] = "";
+                emptyFilled = true;
             }
             else
             {
@@ -799,7 +855,8 @@ public static class LocatorResolver
         return t.IsClass
             && t != typeof(string)
             && t != typeof(Regex)
-            && t.Name.EndsWith("Options", StringComparison.Ordinal);
+            && t.Name.EndsWith("Options", StringComparison.Ordinal)
+            && (t.Namespace?.StartsWith("Microsoft.Playwright", StringComparison.Ordinal) ?? false);
     }
 
     /// <summary>
@@ -886,29 +943,36 @@ public static class LocatorResolver
                 }
             }
 
+            // 数値・bool は全角→半角に正規化してからパースする。
+            // (Excelで全角入力された "２" や "ＴＲＵＥ" にも耐えるため。
+            //  数値トークンの読み取りは ASCII 限定なので、全角はここへ流れてくる)
             if (t == typeof(int))
             {
-                return int.Parse(s, CultureInfo.InvariantCulture);
+                return int.Parse(NormalizeForParse(s), NumberStyles.Integer, CultureInfo.InvariantCulture);
+            }
+            if (t == typeof(long))
+            {
+                return long.Parse(NormalizeForParse(s), NumberStyles.Integer, CultureInfo.InvariantCulture);
             }
             if (t == typeof(double))
             {
-                return double.Parse(s, CultureInfo.InvariantCulture);
+                return double.Parse(NormalizeForParse(s), CultureInfo.InvariantCulture);
             }
             if (t == typeof(float))
             {
-                return float.Parse(s, CultureInfo.InvariantCulture);
+                return float.Parse(NormalizeForParse(s), CultureInfo.InvariantCulture);
             }
             if (t == typeof(decimal))
             {
-                return decimal.Parse(s, CultureInfo.InvariantCulture);
+                return decimal.Parse(NormalizeForParse(s), CultureInfo.InvariantCulture);
             }
             if (t == typeof(bool))
             {
-                return bool.Parse(s);
+                return bool.Parse(NormalizeForParse(s));
             }
             if (t == typeof(Regex))
             {
-                return new Regex(s);
+                return new Regex(s, RegexOptions.None, ParameterParser.RegexMatchTimeout);
             }
 
             // どれにも該当しなければ文字列のまま返す
@@ -1032,7 +1096,18 @@ public static class LocatorResolver
     //  ネストしたLocator式の解決
     // ============================================================
 
-    /// <summary>ネスト式の先頭が "メソッド名(" の形かどうかの判定用。</summary>
+    /// <summary>
+    /// ネスト式の先頭が "メソッド名(" の形かどうかの判定用。
+    ///
+    /// 注意: このパターンに一致する文字列はネスト式 (チェーン評価) とみなされ、
+    /// セレクタ文字列としては扱われない。先頭が「英字/アンダースコア + ( 」の形
+    /// (例: "foo(...)") のセレクタはネスト式に誤分類される。
+    /// ただし実際の CSS / XPath / text= 等のセレクタは先頭に ':' '#' '.' '[' '='
+    /// 等が入るためこのパターンには一致せず (例: ":nth-child(2)", "text=x(y)")、
+    /// "識別子(" で始まる有効なセレクタは事実上存在しないため実害は出ない。
+    /// もし "ident(...)" 形のセレクタを Has/And/Or に渡す必要が生じた場合は
+    /// 別経路 (Locator(...) のネスト式) を使うこと。
+    /// </summary>
     private static readonly Regex ChainHeadPattern =
         new(@"^[A-Za-z_][A-Za-z0-9_]*\s*\(", RegexOptions.Compiled);
 
@@ -1115,6 +1190,14 @@ public static class LocatorResolver
     }
 
     /// <summary>
+    /// IFrameLocator.Owner プロパティ (存在すれば) をキャッシュする。
+    /// リフレクション解決を毎回やり直さないため一度だけ取得する。
+    /// 値が null の場合は「このPlaywrightバージョンに Owner が無い」を意味する。
+    /// </summary>
+    private static readonly PropertyInfo? FrameOwnerProperty =
+        typeof(IFrameLocator).GetProperty("Owner");
+
+    /// <summary>
     /// IFrameLocator.Owner を取得する。
     /// Owner は比較的新しいAPIのため、古いPlaywrightバージョンの
     /// プロジェクトでもこのファイルがコンパイルできるよう
@@ -1122,8 +1205,8 @@ public static class LocatorResolver
     /// </summary>
     private static ILocator GetFrameOwner(IFrameLocator frame)
     {
-        // Owner プロパティ自体が存在しないPlaywrightバージョンでは GetProperty が null を返す
-        var ownerProp = typeof(IFrameLocator).GetProperty("Owner");
+        // Owner プロパティ自体が存在しないPlaywrightバージョンでは null になる
+        var ownerProp = FrameOwnerProperty;
 
         ILocator? owner = null;
         if (ownerProp != null)
@@ -1193,7 +1276,7 @@ public static class LocatorResolver
     /// <summary>
     /// 実体オブジェクトから、リフレクション探索に使うインターフェース型を決める。
     /// </summary>
-    private static Type GetInterfaceType(object target)
+    private static Type GetInterfaceType(object? target)
     {
         switch (target)
         {
@@ -1203,6 +1286,9 @@ public static class LocatorResolver
                 return typeof(ILocator);
             case IFrameLocator:
                 return typeof(IFrameLocator);
+            case null:
+                throw new InvalidOperationException(
+                    "対象が null です (直前のメンバーが null を返した可能性があります)。");
             default:
                 throw new ArgumentException(
                     $"対象 {target.GetType().Name} は IPage / ILocator / IFrameLocator のいずれでもありません。");
@@ -1210,7 +1296,7 @@ public static class LocatorResolver
     }
 
     /// <summary>エラーメッセージ用に、オブジェクトの種類を分かりやすい名前で返す。</summary>
-    private static string KindName(object o)
+    private static string KindName(object? o)
     {
         switch (o)
         {
@@ -1220,6 +1306,8 @@ public static class LocatorResolver
                 return nameof(ILocator);
             case IFrameLocator:
                 return nameof(IFrameLocator);
+            case null:
+                return "null";
             default:
                 return o.GetType().Name;
         }
@@ -1232,7 +1320,7 @@ public static class LocatorResolver
     private static string SuggestNames(Type interfaceType, string methodName, Func<Type, bool> acceptable)
     {
         var names = GetAllMethods(interfaceType)
-            .Where(m => acceptable(m.ReturnType))
+            .Where(m => !m.IsSpecialName && acceptable(m.ReturnType))
             .Select(m => m.Name)
             .Concat(GetAllProperties(interfaceType)
                 .Where(pr => acceptable(pr.PropertyType))
@@ -1293,11 +1381,56 @@ public static class LocatorResolver
         return prev[b.Length];
     }
 
+    /// <summary>
+    /// 数値・bool パースの前処理として、全角の英数字・記号 (U+FF01..U+FF5E) を
+    /// 対応するASCII文字へ、全角スペース (U+3000) を半角スペースへ畳み込む。
+    /// Excelで全角入力された "２" や "ＴＲＵＥ" を受け付けられるようにするため。
+    /// 変換対象がなければ元の文字列をそのまま返す (高速パス)。
+    /// </summary>
+    private static string NormalizeForParse(string s)
+    {
+        StringBuilder? sb = null;
+
+        for (var i = 0; i < s.Length; i++)
+        {
+            var c = s[i];
+            var r = c;
+
+            if (c >= '！' && c <= '～')
+            {
+                r = (char)(c - 0xFEE0);
+            }
+            else if (c == '　')
+            {
+                r = ' ';
+            }
+            else if (c is '－' or '−')
+            {
+                // 全角ハイフンマイナス (U+FF0D) と マイナス記号 (U+2212) は
+                // 全角英数記号の畳み込み範囲 (U+FF01..U+FF5E) の外にあるため個別に半角化する。
+                // (Excel/IMEで全角入力された負数 "－１" を扱えるようにするため)
+                r = '-';
+            }
+
+            if (r != c && sb == null)
+            {
+                sb = new StringBuilder(s.Length);
+                sb.Append(s, 0, i);
+            }
+
+            sb?.Append(r);
+        }
+
+        return sb == null ? s : sb.ToString();
+    }
+
     /// <summary>エラーメッセージ用に、パース済みの値を表示用文字列にする。</summary>
-    private static string Display(object value)
+    private static string Display(object? value)
     {
         switch (value)
         {
+            case null:
+                return "null";
             case LocatorExpr expr:
                 return expr.Text;
             case NullLiteral:
@@ -1353,6 +1486,13 @@ internal sealed class NullLiteral
 // ============================================================
 internal static class ParameterParser
 {
+    /// <summary>
+    /// Excel等の外部データ由来の正規表現に適用するマッチタイムアウト。
+    /// 壊滅的バックトラッキング (ReDoS) を持つパターンが渡されても
+    /// マッチ実行が無限にハングしないよう上限を設ける。
+    /// </summary>
+    internal static readonly TimeSpan RegexMatchTimeout = TimeSpan.FromSeconds(5);
+
     /// <summary>
     /// C#風パラメータ文字列をパースする。
     /// </summary>
@@ -1630,11 +1770,29 @@ internal static class ParameterParser
 
         while (p < t.Length && !IsSq(t[p]))
         {
-            // エスケープされたクォート文字だけ解釈し、他のバックスラッシュはそのまま残す
-            if (t[p] == '\\' && p + 1 < t.Length && IsQuoteChar(t[p + 1]))
+            // エスケープ処理は ReadString (ダブルクォート) と対称にする。
+            // \n \t \r は制御文字に、クォート文字はその文字だけを残し、
+            // 未知のエスケープ (\d 等) はバックスラッシュごと温存する。
+            if (t[p] == '\\' && p + 1 < t.Length)
             {
                 p++;
-                sb.Append(t[p]);
+                switch (t[p])
+                {
+                    case 'n': sb.Append('\n'); break;
+                    case 't': sb.Append('\t'); break;
+                    case 'r': sb.Append('\r'); break;
+                    case '\\': sb.Append('\\'); break;
+                    default:
+                        if (IsQuoteChar(t[p]))
+                        {
+                            sb.Append(t[p]);
+                        }
+                        else
+                        {
+                            sb.Append('\\').Append(t[p]);
+                        }
+                        break;
+                }
             }
             else
             {
@@ -1754,7 +1912,7 @@ internal static class ParameterParser
         }
 
         p++;
-        return new Regex(pattern, regexOptions);
+        return new Regex(pattern, regexOptions, RegexMatchTimeout);
     }
 
     /// <summary>
@@ -1813,41 +1971,38 @@ internal static class ParameterParser
     {
         var start = p;
 
-        if (t[p] == '-')
-        {
-            p++;
-        }
+        // 終端の走査は ScanNumberEnd に一本化する (分類用の走査と文法を共有し、
+        // 片方だけ仕様変更されて「数値判定したのにパースできない」不整合が
+        // 生じるのを防ぐ)。
+        p = ScanNumberEnd(t, p);
 
-        while (p < t.Length && char.IsDigit(t[p]))
-        {
-            p++;
-        }
+        var s = t[start..p];
 
-        // "." の後に数字が続けば小数
-        var isDouble = false;
-        if (p + 1 < t.Length && t[p] == '.' && char.IsDigit(t[p + 1]))
-        {
-            isDouble = true;
-            p++;
-            while (p < t.Length && char.IsDigit(t[p]))
-            {
-                p++;
-            }
-        }
+        // 小数部 ("." の後に数字) を含むかどうかで int / double を分ける。
+        // ScanNumberEnd は数字が続く '.' のみを取り込むので、'.' の有無で判別できる。
+        var isDouble = s.Contains('.');
 
         // 注意: 三項演算子で書くと int が double に暗黙変換されてしまうため if で分ける
-        var s = t[start..p];
         try
         {
             if (isDouble)
             {
-                return double.Parse(s, CultureInfo.InvariantCulture);
+                var d = double.Parse(s, CultureInfo.InvariantCulture);
+
+                // double.Parse は OverflowException を投げず、桁あふれ時は
+                // ±Infinity を返す。黙って Infinity を渡さず明示エラーにする。
+                if (double.IsInfinity(d))
+                {
+                    throw new FormatException($"数値 '{s}' が大きすぎて扱えません。");
+                }
+
+                return d;
             }
             return int.Parse(s, CultureInfo.InvariantCulture);
         }
         catch (OverflowException ex)
         {
-            throw new FormatException($"数値 '{s}' が大きすぎて int として扱えません。", ex);
+            throw new FormatException($"数値 '{s}' が大きすぎて扱えません。", ex);
         }
     }
 
@@ -2153,7 +2308,7 @@ internal static class ParameterParser
 
     /// <summary>
     /// "(" から対応する ")" までを読み飛ばす (pは ")" の次に進む)。
-    /// 内部の文字列リテラル ("..." / @"...") の中の括弧は数えない。
+    /// 内部の文字列リテラル ("..." / @"..." / '...') の中の括弧は数えない。
     /// 読み取り開始時、t[p] は "(" を指していること。
     /// </summary>
     private static void SkipBalancedParens(string t, ref int p)
@@ -2172,6 +2327,17 @@ internal static class ParameterParser
             if (IsVerbatimStart(t, p))
             {
                 ReadVerbatimString(t, ref p);
+                continue;
+            }
+
+            // シングルクォート文字列も丸ごとスキップする。
+            // ReadSingleQuoted/IsSq でサポート済みの記法なので、ここで
+            // 文字列扱いしないと内部の '(' ')' を括弧として誤カウントし、
+            // ネスト式やチェーン式の捕捉範囲がずれる
+            // (例: Filter(new() { HasText = 'a)b' }))。
+            if (IsSq(t[p]))
+            {
+                ReadSingleQuoted(t, ref p);
                 continue;
             }
 
@@ -2333,8 +2499,20 @@ internal static class ParameterParser
     private static bool IsNumberStart(string t, int p)
     {
         return p < t.Length
-            && (char.IsDigit(t[p])
-                || (t[p] == '-' && p + 1 < t.Length && char.IsDigit(t[p + 1])));
+            && (IsAsciiDigit(t[p])
+                || (t[p] == '-' && p + 1 < t.Length && IsAsciiDigit(t[p + 1])));
+    }
+
+    /// <summary>
+    /// ASCII数字 ('0'..'9') かどうか。
+    /// char.IsDigit は全角 '２' や他スクリプトの数字も true を返すが、
+    /// int.Parse / double.Parse はそれらを受け付けず FormatException になるため、
+    /// 数値トークンの判定は ASCII に限定し、全角は未クォート文字列として
+    /// CoerceTo の正規化パスへ回す。
+    /// </summary>
+    private static bool IsAsciiDigit(char c)
+    {
+        return c is >= '0' and <= '9';
     }
 
     /// <summary>
@@ -2357,15 +2535,15 @@ internal static class ParameterParser
             p++;
         }
 
-        while (p < t.Length && char.IsDigit(t[p]))
+        while (p < t.Length && IsAsciiDigit(t[p]))
         {
             p++;
         }
 
-        if (p + 1 < t.Length && t[p] == '.' && char.IsDigit(t[p + 1]))
+        if (p + 1 < t.Length && t[p] == '.' && IsAsciiDigit(t[p + 1]))
         {
             p++;
-            while (p < t.Length && char.IsDigit(t[p]))
+            while (p < t.Length && IsAsciiDigit(t[p]))
             {
                 p++;
             }
