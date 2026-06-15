@@ -386,8 +386,7 @@ public static class LocatorResolver
             if (returnType == null)
             {
                 // returnType 未指定なら ILocator / IFrameLocator のどちらでも受け入れる
-                return typeof(ILocator).IsAssignableFrom(rt)
-                    || typeof(IFrameLocator).IsAssignableFrom(rt);
+                return AcceptsAnyLocator(rt);
             }
 
             return returnType.IsAssignableFrom(rt);
@@ -1135,6 +1134,12 @@ public static class LocatorResolver
                 "ILocator に変換する値が空です。セレクタまたはネスト式を指定してください。");
         }
 
+        // 先頭に書かれた冗長なルート参照 (page. / frame. / 任意の別名) を、
+        // 最初の Locator ファクトリ (GetByText/Locator 等) の手前まで読み飛ばす。
+        // ネスト式は元々ルートの IPage を起点に解決されるため、これらの接頭辞は
+        // 本来不要 (冗長)。うっかり書いても動かせるようにするための救済。
+        expr = StripRootReference(expr);
+
         // 異常に深いネストは StackOverflowException (catch不能・プロセス即死) に
         // なる前に、明示的な定義エラーとして止める
         if (t_nestingDepth >= MaxNestingDepth)
@@ -1167,6 +1172,107 @@ public static class LocatorResolver
 
         // ネスト式でなければセレクタ文字列とみなす
         return page.Locator(expr);
+    }
+
+    /// <summary>
+    /// ネスト式の先頭に書かれた冗長なルート参照 (page. / frame. / 任意の別名) を、
+    /// 「最初に現れる IPage 起点の Locator ファクトリ (GetByText / Locator 等)」の
+    /// 手前まで読み飛ばす。
+    ///
+    ///   "page.GetByText(\"OK\")"                      → "GetByText(\"OK\")"
+    ///   "frame.Locator(\"#x\").ContentFrame.GetBy..." → "Locator(\"#x\").ContentFrame..."
+    ///   "myPage.GetByText(\"OK\")"                    → "GetByText(\"OK\")"  (別名でも可)
+    ///
+    /// 分割は括弧・クォートを解釈する ParseChain で行うため、引数や文字列内の
+    /// ドット ("a.b" / AriaRole.Button) で誤分割しない。
+    ///
+    /// 読み飛ばす側に First / Filter / ContentFrame 等の「レシーバが必要な
+    /// Locator 操作」が含まれる場合は、意味のある起点を黙って捨てることになるため
+    /// 例外にする (例: "ContentFrame.GetByText(...)" は起点にできない)。
+    /// チェーンとして解釈できない文字列 (CSS/XPath セレクタ等) はそのまま返す。
+    /// </summary>
+    private static string StripRootReference(string expr)
+    {
+        // 先頭プレフィックスが存在しうるのは「最初の '(' より前にトップレベルの
+        // '.' がある」場合だけ (例: page.GetByText(...) は '.'(4) < '('(14))。
+        //   - '.' が無い               → プレフィックス無し
+        //   - '(' が無い               → チェーンでない (CSS セレクタ "div.locator" 等)
+        //   - '.' が '(' より後          → ドットは引数内 (GetByRole(AriaRole.Button) 等)
+        // いずれも剥がす余地が無いので、無駄な ParseChain を避けて即返す。
+        // これにより一般的なネスト式 (GetByRole(AriaRole.Button) 等) の二重パースも防ぐ。
+        var dotPos = expr.IndexOf('.');
+        var parenPos = expr.IndexOf('(');
+        if (dotPos < 0 || parenPos < 0 || dotPos > parenPos)
+        {
+            return expr;
+        }
+
+        List<(string Name, string? Args)> segments;
+        try
+        {
+            segments = ParameterParser.ParseChain(expr);
+        }
+        catch (FormatException)
+        {
+            // チェーンとして解釈できない = セレクタ文字列。手を加えない。
+            return expr;
+        }
+
+        // 先頭から、IPage 起点で Locator を生成できる最初のセグメントを探す。
+        // ファクトリは必ず引数を取る呼び出し (Args != null) なので、それを条件に
+        // 加えることで、別名の "locator." (Args == null) を Locator ファクトリと
+        // 取り違えず、後段で正しくルート別名として読み飛ばせるようにする。
+        var cut = -1;
+        for (var i = 0; i < segments.Count; i++)
+        {
+            if (segments[i].Args != null
+                && PageLevelLocatorFactories.Contains(segments[i].Name))
+            {
+                cut = i;
+                break;
+            }
+        }
+
+        // ファクトリが無い (純粋なセレクタ等) / 先頭がファクトリ (剥がす物が無い)
+        // 場合は素通り
+        if (cut <= 0)
+        {
+            return expr;
+        }
+
+        // 読み飛ばす先頭セグメントに「実在する API メンバー (MainFrame / Frames /
+        // First / Filter / ContentFrame 等)」が混じっていたら、意味のあるナビゲーション
+        // を黙って捨てて別要素を指してしまうので明示エラーにする。
+        // page. / frame. / locator. 等のルート別名は捨ててもスコープが変わらないため除外。
+        for (var i = 0; i < cut; i++)
+        {
+            var name = segments[i].Name;
+            if (AllKnownMembers.Contains(name) && !SafeRootAliases.Contains(name))
+            {
+                throw new ArgumentException(
+                    $"ネスト式の起点に '{name}' は使えません。"
+                    + " page./frame. 等のルート参照か、GetByText(...) / Locator(...) 等の"
+                    + " ファクトリで始めてください。");
+            }
+        }
+
+        // 残り (ファクトリ以降) を組み立て直して返す
+        var sb = new StringBuilder();
+        for (var i = cut; i < segments.Count; i++)
+        {
+            if (i > cut)
+            {
+                sb.Append('.');
+            }
+
+            sb.Append(segments[i].Name);
+            if (segments[i].Args != null)
+            {
+                sb.Append('(').Append(segments[i].Args).Append(')');
+            }
+        }
+
+        return sb.ToString();
     }
 
     /// <summary>
@@ -1267,6 +1373,81 @@ public static class LocatorResolver
             t.GetProperties(BindingFlags.Public | BindingFlags.Instance)
                 .Where(p => p.CanWrite)
                 .ToDictionary(p => p.Name, p => p, StringComparer.OrdinalIgnoreCase));
+    }
+
+    // ============================================================
+    //  ネスト式のルート参照解決に使うメンバー名集合
+    // ============================================================
+    //
+    // 注意: これらは GetAllMethods/GetAllProperties (上のキャッシュ) を使うため、
+    // MethodCache / PropertyCache の宣言より後で初期化される必要がある
+    // (静的フィールドの初期化はテキスト順)。
+
+    /// <summary>
+    /// IPage 上で Locator (ILocator / IFrameLocator) を生成できる
+    /// 「起点メソッド/プロパティ」名の集合 (大文字小文字無視)。
+    /// 例: GetByRole, GetByText, Locator, FrameLocator。
+    /// ネスト式の先頭プレフィックスを「最初にこの集合へ一致するセグメント」まで
+    /// 読み飛ばす判定に使う。
+    /// </summary>
+    private static readonly HashSet<string> PageLevelLocatorFactories =
+        BuildMemberNames(locatorReturningOnly: true, typeof(IPage));
+
+    /// <summary>
+    /// IPage / ILocator / IFrameLocator の全メンバー名 (大文字小文字無視)。
+    /// 読み飛ばす側に MainFrame / Frames / First / Filter / ContentFrame 等の
+    /// 「実在する API メンバー (＝意味のあるナビゲーション)」が紛れていないかの
+    /// 検出に使う。これらを黙って捨てると別要素を指してしまうため例外にする。
+    /// </summary>
+    private static readonly HashSet<string> AllKnownMembers =
+        BuildMemberNames(locatorReturningOnly: false,
+            typeof(IPage), typeof(ILocator), typeof(IFrameLocator));
+
+    /// <summary>
+    /// 「ルートそのもの」を指す安全な別名。これらは実在メンバー名 (Page / Locator /
+    /// FrameLocator) と衝突するが、いずれも解決起点＝ページに帰着するため、
+    /// 読み飛ばしてもスコープが変わらない。AllKnownMembers の検出から除外する。
+    /// </summary>
+    private static readonly HashSet<string> SafeRootAliases =
+        new(new[] { "page", "frame", "frameLocator", "locator" }, StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// 値が ILocator / IFrameLocator として受け入れ可能か (どちらかに代入可能か)。
+    /// ResolveSegment の戻り値型判定 (returnType 未指定時) と、メンバー名集合の
+    /// 構築で共有する。
+    /// </summary>
+    private static bool AcceptsAnyLocator(Type rt) =>
+        typeof(ILocator).IsAssignableFrom(rt) || typeof(IFrameLocator).IsAssignableFrom(rt);
+
+    /// <summary>
+    /// 指定インターフェース群のメソッド・プロパティ名集合を作る (大文字小文字無視)。
+    /// locatorReturningOnly が true なら ILocator / IFrameLocator を返すものだけ。
+    /// </summary>
+    private static HashSet<string> BuildMemberNames(bool locatorReturningOnly, params Type[] interfaceTypes)
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var it in interfaceTypes)
+        {
+            foreach (var m in GetAllMethods(it))
+            {
+                // プロパティのアクセサ (get_XXX) は除外し、プロパティ側で名前を拾う
+                if (!m.IsSpecialName && (!locatorReturningOnly || AcceptsAnyLocator(m.ReturnType)))
+                {
+                    set.Add(m.Name);
+                }
+            }
+
+            foreach (var p in GetAllProperties(it))
+            {
+                if (!locatorReturningOnly || AcceptsAnyLocator(p.PropertyType))
+                {
+                    set.Add(p.Name);
+                }
+            }
+        }
+
+        return set;
     }
 
     // ============================================================
