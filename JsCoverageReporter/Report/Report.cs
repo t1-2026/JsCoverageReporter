@@ -1864,7 +1864,7 @@ internal class HtmlReportGenerator
         public List<LineData> MergedLines;
         public IReadOnlyList<(string Name, int Line)> MergedUncalled;
         public SourceMap SrcMap;
-        public List<ScriptCoverage> Members;  // 元グループ（集約フェーズで urlGroups 等を再構築する）
+        public List<ScriptCoverage> Members;  // 元グループ（集約フェーズで urlGroups 等を再構築する）。要素順は MemberCovMaps / MemberCountMaps と添字一致する。
     }
 
     // 1グループ分の重い計算（文字スキャン）を行う。I/O も連番 i も触らない純粋計算。
@@ -1938,6 +1938,7 @@ internal class HtmlReportGenerator
         if (mergedLines.Count <= 1 && srcMap == null)
         {
             // スキップ理由をユーザーが把握できるよう警告を出す
+            // 注: ComputeGroup は並列実行されるため、複数スクリプトのこの警告は stderr 上で非決定的な順序になりうる（生成物には影響しない）。
             Console.Error.WriteLine($"[Warning] Skipping 1-line script (no coverage info): {scriptUrl}");
             comp.Skipped = true;
             return comp;
