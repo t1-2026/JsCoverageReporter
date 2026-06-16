@@ -453,7 +453,8 @@ try
     Console.WriteLine($"  {coverages.Count} script(s) captured.");
 
     // 収集データをハンドオフファイルに書き出して、レポート生成を別プロセスに委譲する。
-    Directory.CreateDirectory(outputDir);
+    // outputDir は上の書き込み可能チェック（Directory.CreateDirectory + プローブ）で
+    // 既に作成・検証済みであり、このパスに到達した時点で必ず存在するため再作成は不要。
     var dataFile = Path.Combine(outputDir, ".coverage-handoff.json");
     await File.WriteAllTextAsync(dataFile, CoverageHandoff.Serialize(scenario.Url, coverages));
 
@@ -467,8 +468,14 @@ try
         return code;
     }
 
-    // デタッチ: 子を起動したら即終了する（子がレポート生成し、--open 時は HTML を開く）
-    ReportProcess.SpawnReport(reportArgs, wait: false);
+    // デタッチ: 子を起動する（子がレポート生成し、--open 時は HTML を開く）。
+    int spawnCode = ReportProcess.SpawnReport(reportArgs, wait: false);
+    if (spawnCode != 0)
+    {
+        Console.Error.WriteLine("レポート生成プロセスの起動に失敗しました。");
+        try { File.Delete(dataFile); } catch { }   // 起動失敗時はハンドオフファイルの残骸を残さない
+        return spawnCode;
+    }
     Console.WriteLine("Report generation started in background.");
     return 0;
 }
