@@ -9,6 +9,15 @@ namespace JsCoverageReporter.Tests.Report;
 /// </summary>
 public class ParallelDeterminismTests
 {
+    // 「生成日時: yyyy-MM-dd HH:mm:ss」の値部分を固定文字列へ置換する。
+    private static string NormalizeTimestamp(string content)
+    {
+        return System.Text.RegularExpressions.Regex.Replace(
+            content,
+            @"生成日時: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}",
+            "生成日時: <NORMALIZED>");
+    }
+
     private static List<ScriptCoverage> ManyScripts()
     {
         var list = new List<ScriptCoverage>();
@@ -56,7 +65,9 @@ public class ParallelDeterminismTests
             {
                 // coverage.json は生成時刻を含むため比較から除外する
                 if (key.EndsWith("coverage.json")) { continue; }
-                Assert.Equal(a[key], b[key]);
+                // index.html 等に含まれる「生成日時: yyyy-MM-dd HH:mm:ss」は2回の Generate 呼び出しで秒がずれうるため、
+                // 比較前に正規化する。それ以外が完全にバイト一致すれば決定性が保証される。
+                Assert.Equal(NormalizeTimestamp(a[key]), NormalizeTimestamp(b[key]));
             }
         }
         finally
