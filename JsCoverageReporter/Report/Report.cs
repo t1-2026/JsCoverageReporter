@@ -1848,6 +1848,115 @@ internal class HtmlReportGenerator
             new ReportOptions(outputDir, writeLcov, writeJson, targetUrl));
     }
 
+    /// <summary>
+    /// 1グループ分の「I/O・連番非依存」な計算結果。並列フェーズで生成し、
+    /// 集約フェーズ（順次）でファイル名割当・HTML 組み立て・書き込みに使う。
+    /// Skipped が true のグループはレポート対象外（連番 i を消費しない）。
+    /// </summary>
+    private sealed class GroupComputation
+    {
+        public bool Skipped;
+        public string ScriptUrl;
+        public string CanonicalSource;
+        public int[][] MemberCovMaps;
+        public int[][] MemberCountMaps;
+        public int[] MergedMap;
+        public int[] MergedCountMap;
+        public List<LineData> MergedLines;
+        public IReadOnlyList<(string Name, int Line)> MergedUncalled;
+        public SourceMap SrcMap;
+        public List<ScriptCoverage> Members;  // 元グループ（集約フェーズで urlGroups 等を再構築する）
+    }
+
+    // 1グループ分の重い計算（文字スキャン）を行う。I/O も連番 i も触らない純粋計算。
+    private GroupComputation ComputeGroup(List<ScriptCoverage> group,
+        IReadOnlyDictionary<string, SourceMap> sourceMaps)
+    {
+        var comp = new GroupComputation { Members = group };
+        if (group.Count == 0) { comp.Skipped = true; return comp; }
+
+        string scriptUrl = group[0].Url;
+
+        // カノニカル（基準）スクリプトは最初のエントリとする
+        var canonical = group[0];
+
+        // BOM（U+FEFF）をソースから除去する
+        // V8 は BOM を JavaScript の文字としてカウントしないため、CDP のオフセット値は
+        // BOM 除去後の位置を指している。BOM を除去せずに渡すとオフセットが1ずれて
+        // 末尾の文字がカバレッジ対象外（neutral）になるバグが発生する。
+        // null の場合は空文字に正規化する（null 合体演算子を使わず if/else で明示的に分岐する）
+        string canonicalSourceRaw;
+        if (canonical.Source == null)
+        {
+            canonicalSourceRaw = "";
+        }
+        else
+        {
+            canonicalSourceRaw = canonical.Source;
+        }
+        string canonicalSource = canonicalSourceRaw.TrimStart('﻿');
+
+        // メンバーごとのカバレッジマップ・実行回数マップを1回だけ計算してキャッシュする。
+        // BuildCoverageMap / BuildCountMap は (source, functions) の決定的な純関数であり、
+        // グループ内全メンバーのソースは canonicalSource と完全一致する（グループキーにソースを含む）。
+        // 後段の URL 別ページ生成で同じメンバーを再計算していた重複を、この配列の再利用で排除する。
+        // 各マップは MergeMaps/MergeCountMaps（新配列を返し入力を変更しない）と BuildLines（読み取りのみ）
+        // からのみ参照されるため共有しても安全で、結果は従来とビット単位で一致する。
+        var memberCovMaps   = new int[group.Count][];
+        var memberCountMaps = new int[group.Count][];
+        for (int g = 0; g < group.Count; g++)
+        {
+            // 範囲の平坦化・ソートはカバレッジマップと実行回数マップで共通のため1回だけ行い、
+            // 両コアで共有する（重複する O(r log r) ソートと割り当てを省く）。
+            // ソート済みリストは両コアで読み取りのみ参照するため共有しても安全。
+            var sortedRanges   = CoverageParser.FlattenAndSortRanges(group[g].Functions);
+            memberCovMaps[g]   = CoverageParser.BuildCoverageMapFromSortedRanges(canonicalSource, sortedRanges);
+            memberCountMaps[g] = CoverageParser.BuildCountMapFromSortedRanges(canonicalSource, sortedRanges);
+        }
+
+        // 全タブ分のカバレッジマップを OR 合成する
+        // 実行回数マップ（行番号ガターのツールチップ表示用）も並行して構築し、文字ごとの最大値で合成する
+        var mergedMap      = memberCovMaps[0];
+        var mergedCountMap = memberCountMaps[0];
+        for (int g = 1; g < group.Count; g++)
+        {
+            mergedMap      = CoverageParser.MergeMaps(mergedMap, memberCovMaps[g]);
+            mergedCountMap = CoverageParser.MergeCountMaps(mergedCountMap, memberCountMaps[g]);
+        }
+
+        // OR 合成したマップから行データを生成する（BOM 除去済みのソースを使う）
+        var mergedLines = BuildLines(canonicalSource, mergedMap, mergedCountMap);
+
+        // このスクリプトのソースマップを取得する（あれば）
+        SourceMap srcMap = null;
+        if (sourceMaps != null) { sourceMaps.TryGetValue(scriptUrl, out srcMap); }
+
+        // 1行しかないスクリプトはレポート対象外としてスキップする
+        // （インライン eval や最小化された1行スクリプトなど、有意な情報が得られないため）
+        // ただしソースマップがある場合は元ファイル別の表示ができるためスキップしない
+        // （ミニファイされた本番バンドルは1行になることが多く、本機能の主用途のため）
+        // i はインクリメントしない → スキップしてもファイル番号に欠番が生じない
+        if (mergedLines.Count <= 1 && srcMap == null)
+        {
+            // スキップ理由をユーザーが把握できるよう警告を出す
+            Console.Error.WriteLine($"[Warning] Skipping 1-line script (no coverage info): {scriptUrl}");
+            comp.Skipped = true;
+            return comp;
+        }
+
+        comp.ScriptUrl       = scriptUrl;
+        comp.CanonicalSource = canonicalSource;
+        comp.MemberCovMaps   = memberCovMaps;
+        comp.MemberCountMaps = memberCountMaps;
+        comp.MergedMap       = mergedMap;
+        comp.MergedCountMap  = mergedCountMap;
+        comp.MergedLines     = mergedLines;
+        // グループ全体で一度も実行されなかった関数の一覧（詳細ページの先頭に表示する）
+        comp.MergedUncalled  = CollectUncalledFunctions(group, canonicalSource);
+        comp.SrcMap          = srcMap;
+        return comp;
+    }
+
     // 単一の公開エントリ。全挙動は options で制御する。
     internal void Generate(
         IReadOnlyList<ScriptCoverage> coverages,
@@ -1915,77 +2024,27 @@ internal class HtmlReportGenerator
         int i = 0;
         foreach (var group in scriptGroups)
         {
-            if (group.Count == 0)
+            // 1グループ分の「I/O・連番非依存」な重い計算（文字スキャン）を行う。
+            // この段階では並列化せず順次呼び出す（出力はバイト一致のまま）。
+            var comp = ComputeGroup(group, sourceMaps);
+
+            // スキップ対象（空グループ or 1行スクリプト）は連番 i を消費せず次へ。
+            // 1行スクリプトの警告出力は ComputeGroup 内で行う（従来挙動と同一）。
+            if (comp.Skipped)
             {
                 continue;
             }
-            string scriptUrl = group[0].Url;
 
-            // カノニカル（基準）スクリプトは最初のエントリとする
-            var canonical = group[0];
-
-            // BOM（U+FEFF）をソースから除去する
-            // V8 は BOM を JavaScript の文字としてカウントしないため、CDP のオフセット値は
-            // BOM 除去後の位置を指している。BOM を除去せずに渡すとオフセットが1ずれて
-            // 末尾の文字がカバレッジ対象外（neutral）になるバグが発生する。
-            // null の場合は空文字に正規化する（null 合体演算子を使わず if/else で明示的に分岐する）
-            string canonicalSourceRaw;
-            if (canonical.Source == null)
-            {
-                canonicalSourceRaw = "";
-            }
-            else
-            {
-                canonicalSourceRaw = canonical.Source;
-            }
-            string canonicalSource = canonicalSourceRaw.TrimStart('\uFEFF');
-
-            // メンバーごとのカバレッジマップ・実行回数マップを1回だけ計算してキャッシュする。
-            // BuildCoverageMap / BuildCountMap は (source, functions) の決定的な純関数であり、
-            // グループ内全メンバーのソースは canonicalSource と完全一致する（グループキーにソースを含む）。
-            // 後段の URL 別ページ生成で同じメンバーを再計算していた重複を、この配列の再利用で排除する。
-            // 各マップは MergeMaps/MergeCountMaps（新配列を返し入力を変更しない）と BuildLines（読み取りのみ）
-            // からのみ参照されるため共有しても安全で、結果は従来とビット単位で一致する。
-            var memberCovMaps   = new int[group.Count][];
-            var memberCountMaps = new int[group.Count][];
-            for (int g = 0; g < group.Count; g++)
-            {
-                // 範囲の平坦化・ソートはカバレッジマップと実行回数マップで共通のため1回だけ行い、
-                // 両コアで共有する（重複する O(r log r) ソートと割り当てを省く）。
-                // ソート済みリストは両コアで読み取りのみ参照するため共有しても安全。
-                var sortedRanges   = CoverageParser.FlattenAndSortRanges(group[g].Functions);
-                memberCovMaps[g]   = CoverageParser.BuildCoverageMapFromSortedRanges(canonicalSource, sortedRanges);
-                memberCountMaps[g] = CoverageParser.BuildCountMapFromSortedRanges(canonicalSource, sortedRanges);
-            }
-
-            // 全タブ分のカバレッジマップを OR 合成する
-            // 実行回数マップ（行番号ガターのツールチップ表示用）も並行して構築し、文字ごとの最大値で合成する
-            var mergedMap      = memberCovMaps[0];
-            var mergedCountMap = memberCountMaps[0];
-            for (int g = 1; g < group.Count; g++)
-            {
-                mergedMap      = CoverageParser.MergeMaps(mergedMap, memberCovMaps[g]);
-                mergedCountMap = CoverageParser.MergeCountMaps(mergedCountMap, memberCountMaps[g]);
-            }
-
-            // OR 合成したマップから行データを生成する（BOM 除去済みのソースを使う）
-            var mergedLines = BuildLines(canonicalSource, mergedMap, mergedCountMap);
-
-            // このスクリプトのソースマップを取得する（あれば）
-            SourceMap srcMap = null;
-            if (sourceMaps != null) { sourceMaps.TryGetValue(scriptUrl, out srcMap); }
-
-            // 1行しかないスクリプトはレポート対象外としてスキップする
-            // （インライン eval や最小化された1行スクリプトなど、有意な情報が得られないため）
-            // ただしソースマップがある場合は元ファイル別の表示ができるためスキップしない
-            // （ミニファイされた本番バンドルは1行になることが多く、本機能の主用途のため）
-            // i はインクリメントしない → スキップしてもファイル番号に欠番が生じない
-            if (mergedLines.Count <= 1 && srcMap == null)
-            {
-                // スキップ理由をユーザーが把握できるよう警告を出す
-                Console.Error.WriteLine($"[Warning] Skipping 1-line script (no coverage info): {scriptUrl}");
-                continue;
-            }
+            // 計算結果からループ本体が使うローカル変数を復元する（以降の本体は無改変で再利用する）。
+            string scriptUrl      = comp.ScriptUrl;
+            string canonicalSource = comp.CanonicalSource;
+            var memberCovMaps     = comp.MemberCovMaps;
+            var memberCountMaps   = comp.MemberCountMaps;
+            var mergedMap         = comp.MergedMap;
+            var mergedCountMap    = comp.MergedCountMap;
+            var mergedLines       = comp.MergedLines;
+            var mergedUncalled    = comp.MergedUncalled;
+            SourceMap srcMap      = comp.SrcMap;
 
             // 合成ページのファイル名（全タブの OR 合成カバレッジを表示する）
             var mergedFilename = $"script-{i}.html";
@@ -2033,9 +2092,6 @@ internal class HtmlReportGenerator
                     exportPages.Add(pageKey);
                 }
             }
-
-            // グループ全体で一度も実行されなかった関数の一覧（詳細ページの先頭に表示する）
-            var mergedUncalled = CollectUncalledFunctions(group, canonicalSource);
 
             // 合成カバレッジの詳細ページを生成する
             WriteFileSafe(
