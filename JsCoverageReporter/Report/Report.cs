@@ -2019,21 +2019,29 @@ internal class HtmlReportGenerator
         // LCOV / JSON エクスポート用のスクリプトデータ（--lcov / --json 指定時にファイル出力する）
         var exportScripts = new List<ExportScriptData>();
 
-        int i = 0;
-        foreach (var group in scriptGroups)
+        // フェーズ1: グループ計算を並列実行する（文字スキャン等の CPU 重処理）。
+        // 結果は元のグループ順を保つため添字付き配列に格納する。
+        // ComputeGroup は I/O も連番 i も触らない純計算（stderr 警告を除く）であり、
+        // comps[] 以外の共有可変状態への並列書き込みは無いため決定性を維持する。
+        var comps = new GroupComputation[scriptGroups.Count];
+        System.Threading.Tasks.Parallel.For(0, scriptGroups.Count, gi =>
         {
-            // 1グループ分の「I/O・連番非依存」な重い計算（文字スキャン）を行う。
-            // この段階では並列化せず順次呼び出す（出力はバイト一致のまま）。
-            var comp = ComputeGroup(group, sourceMaps);
+            comps[gi] = ComputeGroup(scriptGroups[gi], sourceMaps);
+        });
 
+        // フェーズ2: 集約（順次・元の順序）。連番 i 割当・HTML 組み立て・書き込み・蓄積を行う。
+        int i = 0;
+        foreach (var comp in comps)
+        {
             // スキップ対象（空グループ or 1行スクリプト）は連番 i を消費せず次へ。
-            // 1行スクリプトの警告出力は ComputeGroup 内で行う（従来挙動と同一）。
+            // 1行スクリプトの警告出力は ComputeGroup 内（フェーズ1）で行う（従来挙動と同一）。
             if (comp.Skipped)
             {
                 continue;
             }
 
             // 計算結果からループ本体が使うローカル変数を復元する（以降の本体は無改変で再利用する）。
+            var group             = comp.Members;
             string scriptUrl      = comp.ScriptUrl;
             string canonicalSource = comp.CanonicalSource;
             var memberCovMaps     = comp.MemberCovMaps;
