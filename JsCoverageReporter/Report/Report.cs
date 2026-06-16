@@ -1,5 +1,11 @@
 #nullable disable
 
+// 【移植契約】このファイルはレポート生成の自己完結中核である。
+// 依存は入力 DTO（JsCoverageReporter.Coverage の ScriptCoverage / PageInfo /
+// FunctionCoverage / CoverageRange）と注入される SourceMap 辞書のみ。
+// ネットワーク I/O・ブラウザ操作・Microsoft.Playwright への依存を持ち込まないこと。
+// 他プロジェクトへは「このファイル + 上記 DTO」をコピーすれば動作する。
+
 using System.Text;
 using System.Text.Json;
 using JsCoverageReporter.Coverage;
