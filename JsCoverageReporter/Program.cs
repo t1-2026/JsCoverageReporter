@@ -27,6 +27,8 @@ if (Array.IndexOf(args, "--help") >= 0 || Array.IndexOf(args, "-h") >= 0)
           --channel <name>    ブラウザチャンネルを指定する（例: msedge, chrome）
           --lcov              lcov.info（LCOV 形式）も出力する（VSCode Coverage Gutters・CI 連携用）
           --json              coverage.json（機械可読サマリー）も出力する
+          --open              レポート完成後に既定ブラウザで index.html を開く
+          --wait              レポート生成（別プロセス）の完了を待つ
           --verbose           エラー発生時に詳細なスタックトレースを表示する
           --help, -h          このヘルプを表示する
 
@@ -91,6 +93,24 @@ bool writeJson = false;
 
 // --json が既に指定済みかどうかを示すフラグ（重複指定の検知に使う）
 bool jsonSet = false;
+
+// --open が指定された場合は true（レポート完成後に既定ブラウザで index.html を開く）
+bool open = false;
+
+// --open が既に指定済みかどうかを示すフラグ（重複指定の検知に使う）
+bool openSet = false;
+
+// --wait が指定された場合は true（親が子プロセスの完了を待つ）
+bool wait = false;
+
+// --wait が既に指定済みかどうかを示すフラグ（重複指定の検知に使う）
+bool waitSet = false;
+
+// --report-from で指定されたハンドオフデータファイルのパス（内部用・隠しモード）。未指定なら null
+string? reportFrom = null;
+
+// --target-url で指定された対象 URL（内部用・report-from 時に引き継ぐ）。未指定なら null
+string? targetUrlOverride = null;
 
 // コマンドライン引数を1つずつ走査する
 for (int i = 0; i < args.Length; i++)
@@ -210,6 +230,92 @@ for (int i = 0; i < args.Length; i++)
         }
         writeJson = true;
         jsonSet   = true;
+    }
+
+    // --open オプションを検出する（値なし・レポート完成後に既定ブラウザで index.html を開く）
+    else if (args[i] == "--open")
+    {
+        // 同じオプションが複数回指定された場合は警告する
+        if (openSet)
+        {
+            Console.Error.WriteLine("[Warning] --open が複数回指定されました。");
+        }
+        open    = true;
+        openSet = true;
+    }
+
+    // --wait オプションを検出する（値なし・親が子プロセスの完了を待つ）
+    else if (args[i] == "--wait")
+    {
+        // 同じオプションが複数回指定された場合は警告する
+        if (waitSet)
+        {
+            Console.Error.WriteLine("[Warning] --wait が複数回指定されました。");
+        }
+        wait    = true;
+        waitSet = true;
+    }
+
+    // --report-from オプションを検出する（内部用・データファイルからレポートのみ生成する隠しモード）
+    else if (args[i] == "--report-from")
+    {
+        // 値が存在しない、または次の引数が別のオプション（--で始まる）の場合はエラーにする
+        if (i + 1 >= args.Length || args[i + 1].StartsWith("--"))
+        {
+            Console.Error.WriteLine("エラー: --report-from オプションには値が必要です。");
+            return 1;
+        }
+        // 次の引数をハンドオフデータファイルのパスとして取得する
+        reportFrom = args[i + 1];
+        // 値として消費した次の引数をスキップする
+        i++;
+    }
+
+    // --target-url オプションを検出する（内部用・report-from 時に対象 URL を引き継ぐ）
+    else if (args[i] == "--target-url")
+    {
+        // 値が存在しない、または次の引数が別のオプション（--で始まる）の場合はエラーにする
+        if (i + 1 >= args.Length || args[i + 1].StartsWith("--"))
+        {
+            Console.Error.WriteLine("エラー: --target-url オプションには値が必要です。");
+            return 1;
+        }
+        // 次の引数を対象 URL として取得する
+        targetUrlOverride = args[i + 1];
+        // 値として消費した次の引数をスキップする
+        i++;
+    }
+}
+
+// ---- report-from モード（別プロセスのレポート生成専用・隠しモード）----
+// このモードでは config ファイルもブラウザ操作も使わず、ハンドオフ JSON からレポートのみを生成する。
+if (reportFrom != null)
+{
+    try
+    {
+        string json = await File.ReadAllTextAsync(reportFrom);
+        var (handoffUrl, coverages) = CoverageHandoff.Deserialize(json);
+
+        // ソースマップは子側で取得する（並列）
+        var sourceMaps = await SourceMapLoader.LoadAllAsync(coverages);
+
+        string effectiveTarget = targetUrlOverride ?? handoffUrl;
+        new HtmlReportGenerator().Generate(
+            coverages, sourceMaps,
+            new ReportOptions(outputDir, writeLcov, writeJson, effectiveTarget));
+
+        var indexPath = Path.Combine(outputDir, "index.html");
+        Console.WriteLine($"Report: {indexPath}");
+        if (open) { ReportProcess.OpenInBrowser(indexPath); }
+
+        // 読み終えたハンドオフファイルを削除する（残骸を残さない）
+        try { File.Delete(reportFrom); } catch { }
+        return 0;
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"レポート生成に失敗しました: {ex.Message}");
+        return 2;
     }
 }
 
@@ -346,30 +452,31 @@ try
     // 取得したスクリプト数を表示する
     Console.WriteLine($"  {coverages.Count} script(s) captured.");
 
-    // ソースマップ（//# sourceMappingURL）の取得を試みる
-    // 取得できたスクリプトは元ファイル（TypeScript 等）別の行カバレッジもレポートに表示される
-    // 取得・解析の失敗は警告のみでレポート生成は続行する
-    var sourceMaps = await SourceMapLoader.LoadAllAsync(coverages);
-    if (sourceMaps.Count > 0)
+    // 収集データをハンドオフファイルに書き出して、レポート生成を別プロセスに委譲する。
+    // outputDir は上の書き込み可能チェック（Directory.CreateDirectory + プローブ）で
+    // 既に作成・検証済みであり、このパスに到達した時点で必ず存在するため再作成は不要。
+    var dataFile = Path.Combine(outputDir, ".coverage-handoff.json");
+    await File.WriteAllTextAsync(dataFile, CoverageHandoff.Serialize(scenario.Url, coverages));
+
+    var reportArgs = ReportProcess.BuildReportArgs(
+        dataFile, outputDir, writeLcov, writeJson, open, scenario.Url);
+
+    if (wait)
     {
-        Console.WriteLine($"  {sourceMaps.Count} source map(s) resolved.");
+        // 同期: 子の完了を待ち、終了コードを伝播する
+        int code = ReportProcess.SpawnReport(reportArgs, wait: true);
+        return code;
     }
 
-    // HTMLレポートを生成して出力ディレクトリに書き出す（--lcov / --json 指定時は機械可読形式も出力する）
-    // 対象 URL を渡してインデックスのメタ情報（いつ・何に対する計測か）に表示する
-    new HtmlReportGenerator().Generate(coverages, outputDir, sourceMaps, writeLcov, writeJson, scenario.Url);
-    // 生成したレポートのパスを表示する
-    Console.WriteLine($"Report: {Path.Combine(outputDir, "index.html")}");
-    if (writeLcov)
+    // デタッチ: 子を起動する（子がレポート生成し、--open 時は HTML を開く）。
+    int spawnCode = ReportProcess.SpawnReport(reportArgs, wait: false);
+    if (spawnCode != 0)
     {
-        Console.WriteLine($"LCOV:   {Path.Combine(outputDir, "lcov.info")}");
+        Console.Error.WriteLine("レポート生成プロセスの起動に失敗しました。");
+        try { File.Delete(dataFile); } catch { }   // 起動失敗時はハンドオフファイルの残骸を残さない
+        return spawnCode;
     }
-    if (writeJson)
-    {
-        Console.WriteLine($"JSON:   {Path.Combine(outputDir, "coverage.json")}");
-    }
-
-    // 正常終了を示す 0 を返す
+    Console.WriteLine("Report generation started in background.");
     return 0;
 }
 catch (Exception ex)
