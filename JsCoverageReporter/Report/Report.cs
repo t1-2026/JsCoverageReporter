@@ -1861,7 +1861,6 @@ internal class HtmlReportGenerator
         public int[][] MemberCovMaps;
         public int[][] MemberCountMaps;
         public int[] MergedMap;
-        public int[] MergedCountMap;
         public List<LineData> MergedLines;
         public IReadOnlyList<(string Name, int Line)> MergedUncalled;
         public SourceMap SrcMap;
@@ -1949,7 +1948,6 @@ internal class HtmlReportGenerator
         comp.MemberCovMaps   = memberCovMaps;
         comp.MemberCountMaps = memberCountMaps;
         comp.MergedMap       = mergedMap;
-        comp.MergedCountMap  = mergedCountMap;
         comp.MergedLines     = mergedLines;
         // グループ全体で一度も実行されなかった関数の一覧（詳細ページの先頭に表示する）
         comp.MergedUncalled  = CollectUncalledFunctions(group, canonicalSource);
@@ -2041,7 +2039,6 @@ internal class HtmlReportGenerator
             var memberCovMaps     = comp.MemberCovMaps;
             var memberCountMaps   = comp.MemberCountMaps;
             var mergedMap         = comp.MergedMap;
-            var mergedCountMap    = comp.MergedCountMap;
             var mergedLines       = comp.MergedLines;
             var mergedUncalled    = comp.MergedUncalled;
             SourceMap srcMap      = comp.SrcMap;
