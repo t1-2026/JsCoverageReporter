@@ -452,30 +452,24 @@ try
     // 取得したスクリプト数を表示する
     Console.WriteLine($"  {coverages.Count} script(s) captured.");
 
-    // ソースマップ（//# sourceMappingURL）の取得を試みる
-    // 取得できたスクリプトは元ファイル（TypeScript 等）別の行カバレッジもレポートに表示される
-    // 取得・解析の失敗は警告のみでレポート生成は続行する
-    var sourceMaps = await SourceMapLoader.LoadAllAsync(coverages);
-    if (sourceMaps.Count > 0)
+    // 収集データをハンドオフファイルに書き出して、レポート生成を別プロセスに委譲する。
+    Directory.CreateDirectory(outputDir);
+    var dataFile = Path.Combine(outputDir, ".coverage-handoff.json");
+    await File.WriteAllTextAsync(dataFile, CoverageHandoff.Serialize(scenario.Url, coverages));
+
+    var reportArgs = ReportProcess.BuildReportArgs(
+        dataFile, outputDir, writeLcov, writeJson, open, scenario.Url);
+
+    if (wait)
     {
-        Console.WriteLine($"  {sourceMaps.Count} source map(s) resolved.");
+        // 同期: 子の完了を待ち、終了コードを伝播する
+        int code = ReportProcess.SpawnReport(reportArgs, wait: true);
+        return code;
     }
 
-    // HTMLレポートを生成して出力ディレクトリに書き出す（--lcov / --json 指定時は機械可読形式も出力する）
-    // 対象 URL を渡してインデックスのメタ情報（いつ・何に対する計測か）に表示する
-    new HtmlReportGenerator().Generate(coverages, outputDir, sourceMaps, writeLcov, writeJson, scenario.Url);
-    // 生成したレポートのパスを表示する
-    Console.WriteLine($"Report: {Path.Combine(outputDir, "index.html")}");
-    if (writeLcov)
-    {
-        Console.WriteLine($"LCOV:   {Path.Combine(outputDir, "lcov.info")}");
-    }
-    if (writeJson)
-    {
-        Console.WriteLine($"JSON:   {Path.Combine(outputDir, "coverage.json")}");
-    }
-
-    // 正常終了を示す 0 を返す
+    // デタッチ: 子を起動したら即終了する（子がレポート生成し、--open 時は HTML を開く）
+    ReportProcess.SpawnReport(reportArgs, wait: false);
+    Console.WriteLine("Report generation started in background.");
     return 0;
 }
 catch (Exception ex)
