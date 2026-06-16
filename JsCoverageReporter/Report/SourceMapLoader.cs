@@ -27,8 +27,10 @@ internal static class SourceMapLoader
         var result = new Dictionary<string, SourceMap>();
         if (coverages == null) { return result; }
 
-        // 同一 URL のスクリプト（ナビゲーション・タブをまたいだ重複）は1回だけ試行する
+        // 同一 URL のスクリプト（ナビゲーション・タブをまたいだ重複）は1回だけ試行する。
+        // 挿入順を保つため対象をリストに集める。
         var attempted = new HashSet<string>();
+        var targets = new List<(string url, string mapRef)>();
         foreach (var script in coverages)
         {
             if (string.IsNullOrEmpty(script.Url)) { continue; }
@@ -38,27 +40,48 @@ internal static class SourceMapLoader
             string mapRef = SourceMapUrlExtractor.Extract(script.Source);
             if (string.IsNullOrEmpty(mapRef)) { continue; }
 
-            // マップ JSON を取得する（失敗は警告のみでレポート生成は続行する）
-            string json;
-            try
-            {
-                json = await LoadMapJsonAsync(script.Url, mapRef);
-            }
-            catch (Exception ex)
-            {
-                Console.Error.WriteLine($"[Warning] ソースマップの取得に失敗しました ({script.Url}): {ex.Message}");
-                continue;
-            }
-            if (string.IsNullOrEmpty(json)) { continue; }
+            targets.Add((script.Url, mapRef));
+        }
 
-            // JSON を解析する（sections 形式・壊れたマップは null が返る）
-            var sourceMap = SourceMap.Parse(json);
-            if (sourceMap == null)
+        // 取得・解析を並列実行する。結果は targets のインデックスで保持し順序を崩さない。
+        var maps = new SourceMap[targets.Count];
+        var tasks = new Task[targets.Count];
+        for (int t = 0; t < targets.Count; t++)
+        {
+            int idx = t;
+            tasks[idx] = Task.Run(async () =>
             {
-                Console.Error.WriteLine($"[Warning] ソースマップを解析できませんでした ({script.Url}) — sections 形式または不正な JSON の可能性があります。");
-                continue;
-            }
-            result[script.Url] = sourceMap;
+                var (url, mapRef) = targets[idx];
+
+                // マップ JSON を取得する（失敗は警告のみでレポート生成は続行する）
+                string json;
+                try
+                {
+                    json = await LoadMapJsonAsync(url, mapRef);
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[Warning] ソースマップの取得に失敗しました ({url}): {ex.Message}");
+                    return;
+                }
+                if (string.IsNullOrEmpty(json)) { return; }
+
+                // JSON を解析する（sections 形式・壊れたマップは null が返る）
+                var sourceMap = SourceMap.Parse(json);
+                if (sourceMap == null)
+                {
+                    Console.Error.WriteLine($"[Warning] ソースマップを解析できませんでした ({url}) — sections 形式または不正な JSON の可能性があります。");
+                    return;
+                }
+                maps[idx] = sourceMap;
+            });
+        }
+        await Task.WhenAll(tasks);
+
+        // 挿入順で辞書へ集約する（決定的）。
+        for (int t = 0; t < targets.Count; t++)
+        {
+            if (maps[t] != null) { result[targets[t].url] = maps[t]; }
         }
         return result;
     }
