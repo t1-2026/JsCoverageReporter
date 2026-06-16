@@ -41,7 +41,7 @@ internal static class ReportProcess
         };
         foreach (var a in args) { psi.ArgumentList.Add(a); }
 
-        var proc = Process.Start(psi);
+        using var proc = Process.Start(psi);
         if (proc == null) { return 2; }
         if (!wait) { return 0; }
         proc.WaitForExit();
@@ -53,7 +53,7 @@ internal static class ReportProcess
     {
         try
         {
-            Process.Start(new ProcessStartInfo
+            using var p = Process.Start(new ProcessStartInfo
             {
                 FileName = htmlPath,
                 UseShellExecute = true,
