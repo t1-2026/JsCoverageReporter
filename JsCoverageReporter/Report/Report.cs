@@ -1835,6 +1835,7 @@ internal class HtmlReportGenerator
     /// <param name="writeLcov">true なら lcov.info（LCOV 形式）も出力する</param>
     /// <param name="writeJson">true なら coverage.json（機械可読サマリー）も出力する</param>
     /// <param name="targetUrl">計測対象ページの URL（インデックスのメタ情報に表示する。null なら省略）</param>
+    // 従来シグネチャ（後方互換）。引数を ReportOptions に詰めて単一エントリへ委譲する。
     internal void Generate(
         IReadOnlyList<ScriptCoverage> coverages,
         string outputDir,
@@ -1843,6 +1844,21 @@ internal class HtmlReportGenerator
         bool writeJson = false,
         string targetUrl = null)
     {
+        Generate(coverages, sourceMaps,
+            new ReportOptions(outputDir, writeLcov, writeJson, targetUrl));
+    }
+
+    // 単一の公開エントリ。全挙動は options で制御する。
+    internal void Generate(
+        IReadOnlyList<ScriptCoverage> coverages,
+        IReadOnlyDictionary<string, SourceMap> sourceMaps,
+        ReportOptions options)
+    {
+        string outputDir = options.OutputDir;
+        bool   writeLcov = options.WriteLcov;
+        bool   writeJson = options.WriteJson;
+        string targetUrl = options.TargetUrl;
+
         // 出力ディレクトリを作成する（既に存在しても問題ない）
         Directory.CreateDirectory(outputDir);
         // スクリプト詳細ページを格納するサブディレクトリのパス
@@ -2521,25 +2537,29 @@ internal class HtmlReportGenerator
             // ページ URL セルの表示を決める
             // URL が1件: URL をそのまま表示する
             // URL が2件以上: <details>/<summary> で展開表示し、URL 別ページへのリンクを並べる
+            // 表示順は「最後に登場した URL を先頭」にするため pages を逆順にしたコピーを使う。
+            // （data-page ソートキーは従来どおり最初の URL を使うため、元の pages はそのまま残す）
+            var displayPages = new List<(string pageUrl, string tabFilename)>(pages);
+            displayPages.Reverse();
             string pageUrlCell;
-            if (pages.Count <= 1)
+            if (displayPages.Count <= 1)
             {
                 // 単一 URL: URL を直接表示する（XSS 対策のため HTML エスケープする）
-                if (pages.Count == 0 || string.IsNullOrEmpty(pages[0].pageUrl))
+                if (displayPages.Count == 0 || string.IsNullOrEmpty(displayPages[0].pageUrl))
                 {
                     pageUrlCell = "(不明)";
                 }
                 else
                 {
-                    pageUrlCell = HtmlEncode(pages[0].pageUrl);
+                    pageUrlCell = HtmlEncode(displayPages[0].pageUrl);
                 }
             }
             else
             {
                 // 複数 URL: <details>/<summary> で展開できるようにする
                 var sbDetails = new StringBuilder();
-                sbDetails.Append($"<details><summary>複数ページ ({pages.Count})</summary><ul>");
-                foreach (var (pageUrl, tabFilename) in pages)
+                sbDetails.Append($"<details><summary>複数ページ ({displayPages.Count})</summary><ul>");
+                foreach (var (pageUrl, tabFilename) in displayPages)
                 {
                     // リンクテキストは URL（取得できなかった場合は "(URL なし)"）
                     string displayText;
