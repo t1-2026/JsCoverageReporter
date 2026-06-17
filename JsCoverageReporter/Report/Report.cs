@@ -2,7 +2,10 @@
 
 // 【移植契約】このファイルはレポート生成の自己完結中核である。
 // 依存は入力 DTO（JsCoverageReporter.Coverage の ScriptCoverage / PageInfo /
-// FunctionCoverage / CoverageRange）と注入される SourceMap 辞書のみ。
+// FunctionCoverage / CoverageRange）のみ。
+// レポート関連の型（ReportOptions / SourceMap / SourceMapProjector / CoverageExporter /
+// HtmlTemplates / LineData 等）はすべて本ファイル内に集約しており、他ファイルへ依存しない。
+// SourceMap 辞書は呼び出し側が注入する（取得元の SourceMapLoader はホスト層であり本ファイル外）。
 // ネットワーク I/O・ブラウザ操作・Microsoft.Playwright への依存を持ち込まないこと。
 // 他プロジェクトへは「このファイル + 上記 DTO」をコピーすれば動作する。
 
@@ -1530,6 +1533,30 @@ internal enum LineCoverageStatus
 internal record LineData(string Html, LineCoverageStatus Status, int MaxCount = 0);
 
 /// <summary>
+/// レポート生成中核（HtmlReportGenerator.Generate）の全オプションを集約する。
+/// 外部呼び出し側はこのオブジェクトだけで生成挙動を制御する。
+/// ブラウザ起動（--open）は実行環境依存のためここには含めず、ホスト層が担当する。
+/// （Report.cs を自己完結させるため、このオプション型は本ファイル内に置く。）
+/// </summary>
+/// <param name="OutputDir">レポート出力先ディレクトリ</param>
+/// <param name="WriteLcov">lcov.info を出力するか</param>
+/// <param name="WriteJson">coverage.json を出力するか</param>
+/// <param name="TargetUrl">インデックスのメタ情報に表示する対象 URL（null なら非表示）</param>
+/// <param name="MaxDegreeOfParallelism">
+/// レポート生成のグループ計算を並列実行する際の最大並列度。
+/// 0 以下（既定）の場合は論理プロセッサ数を使う。
+/// この値は「同時に並列計算するグループ数」かつ「同時にメモリ上へ保持する計算結果数（チャンクサイズ）」を兼ねる。
+/// 小さくするとピークメモリを抑えられ、大きくすると CPU 利用率が上がる（メモリと引き換え）。
+/// </param>
+internal sealed record ReportOptions(
+    string OutputDir,
+    bool   WriteLcov = false,
+    bool   WriteJson = false,
+    string TargetUrl = null,
+    int    MaxDegreeOfParallelism = 0
+);
+
+/// <summary>
 /// HTMLカバレッジレポートを生成するクラス。
 /// index.html（サマリー）と scripts/script-N.html（詳細）を生成する。
 /// </summary>
@@ -2026,41 +2053,58 @@ internal class HtmlReportGenerator
         // LCOV / JSON エクスポート用のスクリプトデータ（--lcov / --json 指定時にファイル出力する）
         var exportScripts = new List<ExportScriptData>();
 
-        // フェーズ1: グループ計算を並列実行する（文字スキャン等の CPU 重処理）。
-        // 結果は元のグループ順を保つため添字付き配列に格納する。
-        // ComputeGroup は I/O も連番 i も触らない純計算（stderr 警告を除く）であり、
-        // comps[] 以外の共有可変状態への並列書き込みは無いため決定性を維持する。
-        var comps = new GroupComputation[scriptGroups.Count];
-        System.Threading.Tasks.Parallel.For(0, scriptGroups.Count, gi =>
-        {
-            // 1グループの計算が予期せぬ例外で失敗しても、他グループの結果まで失わないようにする。
-            // Parallel.For で例外を投げると AggregateException で全体が中断し、レポートが1ファイルも
-            // 出力されなくなる（従来の順次ループは失敗前のグループ分は書き込み済みだった）。
-            // ここで catch して当該グループだけスキップ扱いにし、Coverage.cs の警告パターンと揃える。
-            try
-            {
-                comps[gi] = ComputeGroup(scriptGroups[gi], sourceMaps);
-            }
-            catch (Exception ex)
-            {
-                // 失敗グループの URL を可能な範囲で特定する（空グループや URL 取得失敗にも備える）
-                string failedUrl = "(unknown)";
-                var failedGroup = scriptGroups[gi];
-                if (failedGroup.Count > 0 && failedGroup[0].Url != null) { failedUrl = failedGroup[0].Url; }
-                Console.Error.WriteLine($"[Warning] Skipping script group due to computation error: {failedUrl} — {ex.Message}");
-                comps[gi] = new GroupComputation { Skipped = true };
-            }
-        });
+        // フェーズ1（計算）とフェーズ2（集約）を「チャンク単位」で交互に実行する。
+        // - フェーズ1: グループ計算（文字スキャン等の CPU 重処理）を最大 degree 並列で、degree 個ずつ行う。
+        // - フェーズ2: 各チャンクを元の順序で順次集約し、連番 i 割当・HTML 組み立て・書き込みを行う。
+        // この構造により次の 2 点を両立する:
+        //   (1) 並列度を degree に制限する（CPU 過負荷・スレッド過剰生成を防ぐ）。
+        //   (2) 同時にメモリ上へ生存する GroupComputation を最大 degree 個に抑える。
+        //       全グループ分の memberCovMaps/memberCountMaps を保持し続けないため、ピークメモリが
+        //       「全カバレッジデータ分」から「degree グループ分」へ大幅に減る。
+        // ComputeGroup は I/O も連番 i も触らない純計算（stderr 警告を除く）で、各チャンクの
+        // Parallel.For は comps[] の異なる添字のみへ書き込む。集約は厳密に元の順序で行うため決定性は不変。
+        int degree = options.MaxDegreeOfParallelism;
+        if (degree <= 0) { degree = Environment.ProcessorCount; }   // 0 以下（未指定）は論理プロセッサ数
+        var parallelOptions = new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = degree };
 
-        // フェーズ2: 集約（順次・元の順序）。連番 i 割当・HTML 組み立て・書き込み・蓄積を行う。
+        // comps はスロット配列。各チャンクの計算で該当区間だけを埋め、集約後に null 化して即解放する。
+        // 非 null になるのは「計算済みかつ未集約」の最大 degree 個だけで、重い実体はこの範囲のみ生存する。
+        var comps = new GroupComputation[scriptGroups.Count];
+        int nextChunkStart = 0;
+
         int i = 0;
         for (int idx = 0; idx < comps.Length; idx++)
         {
+            // 集約が次チャンク先頭に達したら、その区間 [start, chunkEnd) を並列計算する（必要な分だけ先読み）。
+            if (idx >= nextChunkStart)
+            {
+                int start    = nextChunkStart;
+                int chunkEnd  = Math.Min(start + degree, scriptGroups.Count);
+                System.Threading.Tasks.Parallel.For(start, chunkEnd, parallelOptions, gi =>
+                {
+                    // 1グループの計算が例外で失敗しても他グループを巻き添えにしない。
+                    // Parallel.For で例外を投げると AggregateException で全体が中断し、レポートが1ファイルも
+                    // 出力されなくなるため、ここで catch して当該グループだけスキップ扱いにする
+                    // （Coverage.cs の警告パターンと揃える）。
+                    try
+                    {
+                        comps[gi] = ComputeGroup(scriptGroups[gi], sourceMaps);
+                    }
+                    catch (Exception ex)
+                    {
+                        // 失敗グループの URL を可能な範囲で特定する（空グループや URL 取得失敗にも備える）
+                        string failedUrl = "(unknown)";
+                        var failedGroup = scriptGroups[gi];
+                        if (failedGroup.Count > 0 && failedGroup[0].Url != null) { failedUrl = failedGroup[0].Url; }
+                        Console.Error.WriteLine($"[Warning] Skipping script group due to computation error: {failedUrl} — {ex.Message}");
+                        comps[gi] = new GroupComputation { Skipped = true };
+                    }
+                });
+                nextChunkStart = chunkEnd;
+            }
+
             var comp = comps[idx];
-            // 処理済みグループを配列から外して GC 可能にする（集約は常に1グループずつしか使わない）。
-            // フェーズ1が全グループの memberCovMaps/memberCountMaps 等を comps[] に保持したままだと
-            // ピークメモリが全カバレッジデータ分まで膨らむため、参照を切ってメモリ滞留を防ぐ。
-            // comp ローカルは次反復で再代入されるまでのみ生存し、従来の順次ループと同じ滞留量に戻る。
+            // 集約済みグループは配列から外して即 GC 可能にする（同時生存を最大 degree 個に抑える）。
             comps[idx] = null;
 
             // スキップ対象（空グループ or 1行スクリプト）は連番 i を消費せず次へ。
