@@ -37,4 +37,27 @@ public class ReportProcessTests
 
         Assert.Equal(new[] { "--report-from", "d.json", "--output", "out" }, args);
     }
+
+    [Theory]
+    // progressWindow が false なら、wait/OS によらずウィンドウなし・警告なし
+    [InlineData(false, false, true,  false, false)]
+    [InlineData(false, true,  true,  false, false)]
+    [InlineData(false, false, false, false, false)]
+    // Windows + デタッチ(wait=false) + progressWindow → ウィンドウを開く
+    [InlineData(true,  false, true,  true,  false)]
+    // Windows + wait 併用 → ウィンドウは開かず警告
+    [InlineData(true,  true,  true,  false, true)]
+    // 非 Windows → progressWindow は黙って無視（警告も出さない）
+    [InlineData(true,  false, false, false, false)]
+    [InlineData(true,  true,  false, false, false)]
+    public void ResolveProgressWindow_DecidesWindowAndWarning(
+        bool progressWindow, bool wait, bool isWindows,
+        bool expectUseNewWindow, bool expectWarnWaitConflict)
+    {
+        var (useNewWindow, warnWaitConflict) =
+            ReportProcess.ResolveProgressWindow(progressWindow, wait, isWindows);
+
+        Assert.Equal(expectUseNewWindow, useNewWindow);
+        Assert.Equal(expectWarnWaitConflict, warnWaitConflict);
+    }
 }
