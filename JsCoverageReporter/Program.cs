@@ -311,9 +311,11 @@ if (reportFrom != null)
         var (handoffUrl, coverages) = CoverageHandoff.Deserialize(json);
 
         // ソースマップは子側で取得する（並列）
+        Console.WriteLine($"Loading source maps... ({coverages.Count} script(s))");
         var sourceMaps = await SourceMapLoader.LoadAllAsync(coverages);
 
         string effectiveTarget = targetUrlOverride ?? handoffUrl;
+        Console.WriteLine("Generating report...");
         new HtmlReportGenerator().Generate(
             coverages, sourceMaps,
             new ReportOptions(outputDir, writeLcov, writeJson, effectiveTarget));
