@@ -31,6 +31,21 @@ internal static class ReportProcess
         return args.ToArray();
     }
 
+    /// <summary>
+    /// --progress-window の指定・--wait 併用・OS から、レポート生成子プロセスを
+    /// 新しいコンソールウィンドウで起動するか、および --wait 併用の警告を出すかを決める純関数。
+    /// 新ウィンドウ表示は Windows でのみ有効。--wait 併用時はウィンドウを出さず警告する。
+    /// 非 Windows では progressWindow を黙って無視する（警告なし）。
+    /// </summary>
+    public static (bool UseNewWindow, bool WarnWaitConflict) ResolveProgressWindow(
+        bool progressWindow, bool wait, bool isWindows)
+    {
+        if (!progressWindow) { return (false, false); }
+        if (!isWindows) { return (false, false); }  // 非 Windows は無視（警告なし）
+        if (wait) { return (false, true); }          // wait 併用は不可 → 警告して無視
+        return (true, false);                        // Windows + デタッチ → 新ウィンドウ
+    }
+
     /// <summary>子プロセスを起動する。wait が true なら完了を待ち終了コードを返す。</summary>
     public static int SpawnReport(string[] args, bool wait)
     {
