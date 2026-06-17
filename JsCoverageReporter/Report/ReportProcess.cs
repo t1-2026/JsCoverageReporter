@@ -46,21 +46,36 @@ internal static class ReportProcess
         return (true, false);                        // Windows + デタッチ → 新ウィンドウ
     }
 
-    /// <summary>子プロセスを起動する。wait が true なら完了を待ち終了コードを返す。</summary>
-    public static int SpawnReport(string[] args, bool wait)
+    /// <summary>
+    /// 子プロセスを起動する。wait が true なら完了を待ち終了コードを返す。
+    /// newWindow が true のときは新しいコンソールウィンドウで起動する（Windows）。
+    /// 起動できなかった場合は 2 を返す。
+    /// </summary>
+    public static int SpawnReport(string[] args, bool wait, bool newWindow = false)
     {
         var psi = new ProcessStartInfo
         {
             FileName = Environment.ProcessPath,
-            UseShellExecute = false,
+            // newWindow 時は UseShellExecute=true で新コンソールウィンドウを得る。
+            // ウィンドウを閉じると OS が既定でプロセスを終了する（中止）。
+            UseShellExecute = newWindow,
         };
         foreach (var a in args) { psi.ArgumentList.Add(a); }
 
-        using var proc = Process.Start(psi);
-        if (proc == null) { return 2; }
-        if (!wait) { return 0; }
-        proc.WaitForExit();
-        return proc.ExitCode;
+        try
+        {
+            using var proc = Process.Start(psi);
+            if (proc == null) { return 2; }
+            if (!wait) { return 0; }
+            proc.WaitForExit();
+            return proc.ExitCode;
+        }
+        catch (Exception ex)
+        {
+            // UseShellExecute=true では起動失敗時に例外が飛び得る。従来の null 同様 2 を返す。
+            Console.Error.WriteLine($"[Warning] レポート生成プロセスを起動できませんでした: {ex.Message}");
+            return 2;
+        }
     }
 
     /// <summary>既定ブラウザ（OS 関連付け）で HTML を開く。失敗しても致命的にはしない。</summary>
