@@ -31,7 +31,11 @@ public class ReportOptionsTests
     private static string NormalizeTimestamps(string s)
     {
         s = Regex.Replace(s, @"生成日時: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", "生成日時: <TS>");
-        s = Regex.Replace(s, @"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}", "<TS>");
+        // coverage.json の generatedAt は ISO 形式（yyyy-MM-ddTHH:mm:sszzz）。
+        // System.Text.Json はタイムゾーンの '+' をエスケープして "\\u002B" の6文字で出力するため、
+        // リテラルの [+-] とエスケープ表現 \\u002B の両方を許容しないと正規化されず、
+        // 2回の生成が秒境界をまたいだときにバイト比較が稀に失敗する。
+        s = Regex.Replace(s, @"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[+-]|\\u002[Bb])\d{2}:\d{2}", "<TS>");
         return s;
     }
 
