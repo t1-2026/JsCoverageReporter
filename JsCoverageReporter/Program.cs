@@ -29,6 +29,7 @@ if (Array.IndexOf(args, "--help") >= 0 || Array.IndexOf(args, "-h") >= 0)
           --json              coverage.json（機械可読サマリー）も出力する
           --open              レポート完成後に既定ブラウザで index.html を開く
           --wait              レポート生成（別プロセス）の完了を待つ
+          --progress-window   レポート生成を別ウィンドウで表示する（Windows のみ）
           --verbose           エラー発生時に詳細なスタックトレースを表示する
           --help, -h          このヘルプを表示する
 
@@ -105,6 +106,12 @@ bool wait = false;
 
 // --wait が既に指定済みかどうかを示すフラグ（重複指定の検知に使う）
 bool waitSet = false;
+
+// --progress-window が指定された場合は true（レポート生成を別ウィンドウで表示する）
+bool progressWindow = false;
+
+// --progress-window が既に指定済みかどうかを示すフラグ（重複指定の検知に使う）
+bool progressWindowSet = false;
 
 // --report-from で指定されたハンドオフデータファイルのパス（内部用・隠しモード）。未指定なら null
 string? reportFrom = null;
@@ -254,6 +261,13 @@ for (int i = 0; i < args.Length; i++)
         }
         wait    = true;
         waitSet = true;
+    }
+
+    // --progress-window（値なし・レポート生成を別ウィンドウで表示する。Windows のみ）
+    else if (args[i] == "--progress-window")
+    {
+        if (progressWindowSet) { Console.Error.WriteLine("[Warning] --progress-window が複数回指定されました。"); }
+        progressWindow = true; progressWindowSet = true;
     }
 
     // --report-from オプションを検出する（内部用・データファイルからレポートのみ生成する隠しモード）
@@ -461,15 +475,23 @@ try
     var reportArgs = ReportProcess.BuildReportArgs(
         dataFile, outputDir, writeLcov, writeJson, open, scenario.Url);
 
+    // 進捗ウィンドウの可否を判定する（Windows + デタッチ時のみ新ウィンドウ。--wait 併用は警告して無視）。
+    var (useNewWindow, warnWaitConflict) =
+        ReportProcess.ResolveProgressWindow(progressWindow, wait, OperatingSystem.IsWindows());
+    if (warnWaitConflict)
+    {
+        Console.Error.WriteLine("[Warning] --progress-window は --wait と併用できないため無視されます。");
+    }
+
     if (wait)
     {
-        // 同期: 子の完了を待ち、終了コードを伝播する
-        int code = ReportProcess.SpawnReport(reportArgs, wait: true);
+        // 同期: 子の完了を待ち、終了コードを伝播する（wait 時は新ウィンドウを出さない）
+        int code = ReportProcess.SpawnReport(reportArgs, wait: true, newWindow: useNewWindow);
         return code;
     }
 
-    // デタッチ: 子を起動する（子がレポート生成し、--open 時は HTML を開く）。
-    int spawnCode = ReportProcess.SpawnReport(reportArgs, wait: false);
+    // デタッチ: 子を起動する（useNewWindow 時は別コンソールウィンドウで進捗表示）。
+    int spawnCode = ReportProcess.SpawnReport(reportArgs, wait: false, newWindow: useNewWindow);
     if (spawnCode != 0)
     {
         Console.Error.WriteLine("レポート生成プロセスの起動に失敗しました。");
