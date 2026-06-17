@@ -2033,13 +2033,36 @@ internal class HtmlReportGenerator
         var comps = new GroupComputation[scriptGroups.Count];
         System.Threading.Tasks.Parallel.For(0, scriptGroups.Count, gi =>
         {
-            comps[gi] = ComputeGroup(scriptGroups[gi], sourceMaps);
+            // 1グループの計算が予期せぬ例外で失敗しても、他グループの結果まで失わないようにする。
+            // Parallel.For で例外を投げると AggregateException で全体が中断し、レポートが1ファイルも
+            // 出力されなくなる（従来の順次ループは失敗前のグループ分は書き込み済みだった）。
+            // ここで catch して当該グループだけスキップ扱いにし、Coverage.cs の警告パターンと揃える。
+            try
+            {
+                comps[gi] = ComputeGroup(scriptGroups[gi], sourceMaps);
+            }
+            catch (Exception ex)
+            {
+                // 失敗グループの URL を可能な範囲で特定する（空グループや URL 取得失敗にも備える）
+                string failedUrl = "(unknown)";
+                var failedGroup = scriptGroups[gi];
+                if (failedGroup.Count > 0 && failedGroup[0].Url != null) { failedUrl = failedGroup[0].Url; }
+                Console.Error.WriteLine($"[Warning] Skipping script group due to computation error: {failedUrl} — {ex.Message}");
+                comps[gi] = new GroupComputation { Skipped = true };
+            }
         });
 
         // フェーズ2: 集約（順次・元の順序）。連番 i 割当・HTML 組み立て・書き込み・蓄積を行う。
         int i = 0;
-        foreach (var comp in comps)
+        for (int idx = 0; idx < comps.Length; idx++)
         {
+            var comp = comps[idx];
+            // 処理済みグループを配列から外して GC 可能にする（集約は常に1グループずつしか使わない）。
+            // フェーズ1が全グループの memberCovMaps/memberCountMaps 等を comps[] に保持したままだと
+            // ピークメモリが全カバレッジデータ分まで膨らむため、参照を切ってメモリ滞留を防ぐ。
+            // comp ローカルは次反復で再代入されるまでのみ生存し、従来の順次ループと同じ滞留量に戻る。
+            comps[idx] = null;
+
             // スキップ対象（空グループ or 1行スクリプト）は連番 i を消費せず次へ。
             // 1行スクリプトの警告出力は ComputeGroup 内（フェーズ1）で行う（従来挙動と同一）。
             if (comp.Skipped)
