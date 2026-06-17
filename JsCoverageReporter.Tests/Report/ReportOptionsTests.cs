@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using JsCoverageReporter.Coverage;
 using JsCoverageReporter.Report;
 
@@ -22,6 +23,18 @@ public class ReportOptionsTests
         };
     }
 
+    /// <summary>
+    /// 生成日時のタイムスタンプ値のみを固定トークンへ置換する（他のバイトは保持）。
+    /// index.html の「生成日時: yyyy-MM-dd HH:mm:ss」と coverage.json の ISO 形式
+    /// 「yyyy-MM-ddTHH:mm:sszzz」を対象にする。
+    /// </summary>
+    private static string NormalizeTimestamps(string s)
+    {
+        s = Regex.Replace(s, @"生成日時: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", "生成日時: <TS>");
+        s = Regex.Replace(s, @"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}", "<TS>");
+        return s;
+    }
+
     [Fact]
     public void Generate_OptionsOverload_MatchesParameterOverload()
     {
@@ -41,7 +54,9 @@ public class ReportOptionsTests
             {
                 var a = File.ReadAllText(Path.Combine(dirA, rel.Replace('/', Path.DirectorySeparatorChar)));
                 var b = File.ReadAllText(Path.Combine(dirB, rel.Replace('/', Path.DirectorySeparatorChar)));
-                Assert.Equal(a, b);
+                // index.html / coverage.json は生成日時（DateTimeOffset.Now）を含み、2回の生成が
+                // 秒境界をまたぐと差が出る。タイムスタンプ値のみ正規化し、それ以外はバイト一致を検証する。
+                Assert.Equal(NormalizeTimestamps(a), NormalizeTimestamps(b));
             }
         }
         finally
