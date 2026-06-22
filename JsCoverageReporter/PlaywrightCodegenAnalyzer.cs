@@ -30,7 +30,7 @@
 //    Target           要素を特定するロケータのメソッド名（"GetByRole" 等）。無ければ null
 //    Device           "Mouse"/"Keyboard"/"Touchscreen"。要素操作なら null
 //    Action           アクションのメソッド名（"ClickAsync" 等）。必須
-//    Arguments        アクション引数（生の式文字列の配列）。無ければ null
+//    Arguments        アクション引数を 1 つにまとめた文字列（カンマ区切り）。無ければ null
 //    IsAssertion      Expect(...) アサーションなら true（Action は "ToBeVisibleAsync" 等）
 //    Negated          否定アサーション(.Not.)なら true
 //    ActionName       日本語の操作名（"クリック" / "検証:表示確認" / "ドラッグFrom" 等）。必須
@@ -39,7 +39,7 @@
 //    NewPageVariable  開く先の Page 変数名（"page1" 等）。無ければ null
 //    FilePath         アップロード元 / ダウンロード保存先パス。無ければ null
 //    LineNumber       元の行番号（1 始まり） / RawLine  元のソース 1 行
-//    Step             { Method, Args } … Frames/Locators の各要素（ToFlat の元データ）
+//    Step             { Method, Param } … Frames/Locators の各要素。Param は全引数を 1 つにまとめた文字列
 //
 //  ── 戻り値の処理例 1: フィールドを直接参照 ──
 //    foreach (var a in actions)
@@ -47,15 +47,16 @@
 //        Console.WriteLine($"L{a.LineNumber} [{a.ActionName}] {a.Comment}");
 //        if (a.Frames != null)   Console.WriteLine($"  フレーム: {a.FrameDescription}");
 //        if (a.Target != null)   Console.WriteLine($"  対象: {a.Target}");
-//        if (a.Arguments != null)Console.WriteLine($"  引数: {string.Join(", ", a.Arguments)}");
+//        if (a.Arguments != null)Console.WriteLine($"  引数: {a.Arguments}");
 //        if (a.OpensNewPage)     Console.WriteLine($"  → 新画面 {a.NewPageVariable} を開く");
 //        if (a.FilePath != null) Console.WriteLine($"  パス: {a.FilePath}");
 //    }
 //
-//  ── 戻り値の処理例 2: ToFlat() で Locator1 / Locator1Param1 … に展開（CSV・表向き）──
+//  ── 戻り値の処理例 2: ToFlat() で Locator1 / Locator1Param … に展開（CSV・表向き）──
 //    foreach (var a in actions)
 //        foreach (var (key, value) in a.ToFlat())
-//            Console.WriteLine($"{key}={value ?? "null"}");   // 例: Locator1=GetByRole / Action=ClickAsync
+//            Console.WriteLine($"{key}={value ?? "null"}");
+//    // 例: Locator1=GetByRole / Locator1Param=AriaRole.Button, new() { Name = "Sign in" } / Action=ClickAsync
 //
 //  ── 戻り値の処理例 3: 種別で振り分け／集計 ──
 //    var clicks     = actions.Where(a => a.Action == "ClickAsync").ToList();
@@ -67,6 +68,43 @@
 //  ── 戻り値の処理例 4: JSON 化（PlaywrightAction は record なのでそのままシリアライズ可）──
 //    string json = System.Text.Json.JsonSerializer.Serialize(
 //        actions, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+//
+//  ── Frame / Locator のメソッド名とパラメータ値（Step.Method / Step.Param）──
+//    Frames / Locators は Step{ Method, Param } のリスト。Param は括弧内の全引数を 1 つにまとめた生文字列。
+//
+//    [Frame の例]  page.FrameLocator("#pay").Get... / page.Locator("#f").ContentFrame.Get...
+//      Method            Param（設定値の例）
+//      FrameLocator      "#pay"                         ← iframe の CSS セレクタ
+//      Locator           "#f"                           ← ContentFrame 形式の iframe セレクタ
+//      （ネスト時は Frames に複数要素。例: [FrameLocator("#outer"), FrameLocator("#inner")]）
+//
+//    [Locator の例]
+//      Method            Param（設定値の例）
+//      GetByRole         AriaRole.Button, new() { Name = "Sign in" }   ← ロール + オプション
+//      GetByLabel        "Username"
+//      GetByPlaceholder  "Search"
+//      GetByText         "More", new() { Exact = true }
+//      GetByTestId       "submit"
+//      Locator           "#cell"                                       ← 任意 CSS / XPath
+//      Filter            new() { HasText = "Active" }
+//      Nth               1
+//      First / Last      ""（パラメータなし）
+//      And / Or          page.GetByTitle("Save")                       ← 合成相手のロケータ式
+//
+//  ── Frame / Locator の取り出し方 ──
+//    foreach (var a in actions)
+//    {
+//        // フレーム（トップフレームなら Frames は null）
+//        if (a.Frames != null)
+//            foreach (var f in a.Frames)
+//                Console.WriteLine($"frame: {f.Method} ({f.Param})");
+//
+//        // ロケータ（Page 直接操作なら Locators は null）
+//        if (a.Locators != null)
+//            foreach (var loc in a.Locators)
+//                Console.WriteLine($"locator: {loc.Method} ({loc.Param})");
+//        // 例: locator: GetByRole (AriaRole.Button, new() { Name = "Sign in" })
+//    }
 //
 //  注意: 「1 アクション = 1 行」という codegen の標準出力を前提とする
 //        （唯一の複数行出力 ToMatchAriaSnapshotAsync の YAML も吸収済み）。
@@ -81,23 +119,24 @@ using System.Text;
 namespace PlaywrightCodegen
 {
     /// <summary>
-    /// メソッドチェーンの 1 ステップ。
+    /// メソッドチェーンの 1 ステップ。Param は全引数を 1 つにまとめた文字列（カンマ区切りの生の式）。
     /// 例: GetByRole(AriaRole.Button, new(){ Name = "Submit" })
-    ///   → Method="GetByRole", Args=["AriaRole.Button", "new(){ Name = \"Submit\" }"]
+    ///   → Method="GetByRole", Param="AriaRole.Button, new(){ Name = \"Submit\" }"
+    ///   引数なし（First / Click() 等）は Param="" 。
     /// </summary>
-    public sealed record Step(string Method, IReadOnlyList<string> Args)
+    public sealed record Step(string Method, string Param)
     {
-        // デバッグ表示用: 引数が無ければメソッド名のみ、あれば "Method(arg, ...)"。
+        // デバッグ表示用: パラメータが無ければメソッド名のみ、あれば "Method(param)"。
         public override string ToString()
         {
-            // 引数なしのプロパティ的ステップ（First/Last など）はメソッド名だけ返す。
-            if (Args.Count == 0)
+            // パラメータなしのステップ（First/Last など）はメソッド名だけ返す。
+            if (Param.Length == 0)
             {
                 return Method;
             }
 
-            // 引数ありは "Method(a, b)" 形式に整形する。
-            return $"{Method}({string.Join(", ", Args)})";
+            // パラメータありは "Method(param)" 形式に整形する。
+            return $"{Method}({Param})";
         }
     }
 
@@ -118,8 +157,8 @@ namespace PlaywrightCodegen
         /// <summary>アクションのメソッド名（"ClickAsync", "FillAsync", "GotoAsync" など）。</summary>
         public required string Action { get; init; }
 
-        /// <summary>アクションの引数（トップレベルでカンマ分割した生の式文字列）。引数なしなら null。</summary>
-        public IReadOnlyList<string>? Arguments { get; init; }
+        /// <summary>アクションの引数を 1 つにまとめた文字列（カンマ区切りの生の式）。引数なしなら null。</summary>
+        public string? Arguments { get; init; }
 
         /// <summary>要素を特定するロケータのメソッド名（"GetByRole", "Locator" など）。Page 直接操作なら null。</summary>
         public string? Target { get; init; }
@@ -220,13 +259,10 @@ namespace PlaywrightCodegen
             // アクションのメソッド名。
             cols.Add(new KeyValuePair<string, string?>("Action", Action));
 
-            // アクションの引数を ActionParam1, ActionParam2, ... に展開。
+            // アクションの引数は 1 つにまとめて ActionParam に出す。
             if (Arguments != null)
             {
-                for (int p = 0; p < Arguments.Count; p++)
-                {
-                    cols.Add(new KeyValuePair<string, string?>($"ActionParam{p + 1}", Arguments[p]));
-                }
+                cols.Add(new KeyValuePair<string, string?>("ActionParam", Arguments));
             }
 
             // 新画面を開く操作なら OpensNewPage 列を出す。
@@ -254,7 +290,7 @@ namespace PlaywrightCodegen
             return cols;
         }
 
-        // ステップ列を "PrefixN" / "PrefixNParamM" の形で cols に追加する。
+        // ステップ列を "PrefixN" / "PrefixNParam"（パラメータは 1 つにまとめる）の形で cols に追加する。
         private static void AppendSteps(List<KeyValuePair<string, string?>> cols, string prefix, IReadOnlyList<Step>? steps)
         {
             // ステップが無ければ何も追加しない。
@@ -271,10 +307,10 @@ namespace PlaywrightCodegen
                 // "Locator1" = メソッド名。
                 cols.Add(new KeyValuePair<string, string?>($"{prefix}{i + 1}", s.Method));
 
-                // "Locator1Param1" = 各引数。
-                for (int p = 0; p < s.Args.Count; p++)
+                // "Locator1Param" = 全パラメータを 1 つにまとめた文字列（あれば）。
+                if (s.Param.Length > 0)
                 {
-                    cols.Add(new KeyValuePair<string, string?>($"{prefix}{i + 1}Param{p + 1}", s.Args[p]));
+                    cols.Add(new KeyValuePair<string, string?>($"{prefix}{i + 1}Param", s.Param));
                 }
             }
         }
@@ -286,7 +322,7 @@ namespace PlaywrightCodegen
             string args = "";
             if (Arguments != null)
             {
-                args = $" args=[{string.Join(", ", Arguments)}]";
+                args = $" args=[{Arguments}]";
             }
 
             // アサーションの種別プレフィックス。
@@ -733,9 +769,10 @@ namespace PlaywrightCodegen
 
                 // プロンプト入力値があれば引数として渡す。
                 IReadOnlyList<string>? dialogArgs = null;
-                if (step.Args.Count > 0)
+                var promptArgs = SplitArgs(step.Param);
+                if (promptArgs.Count > 0)
                 {
-                    dialogArgs = step.Args;
+                    dialogArgs = promptArgs;
                 }
 
                 // ダイアログ行のアクションを組み立てて積む。
@@ -931,11 +968,18 @@ namespace PlaywrightCodegen
                 comment = "確認ダイアログを却下";
             }
 
+            // プロンプト入力値があれば 1 つの文字列にまとめて保持する。
+            string? argumentsJoined = null;
+            if (args != null && args.Count > 0)
+            {
+                argumentsJoined = string.Join(", ", args);
+            }
+
             return new PlaywrightAction
             {
                 PageVariable = pageVar,
                 Action = method,
-                Arguments = args,
+                Arguments = argumentsJoined,
                 Target = "Dialog",
                 ActionName = actionName,
                 Comment = comment,
@@ -1063,17 +1107,18 @@ namespace PlaywrightCodegen
 
                 // 末尾メソッドが目的のもので引数があれば、それをパスとして返す。
                 var m = steps[^1];
-                if (m.Method != method || m.Args.Count == 0)
+                var margs = SplitArgs(m.Param);
+                if (m.Method != method || margs.Count == 0)
                 {
                     continue;
                 }
 
                 // 単一引数はアンエスケープ、複数なら各要素をアンエスケープして連結する。
-                if (m.Args.Count == 1)
+                if (margs.Count == 1)
                 {
-                    return UnescapePathValue(m.Args[0]);
+                    return UnescapePathValue(margs[0]);
                 }
-                return string.Join(", ", m.Args.Select(UnescapePathValue));
+                return string.Join(", ", margs.Select(UnescapePathValue));
             }
 
             return null;
@@ -1400,9 +1445,10 @@ namespace PlaywrightCodegen
             // ToMatchAriaSnapshotAsync は複数行の verbatim 文字列（YAML）で、行ベース解析では
             // 1 行目しか取れず途中の "@\"" が混入するため、引数は保持しない（コメントも {arg} 不使用）。
             IReadOnlyList<string>? assertArgs = null;
-            if (assertStep.Args.Count > 0 && method != "ToMatchAriaSnapshotAsync")
+            var assertParamList = SplitArgs(assertStep.Param);
+            if (assertParamList.Count > 0 && method != "ToMatchAriaSnapshotAsync")
             {
-                assertArgs = assertStep.Args;
+                assertArgs = assertParamList;
             }
 
             return MakeAction(root, steps, method, assertArgs, lineNo, raw, isAssertion: true, negated: negated);
@@ -1503,17 +1549,20 @@ namespace PlaywrightCodegen
             // アクションを除いたロケータ/フレーム/デバイス列。
             var chain = steps.Take(steps.Count - 1);
 
+            // アクションの引数（Param を個々の引数に分割したもの）。
+            var lastArgs = SplitArgs(last.Param);
+
             // DragToAsync(ILocator) は「ドラッグ元」「ドラッグ先」の 2 行に分割する。
-            if (last.Method == "DragToAsync" && last.Args.Count >= 1)
+            if (last.Method == "DragToAsync" && lastArgs.Count >= 1)
             {
                 // 第 1 引数をロケータ式として解析してみる。
-                var destSteps = SplitChain(last.Args[0], out var destRoot);
+                var destSteps = SplitChain(lastArgs[0], out var destRoot);
 
                 // 第 1 引数がロケータ式のときだけ分割する。
                 if (destSteps.Count > 0)
                 {
                     // 残りの引数（オプション）は元側に残す。
-                    var options = last.Args.Skip(1).ToList();
+                    var options = lastArgs.Skip(1).ToList();
                     IReadOnlyList<string>? srcArgs = null;
                     if (options.Count > 0)
                     {
@@ -1545,9 +1594,9 @@ namespace PlaywrightCodegen
 
             // 通常は 1 件。引数があれば渡す。
             IReadOnlyList<string>? actionArgs = null;
-            if (last.Args.Count > 0)
+            if (lastArgs.Count > 0)
             {
-                actionArgs = last.Args;
+                actionArgs = lastArgs;
             }
 
             var action = MakeAction(root, chain, last.Method, actionArgs, lineNo, raw);
@@ -1592,7 +1641,7 @@ namespace PlaywrightCodegen
                     frames.Add(s);
                 }
                 // 引数なしの Mouse/Keyboard/Touchscreen はデバイスへ。
-                else if (DeviceNames.Contains(s.Method) && s.Args.Count == 0)
+                else if (DeviceNames.Contains(s.Method) && s.Param.Length == 0)
                 {
                     device = s.Method;
                 }
@@ -1612,6 +1661,8 @@ namespace PlaywrightCodegen
             else
             {
                 actionName = JapaneseActionName(actionMethod, isAssertion, negated);
+                // Click/DblClick は Button オプションで右クリック/中クリックに補正する。
+                actionName = AdjustClickName(actionMethod, actionName, actionArgs);
             }
 
             // 説明コメントを組み立てる。
@@ -1645,13 +1696,20 @@ namespace PlaywrightCodegen
                 locatorsField = locators;
             }
 
+            // アクション引数は 1 つの文字列にまとめて保持する（引数なしは null）。
+            string? argumentsJoined = null;
+            if (actionArgs != null && actionArgs.Count > 0)
+            {
+                argumentsJoined = string.Join(", ", actionArgs);
+            }
+
             return new PlaywrightAction
             {
                 PageVariable = pageVar,
                 Frames = framesField,
                 Locators = locatorsField,
                 Action = actionMethod,
-                Arguments = actionArgs,
+                Arguments = argumentsJoined,
                 Target = SelectTarget(locators),
                 Device = device,
                 IsAssertion = isAssertion,
@@ -1703,6 +1761,54 @@ namespace PlaywrightCodegen
             return method;
         }
 
+        // Click/DblClick の Button オプション（MouseButton.Right/Middle）から操作名を補正する。
+        private static string AdjustClickName(string method, string baseName, IReadOnlyList<string>? args)
+        {
+            // Click / DblClick かつ引数があるときだけ対象。
+            if (method != "ClickAsync" && method != "DblClickAsync")
+            {
+                return baseName;
+            }
+            if (args == null)
+            {
+                return baseName;
+            }
+
+            // 引数（オプション）に MouseButton.Right / Middle が含まれるか調べる。
+            bool right = false;
+            bool middle = false;
+            foreach (var a in args)
+            {
+                if (a.Contains("MouseButton.Right"))
+                {
+                    right = true;
+                }
+                else if (a.Contains("MouseButton.Middle"))
+                {
+                    middle = true;
+                }
+            }
+
+            bool dbl = method == "DblClickAsync";
+            if (right)
+            {
+                if (dbl)
+                {
+                    return "右ダブルクリック";
+                }
+                return "右クリック";
+            }
+            if (middle)
+            {
+                if (dbl)
+                {
+                    return "中ダブルクリック";
+                }
+                return "中クリック";
+            }
+            return baseName;
+        }
+
         /// <summary>「どの要素に何をしているか」の日本語コメントを組み立てる。</summary>
         private static string BuildComment(List<Step> frames, List<Step> locators, string? device,
             string actionMethod, string actionName, IReadOnlyList<string>? args, bool isAssertion, bool negated)
@@ -1715,9 +1821,10 @@ namespace PlaywrightCodegen
                 var sels = new List<string>();
                 foreach (var f in frames)
                 {
-                    if (f.Args.Count > 0)
+                    var fargs = SplitArgs(f.Param);
+                    if (fargs.Count > 0)
                     {
-                        sels.Add(Unquote(f.Args[0]));
+                        sels.Add(Unquote(fargs[0]));
                     }
                     else
                     {
@@ -1736,11 +1843,13 @@ namespace PlaywrightCodegen
                 return framePart + BuildAssertPredicate(subject, actionMethod, args, negated);
             }
 
-            // 引数部分（あれば "（...）"）。
+            // 引数部分（あれば "（...）"）。末尾のオプションオブジェクト（new(){ Button=... } 等）は
+            // 文に含めない（右クリック等は ActionName に反映済み、Timeout 等の設定値も冗長なため）。
             string argPart = "";
-            if (args != null)
+            var valueArgs = StripTrailingOptions(args);
+            if (valueArgs.Count > 0)
             {
-                argPart = $"（{string.Join(", ", args)}）";
+                argPart = $"（{string.Join(", ", valueArgs)}）";
             }
 
             // ページ直接操作（要素もデバイスも無い）は主語「ページ」を省いて操作名だけにする。
@@ -1906,9 +2015,10 @@ namespace PlaywrightCodegen
         {
             // 第 1 引数（引用符を外したもの）。
             string first = "";
-            if (s.Args.Count > 0)
+            var sargs = SplitArgs(s.Param);
+            if (sargs.Count > 0)
             {
-                first = Unquote(s.Args[0]);
+                first = Unquote(sargs[0]);
             }
 
             // GetByRole は「ロール（日本語）」＋ Name オプションで表す。
@@ -2091,7 +2201,7 @@ namespace PlaywrightCodegen
         /// <summary>new(){ Name = "x", ... } 形式のオプションから指定プロパティの値を取り出す。</summary>
         private static string OptionValue(Step s, string prop)
         {
-            foreach (var a in s.Args)
+            foreach (var a in SplitArgs(s.Param))
             {
                 // '{' '}' で囲まれたオプション本体を探す。
                 int brace = a.IndexOf('{');
@@ -2162,31 +2272,29 @@ namespace PlaywrightCodegen
         /// </summary>
         private static Step ParseSegment(string seg)
         {
-            // '(' が無ければプロパティアクセス（引数なし）。
+            // '(' が無ければプロパティアクセス（パラメータなし）。
             int paren = seg.IndexOf('(');
             if (paren < 0)
             {
-                return new Step(seg, Array.Empty<string>());
+                return new Step(seg, "");
             }
 
             // メソッド名は '(' の前。
             var method = seg[..paren].Trim();
 
-            // 括弧の中身を取り出す。
-            var inner = ExtractParenContent(seg, paren);
+            // 括弧の中身（全引数）を 1 つの文字列として Param に格納する。
+            var inner = ExtractParenContent(seg, paren).Trim();
+            return new Step(method, inner);
+        }
 
-            // 中身が空なら引数なし、あればトップレベルのカンマで分割。
-            List<string> args;
-            if (inner.Length == 0)
+        /// <summary>Step.Param（カンマ連結された引数文字列）を個々の引数リストへ分割する。</summary>
+        private static List<string> SplitArgs(string param)
+        {
+            if (param.Length == 0)
             {
-                args = new List<string>();
+                return new List<string>();
             }
-            else
-            {
-                args = SplitTopLevel(inner, ',').Select(a => a.Trim()).Where(a => a.Length > 0).ToList();
-            }
-
-            return new Step(method, args);
+            return SplitTopLevel(param, ',').Select(a => a.Trim()).Where(a => a.Length > 0).ToList();
         }
 
         /// <summary>
