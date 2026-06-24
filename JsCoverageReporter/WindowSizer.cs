@@ -69,6 +69,55 @@ public static class WindowSizer
             b.GetProperty("height").GetInt32());
     }
 
+    /// <summary>ウィンドウを最大化する。</summary>
+    public static async Task MaximizeAsync(IPage page) => await SetWindowStateAsync(page, "maximized");
+
+    /// <summary>ウィンドウを最小化する。</summary>
+    public static async Task MinimizeAsync(IPage page) => await SetWindowStateAsync(page, "minimized");
+
+    /// <summary>ウィンドウを全画面(フルスクリーン)にする。</summary>
+    public static async Task FullscreenAsync(IPage page) => await SetWindowStateAsync(page, "fullscreen");
+
+    /// <summary>ウィンドウを通常状態に戻す（最大化/最小化/全画面の解除）。</summary>
+    public static async Task RestoreAsync(IPage page) => await SetWindowStateAsync(page, "normal");
+
+    /// <summary>Page が属するブラウザウィンドウの現在の状態を返す（normal/minimized/maximized/fullscreen）。</summary>
+    public static async Task<string> GetWindowStateAsync(IPage page)
+    {
+        var cdp = await page.Context.NewCDPSessionAsync(page);
+        var result = await cdp.SendAsync("Browser.getWindowForTarget");
+        if (result == null)
+            throw new InvalidOperationException("Browser.getWindowForTarget が null を返しました。");
+        return result.Value.GetProperty("bounds").GetProperty("windowState").GetString() ?? "normal";
+    }
+
+    /// <summary>
+    /// windowState を変更する。CDP は非normal状態どうしの直接遷移を許さないため、
+    /// 目的が非normalで現在も非normalの場合は一度 normal を経由する。
+    /// </summary>
+    private static async Task SetWindowStateAsync(IPage page, string state)
+    {
+        var cdp = await page.Context.NewCDPSessionAsync(page);
+        int windowId = await GetWindowIdAsync(cdp);
+
+        if (state != "normal")
+        {
+            string current = await GetWindowStateAsync(page);
+            if (current != "normal")
+                await SetBoundsStateAsync(cdp, windowId, "normal");
+        }
+
+        await SetBoundsStateAsync(cdp, windowId, state);
+    }
+
+    private static async Task SetBoundsStateAsync(ICDPSession cdp, int windowId, string state) =>
+        await cdp.SendAsync("Browser.setWindowBounds", new Dictionary<string, object>
+        {
+            ["windowId"] = windowId,
+            // 非normal状態の指定時は windowState 単独で送る必要がある
+            ["bounds"] = new Dictionary<string, object> { ["windowState"] = state }
+        });
+
     private static async Task<int> GetWindowIdAsync(ICDPSession cdp)
     {
         var result = await cdp.SendAsync("Browser.getWindowForTarget");
