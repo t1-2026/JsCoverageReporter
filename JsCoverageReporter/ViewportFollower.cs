@@ -29,16 +29,26 @@ namespace JsCoverageReporter;
 /// 使い方：
 /// <code>
 ///   var follower = new ViewportFollower();
-///   await follower.CalibrateAsync(page);     // 任意。呼ばなくても Follow 時に自動計測される
 ///
-///   await WindowSizer.SetWindowSizeAsync(page, 1600, 1000);  // または Win32 / 最大化 / 全画面
-///   await follower.FollowAsync(page);        // 現在の状態に合わせて viewport を追随
+///   // (A) 外部 Win32 でリサイズした場合：リサイズ後に Follow を呼ぶ
+///   //     SetWindowPos(hwnd, ...);
+///   await follower.FollowAsync(page);
+///
+///   // (B) ウィンドウ操作と追随を一括で行う便利メソッド
+///   await follower.SetWindowSizeAsync(page, 1600, 1000); // サイズ変更＋追随
+///   await follower.MaximizeAsync(page);                  // 最大化＋追随（最大化状態を保持して埋める）
+///   await follower.FullscreenAsync(page);                // 全画面＋追随
+///   await follower.RestoreAsync(page);                   // 通常化＋追随
 /// </code>
 ///
 /// 注意：
+///   - SetViewportSizeAsync は windowState を normal に戻す副作用があるため、maximized/fullscreen では
+///     override 設定後に状態を再適用して埋める。そのため最大化/全画面の Follow では一瞬通常化→再適用の
+///     ちらつきが入る。
 ///   - クロム量の計測時に NoViewport の一時ウィンドウが一瞬開いて閉じる（状態ごとに初回のみ）。
 ///     maximized のクロム計測ではその一時ウィンドウが一度最大化される。
-///   - ブックマークバーの表示切替など恒久的にクロム高さが変わったら ResetCalibration() で測り直させる。
+///   - ブックマークバーの表示切替やブラウザのバージョンアップ等でクロム高さが変わったら
+///     ResetCalibration() を呼べば次回 Follow 時に測り直す（値はハードコードしていないので自動追従）。
 ///   - 最小化中(minimized)に FollowAsync を呼んだ場合は何もしない。
 ///   - 単位は DIP(=CSS px)。Chromium 系専用。
 /// </summary>
@@ -69,11 +79,51 @@ public sealed class ViewportFollower
             return; // 最小化中はサイズが意味を持たないので何もしない
 
         var chrome = await EnsureChromeAsync(page, state);
-        var (outerW, outerH) = await GetOuterAsync(page);
+        // 状態遷移(特に fullscreen 解除)直後は外形が確定するまで時間がかかるため、安定を待つ
+        var (outerW, outerH) = await WaitForStableOuterAsync(page);
 
         int cssW = Math.Max(1, outerW - chrome.W);
         int cssH = Math.Max(1, outerH - chrome.H);
         await page.SetViewportSizeAsync(cssW, cssH);
+
+        // SetViewportSizeAsync は windowState を normal に戻し、ウィンドウを縮める。
+        // 最大化/全画面では override 設定後に状態を再適用すると、状態を保ったまま
+        // ウィンドウが再び広がり override(=コンテンツ領域)と一致して埋まる。
+        if (state == "maximized")
+            await WindowSizer.MaximizeAsync(page);
+        else if (state == "fullscreen")
+            await WindowSizer.FullscreenAsync(page);
+    }
+
+    // ---- ウィンドウ操作 + 追随 を1呼び出しで行う便利メソッド ----
+    // （外部 Win32 でリサイズする場合は、リサイズ後に FollowAsync を直接呼ぶこと）
+
+    /// <summary>ウィンドウ外形サイズ(DIP)を変更し、続けて viewport を追随させる。</summary>
+    public async Task SetWindowSizeAsync(IPage page, int width, int height)
+    {
+        await WindowSizer.SetWindowSizeAsync(page, width, height);
+        await FollowAsync(page);
+    }
+
+    /// <summary>ウィンドウを最大化し、viewport を追随させる。</summary>
+    public async Task MaximizeAsync(IPage page)
+    {
+        await WindowSizer.MaximizeAsync(page);
+        await FollowAsync(page);
+    }
+
+    /// <summary>ウィンドウを全画面にし、viewport を追随させる。</summary>
+    public async Task FullscreenAsync(IPage page)
+    {
+        await WindowSizer.FullscreenAsync(page);
+        await FollowAsync(page);
+    }
+
+    /// <summary>ウィンドウを通常状態に戻し、viewport を追随させる。</summary>
+    public async Task RestoreAsync(IPage page)
+    {
+        await WindowSizer.RestoreAsync(page);
+        await FollowAsync(page);
     }
 
     /// <summary>対象状態のクロム量を返す（未計測なら計測してキャッシュ）。</summary>
@@ -127,5 +177,26 @@ public sealed class ViewportFollower
     {
         var o = await page.EvaluateAsync<double[]>("() => [window.outerWidth, window.outerHeight]");
         return ((int)Math.Round(o[0]), (int)Math.Round(o[1]));
+    }
+
+    /// <summary>
+    /// ウィンドウ外形が安定する（2回連続で同値になる）まで待って返す。
+    /// 状態遷移（最大化/全画面の解除など）直後の過渡的なサイズを避けるため。
+    /// </summary>
+    private static async Task<(int Width, int Height)> WaitForStableOuterAsync(IPage page)
+    {
+        const int maxAttempts = 20;   // 約 20 * 80ms = 1.6s 上限
+        const int intervalMs = 80;
+
+        var prev = await GetOuterAsync(page);
+        for (int i = 0; i < maxAttempts; i++)
+        {
+            await page.WaitForTimeoutAsync(intervalMs);
+            var cur = await GetOuterAsync(page);
+            if (cur.Width == prev.Width && cur.Height == prev.Height)
+                return cur;
+            prev = cur;
+        }
+        return prev;
     }
 }
