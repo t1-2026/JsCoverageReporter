@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using Microsoft.Playwright;
 
@@ -47,15 +48,24 @@ namespace JsCoverageReporter;
 ///     ちらつきが入る。
 ///   - クロム量の計測時に NoViewport の一時ウィンドウが一瞬開いて閉じる（状態ごとに初回のみ）。
 ///     maximized のクロム計測ではその一時ウィンドウが一度最大化される。
+///   - クロム量はブラウザ単位で static 共有キャッシュする。同一ブラウザの全 page/タブ/follower で
+///     状態ごとに1回だけ実測し、別ブラウザは別途実測する（複数ブラウザ運用に対応）。
+///     ブラウザ破棄時にキャッシュは自動解放される（ConditionalWeakTable）。
 ///   - ブックマークバーの表示切替やブラウザのバージョンアップ等でクロム高さが変わったら
-///     ResetCalibration() を呼べば次回 Follow 時に測り直す（値はハードコードしていないので自動追従）。
+///     ResetCalibration(page)（または ResetAllCalibration()）を呼べば次回 Follow 時に測り直す
+///     （値はハードコードしていないので自動追従）。
 ///   - 最小化中(minimized)に FollowAsync を呼んだ場合は何もしない。
+///   - 前提: 全ウィンドウが同一 DPI・同一ツールバー構成であること（異なる DPI モニタを跨ぐ運用は対象外）。
 ///   - 単位は DIP(=CSS px)。Chromium 系専用。
 /// </summary>
 public sealed class ViewportFollower
 {
-    // 表示状態 -> 実クロム量(DIP)。fullscreen は常に (0,0) なので計測しない。
-    private readonly Dictionary<string, (int W, int H)> _chromeByState = new();
+    // クロム量はウィンドウ(=ブラウザ)の性質であり page には依らない。よってブラウザ単位で
+    // 共有キャッシュする（同一ブラウザの全 page/タブ/follower で状態ごとに1回だけ実測。
+    // 別ブラウザは別途実測）。ConditionalWeakTable によりブラウザ破棄時に自動解放される。
+    // 値: 表示状態 -> 実クロム量(DIP)。fullscreen は常に (0,0) なので格納しない。
+    private static readonly ConditionalWeakTable<IBrowser, Dictionary<string, (int W, int H)>> _chromeCache = new();
+    private static readonly object _gate = new();
 
     /// <summary>
     /// normal 状態のクロム量を事前計測しておく（任意）。呼ばなくても FollowAsync が必要時に計測する。
@@ -65,8 +75,22 @@ public sealed class ViewportFollower
         await EnsureChromeAsync(page, "normal");
     }
 
-    /// <summary>計測済みクロム量を破棄する。クロム構成（ブックマークバー等）が変わった後に呼ぶ。</summary>
-    public void ResetCalibration() => _chromeByState.Clear();
+    /// <summary>指定 page が属するブラウザの計測済みクロム量を破棄する（次回 Follow 時に測り直す）。</summary>
+    public void ResetCalibration(IPage page)
+    {
+        var browser = page.Context.Browser;
+        if (browser == null)
+            return;
+        lock (_gate)
+            _chromeCache.Remove(browser);
+    }
+
+    /// <summary>全ブラウザの計測済みクロム量を破棄する。</summary>
+    public static void ResetAllCalibration()
+    {
+        lock (_gate)
+            _chromeCache.Clear();
+    }
 
     /// <summary>
     /// ウィンドウサイズ／表示状態を変更した後に呼ぶ。現在の状態の実クロム量を使って
@@ -126,18 +150,47 @@ public sealed class ViewportFollower
         await FollowAsync(page);
     }
 
-    /// <summary>対象状態のクロム量を返す（未計測なら計測してキャッシュ）。</summary>
+    /// <summary>対象状態のクロム量を返す（ブラウザ単位で未計測なら計測してキャッシュ）。</summary>
     private async Task<(int W, int H)> EnsureChromeAsync(IPage page, string state)
     {
         if (state == "fullscreen")
             return (0, 0); // 全画面はクロムが無い
 
-        if (_chromeByState.TryGetValue(state, out var cached))
-            return cached;
+        var browser = page.Context.Browser;
+        if (browser == null)
+            throw new InvalidOperationException("Browser を取得できません（Connect 経由などで未公開）。");
+        var cache = GetBrowserCache(browser);
 
+        lock (_gate)
+        {
+            if (cache.TryGetValue(state, out var cached))
+                return cached;
+        }
+
+        // 実測は await を伴うので lock の外で行う（同時実行で二重計測しても結果は同じ＝無害）。
         var measured = await ProbeChromeAsync(page, state);
-        _chromeByState[state] = measured;
-        return measured;
+
+        lock (_gate)
+        {
+            if (cache.TryGetValue(state, out var existing))
+                return existing; // 競合した場合は先に格納された値を優先
+            cache[state] = measured;
+            return measured;
+        }
+    }
+
+    /// <summary>ブラウザ単位のクロム量キャッシュを取得（無ければ作成）。</summary>
+    private static Dictionary<string, (int W, int H)> GetBrowserCache(IBrowser browser)
+    {
+        lock (_gate)
+        {
+            if (!_chromeCache.TryGetValue(browser, out var dict))
+            {
+                dict = new Dictionary<string, (int W, int H)>();
+                _chromeCache.Add(browser, dict);
+            }
+            return dict;
+        }
     }
 
     /// <summary>
