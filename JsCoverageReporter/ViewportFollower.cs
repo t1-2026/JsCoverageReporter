@@ -34,6 +34,8 @@ namespace JsCoverageReporter; // 本ソースが属する名前空間
 //        → ViewportFollower.ResetCalibration(page);  // 全ブラウザなら ResetAllCalibration();
 //
 // 【前提・注意】
+//   ・headed(Headless=false) 専用。headless で公開メソッドを呼ぶと InvalidOperationException を投げる
+//     （実ウィンドウ/クロムが無く、最大化/全画面は内部例外・サイズ追随も無意味になるため）。
 //   ・単位は DIP(=CSS px)。Chromium 系専用（Chrome / Edge / bundled Chromium で確認済み）。
 //   ・全ウィンドウが同一 DPI 前提（異なる DPI モニタ跨ぎは対象外）。
 //   ・クロム量(タブ/アドレスバー＋枠)はブラウザ×ウィンドウ種別×状態ごとに実測して共有キャッシュする。
@@ -64,6 +66,8 @@ public static class ViewportFollower
     /// </summary>
     public static async Task SetWindowSizeAndFollowAsync(IPage page, int width, int height)
     {
+        // headed 専用。headless なら明確な例外で弾く（ウィンドウ操作前に確認）
+        await EnsureHeadedAsync(page);
         // まず外形サイズを変更する
         await SetWindowSizeAsync(page, width, height);
         // 変更後のサイズに viewport を追随させる
@@ -77,6 +81,8 @@ public static class ViewportFollower
     /// </summary>
     public static async Task MaximizeAndFollowAsync(IPage page)
     {
+        // headed 専用。headless なら明確な例外で弾く（ウィンドウ操作前に確認）
+        await EnsureHeadedAsync(page);
         // ウィンドウを最大化する
         await MaximizeAsync(page);
         // 最大化後の領域に viewport を追随させる
@@ -90,6 +96,8 @@ public static class ViewportFollower
     /// </summary>
     public static async Task FullscreenAndFollowAsync(IPage page)
     {
+        // headed 専用。headless なら明確な例外で弾く（ウィンドウ操作前に確認）
+        await EnsureHeadedAsync(page);
         // ウィンドウを全画面にする
         await FullscreenAsync(page);
         // 全画面後の領域に viewport を追随させる
@@ -103,6 +111,8 @@ public static class ViewportFollower
     /// </summary>
     public static async Task RestoreAndFollowAsync(IPage page)
     {
+        // headed 専用。headless なら明確な例外で弾く（ウィンドウ操作前に確認）
+        await EnsureHeadedAsync(page);
         // ウィンドウを通常状態に戻す
         await RestoreAsync(page);
         // 通常化後の領域に viewport を追随させる
@@ -119,6 +129,8 @@ public static class ViewportFollower
     /// </summary>
     public static async Task FollowAsync(IPage page)
     {
+        // headed 専用。headless なら明確な例外で弾く
+        await EnsureHeadedAsync(page);
         // 現在のウィンドウ状態を取得する
         string state = await GetWindowStateAsync(page);
         // 最小化中はサイズが意味を持たないので何もしない
@@ -202,6 +214,31 @@ public static class ViewportFollower
             _chromeCache.Clear();
         } // lock ここまで
     } // ResetAllCalibration ここまで
+
+    // =================================================================================
+    // 内部: 前提チェック
+    // =================================================================================
+
+    /// <summary>
+    /// headed(Headless=false)で動いているか確認し、headless なら明確な例外を投げる（内部用）。
+    /// headless には実ウィンドウ/クロムが無く、最大化/全画面は例外・サイズ追随も無意味になるため、
+    /// 各公開メソッドの冒頭でウィンドウ操作前に弾く。判定は navigator.userAgent の "Headless" 有無で行う。
+    /// </summary>
+    private static async Task EnsureHeadedAsync(IPage page)
+    {
+        // userAgent に "Headless"(HeadlessChrome) が含まれるかで headless を判定する
+        bool isHeadless = await page.EvaluateAsync<bool>("() => navigator.userAgent.includes('Headless')");
+        // headless の場合はこのクラスの前提を満たさないので明確に失敗させる
+        if (isHeadless)
+        {
+            // 原因と対処を明示した例外を投げる
+            throw new InvalidOperationException(
+                "ViewportFollower は headed(Headless=false) 専用です。" +
+                "headless では実ウィンドウ/クロムが無く、最大化/全画面は例外・サイズ追随も無意味になります。" +
+                "Headless=false で起動してください。" +
+                "（※ context に独自 UserAgent を設定している場合はこの判定が効かないことがあります）");
+        } // headless 検出時の処理ここまで
+    } // EnsureHeadedAsync ここまで
 
     // =================================================================================
     // 内部: ウィンドウ操作（CDP）。公開はしない（FollowAsync / *AndFollowAsync から利用）。
