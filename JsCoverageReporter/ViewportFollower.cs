@@ -61,11 +61,12 @@ public sealed class ViewportFollower
     /// </summary>
     public async Task CalibrateAsync(IPage page)
     {
-        _cdp ??= await page.Context.NewCDPSessionAsync(page);
+        var cdp = await EnsureCdpAsync(page);
 
-        var vp = page.ViewportSize
-            ?? throw new InvalidOperationException("viewport が未設定です（NoViewport ではこのヘルパーは不要）。");
-        var (outerW, outerH) = await GetOuterAsync(_cdp);
+        var vp = page.ViewportSize;
+        if (vp == null)
+            throw new InvalidOperationException("viewport が未設定です（NoViewport ではこのヘルパーは不要）。");
+        var (outerW, outerH) = await GetOuterAsync(cdp);
 
         _chromeW = outerW - vp.Width;
         _chromeH = outerH - vp.Height;
@@ -80,21 +81,30 @@ public sealed class ViewportFollower
         if (_chromeH < 0)
             throw new InvalidOperationException("先に CalibrateAsync を呼んでください。");
 
-        _cdp ??= await page.Context.NewCDPSessionAsync(page);
+        var cdp = await EnsureCdpAsync(page);
 
-        var (outerW, outerH) = await GetOuterAsync(_cdp);
+        var (outerW, outerH) = await GetOuterAsync(cdp);
         int cssW = Math.Max(1, outerW - _chromeW);
         int cssH = Math.Max(1, outerH - _chromeH);
 
         await page.SetViewportSizeAsync(cssW, cssH);
     }
 
+    /// <summary>CDP セッションを未生成なら生成して返す（遅延初期化）。</summary>
+    private async Task<ICDPSession> EnsureCdpAsync(IPage page)
+    {
+        if (_cdp == null)
+            _cdp = await page.Context.NewCDPSessionAsync(page);
+        return _cdp;
+    }
+
     /// <summary>CDP からウィンドウ外形(DIP)を取得する。</summary>
     private static async Task<(int Width, int Height)> GetOuterAsync(ICDPSession cdp)
     {
-        var result = await cdp.SendAsync("Browser.getWindowForTarget")
-            ?? throw new InvalidOperationException("Browser.getWindowForTarget が null を返しました。");
-        var bounds = result.GetProperty("bounds");
+        var result = await cdp.SendAsync("Browser.getWindowForTarget");
+        if (result == null)
+            throw new InvalidOperationException("Browser.getWindowForTarget が null を返しました。");
+        var bounds = result.Value.GetProperty("bounds");
         return (bounds.GetProperty("width").GetInt32(), bounds.GetProperty("height").GetInt32());
     }
 }
