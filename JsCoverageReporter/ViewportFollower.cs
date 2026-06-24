@@ -1,5 +1,4 @@
 using System;
-using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using Microsoft.Playwright;
 
@@ -9,94 +8,62 @@ namespace JsCoverageReporter;
 /// Playwright(headed) が起動したブラウザのウィンドウサイズを Win32 API で変更した後、
 /// 変更後の表示領域に合わせて viewport を追随させるためのヘルパー。
 ///
-/// 前提：
-///   - 起動時に固定 viewport を指定している（ViewportSize.NoViewport ではない）。
-///     このとき CDP の Emulation.setDeviceMetricsOverride が効いているため、
-///     Win32 でウィンドウを広げても HTML は override されたサイズのまま描画され、
-///     window.innerWidth/innerHeight も override 値を返す（実窓サイズを測れない）。
-///   - そこで OS 側のクライアント領域(物理px)を測り → CSS px に変換 → SetViewportSizeAsync で追随させる。
+/// 背景：
+///   - 起動時に固定 viewport を指定している（ViewportSize.NoViewport ではない）と
+///     CDP の Emulation.setDeviceMetricsOverride が効き、HTML は override されたサイズのまま描画される。
+///     Win32 でウィンドウを広げても増えた分はグレーの余白になり、
+///     window.innerWidth/innerHeight も override 値を返すため実ウィンドウサイズを測れない。
 ///
-/// 仕組み：
-///   横方向にはクロム(タブ/アドレスバー)が無いことを利用して
-///     scale   = clientPxW / innerWidth        … 物理px ↔ CSS px の変換係数
-///     chromePx = clientPxH - scale * innerHeight … クロム高さ(物理px)
-///   を1回のキャリブレーションで定数化する。以後はリサイズ後に計算だけで viewport を出せる。
+/// 仕組み（クロム高さ・スケール・DPI の計算は一切不要）：
+///   1. CDP で Emulation.clearDeviceMetricsOverride を送って override を解除し、
+///      実ウィンドウのコンテンツ領域に合わせて再レイアウトさせる。
+///   2. その状態の window.innerWidth/innerHeight を測る。これが「実際に見えている HTML 領域」そのもの。
+///   3. その値で SetViewportSizeAsync を呼び、override を測定値ぴったりに張り直す。
+///      測定値＝現在のコンテンツ領域なので、ウィンドウサイズは Win32 指定値のまま動かない。
 ///
 /// 使い方：
 /// <code>
 ///   var follower = new ViewportFollower();
 ///
-///   // 1) Win32 でリサイズする前に、現在の状態で1回だけ校正する
-///   await follower.CalibrateAsync(page, hwnd);
-///
-///   // 2) Win32 API でウィンドウサイズを変更する
+///   // 1) Win32 API でウィンドウサイズを変更する
 ///   SetWindowPos(hwnd, IntPtr.Zero, 0, 0, 1600, 1000, SWP_NOMOVE | SWP_NOZORDER);
 ///
-///   // 3) リサイズ後に呼ぶと viewport が新しい表示領域に追随する
-///   await follower.FollowAsync(page, hwnd);
+///   // 2) リサイズ後に呼ぶと viewport が新しい表示領域に追随する（hwnd は不要）
+///   await follower.FollowAsync(page);
 /// </code>
 ///
 /// 注意：
-///   - headed では SetViewportSizeAsync がウィンドウもリサイズしようとするが、
-///     本クラスは「いまの Win32 窓の中身ぴったり」になる CSS サイズを出すため、
-///     結果のウィンドウサイズは Win32 指定値と一致し暴れない。
-///   - クロム高さが途中で変わらないことが前提。ブックマークバーの表示切替・F11 全画面・
-///     拡張機能のバー追加・別DPIモニタへの移動が起きたら CalibrateAsync を再実行すること。
-///   - GetClientRect は物理ピクセル基準。アプリマニフェストで Per-Monitor DPI Aware にしておくとズレない。
+///   - override を一旦解除して測るため、クロム高さ・スクロールバー幅・DPI スケールに依存せず正確。
+///     ブックマークバーの表示切替・F11 全画面・別DPIモニタへの移動が混ざっても、その都度測り直すので問題ない。
+///   - Chromium 専用（CDP を使用）。
 /// </summary>
 public sealed class ViewportFollower
 {
-    [StructLayout(LayoutKind.Sequential)]
-    private struct RECT { public int Left, Top, Right, Bottom; }
-
-    [DllImport("user32.dll")]
-    private static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
-
-    private double _scale = 0;     // 物理px / CSS px
-    private double _chromePx = 0;  // クロム高さ（物理px）
-
     /// <summary>
-    /// Win32 リサイズ前に1度だけ呼ぶ。現在の viewport と窓から変換係数・クロム高さを校正する。
-    /// クロム構成が変わった場合（ブックマークバー切替・全画面・別DPIモニタ移動など）は再度呼ぶこと。
+    /// Win32 でウィンドウサイズを変更した後に呼ぶ。override を解除して実コンテンツ領域を測り、
+    /// その値で viewport を張り直して追随させる。
     /// </summary>
-    public async Task CalibrateAsync(IPage page, IntPtr hwnd)
+    public async Task FollowAsync(IPage page)
     {
-        if (!GetClientRect(hwnd, out var rc))
-            throw new InvalidOperationException("GetClientRect failed.");
+        // override を解除して、実ウィンドウのコンテンツ領域に合わせて再レイアウトさせる
+        var cdp = await page.Context.NewCDPSessionAsync(page);
+        try
+        {
+            await cdp.SendAsync("Emulation.clearDeviceMetricsOverride");
 
-        int clientPxW = rc.Right - rc.Left;
-        int clientPxH = rc.Bottom - rc.Top;
+            // override 解除後の innerWidth/innerHeight＝実際に見えている HTML 領域(CSS px)。
+            // EvaluateAsync<T> の名前マッチを避けるため [幅, 高さ] の配列で受け取る。
+            var size = await page.EvaluateAsync<double[]>(
+                "() => [window.innerWidth, window.innerHeight]");
+            int cssW = (int)Math.Round(size[0]);
+            int cssH = (int)Math.Round(size[1]);
 
-        // スクロールバーの影響を避けるため documentElement.clientWidth を使う。
-        // EvaluateAsync<T> はプロパティ名をケースセンシティブに突き合わせるため、
-        // カスタム型ではなく [幅, 高さ] の配列で受け取って取り違えを防ぐ。
-        var inner = await page.EvaluateAsync<double[]>(
-            "() => [document.documentElement.clientWidth, window.innerHeight]");
-        double innerWidth = inner[0];
-        double innerHeight = inner[1];
-
-        _scale    = clientPxW / innerWidth;
-        _chromePx = clientPxH - _scale * innerHeight;
-    }
-
-    /// <summary>
-    /// Win32 でウィンドウサイズを変更した後に呼ぶ。新しいクライアント領域から viewport を算出して追随させる。
-    /// 事前に CalibrateAsync を呼んでおく必要がある。
-    /// </summary>
-    public async Task FollowAsync(IPage page, IntPtr hwnd)
-    {
-        if (_scale <= 0)
-            throw new InvalidOperationException("先に CalibrateAsync を呼んでください。");
-
-        if (!GetClientRect(hwnd, out var rc))
-            throw new InvalidOperationException("GetClientRect failed.");
-
-        int clientPxW = rc.Right - rc.Left;
-        int clientPxH = rc.Bottom - rc.Top;
-
-        int cssW = (int)Math.Round(clientPxW / _scale);
-        int cssH = (int)Math.Round((clientPxH - _chromePx) / _scale);
-
-        await page.SetViewportSizeAsync(cssW, Math.Max(1, cssH));
+            // 測定値ぴったりに override を張り直す（ウィンドウサイズは変わらない）
+            await page.SetViewportSizeAsync(Math.Max(1, cssW), Math.Max(1, cssH));
+        }
+        finally
+        {
+            await cdp.DetachAsync();
+        }
     }
 }
