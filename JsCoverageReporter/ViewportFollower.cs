@@ -52,8 +52,6 @@ public sealed class ViewportFollower
     [DllImport("user32.dll")]
     private static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
 
-    private record Inner(double Iw, double Ih);
-
     private double _scale = 0;     // 物理px / CSS px
     private double _chromePx = 0;  // クロム高さ（物理px）
 
@@ -69,14 +67,16 @@ public sealed class ViewportFollower
         int clientPxW = rc.Right - rc.Left;
         int clientPxH = rc.Bottom - rc.Top;
 
-        // スクロールバーの影響を避けるため documentElement.clientWidth を使う
-        var inner = await page.EvaluateAsync<Inner>(@"() => ({
-            iw: document.documentElement.clientWidth,
-            ih: window.innerHeight
-        })");
+        // スクロールバーの影響を避けるため documentElement.clientWidth を使う。
+        // EvaluateAsync<T> はプロパティ名をケースセンシティブに突き合わせるため、
+        // カスタム型ではなく [幅, 高さ] の配列で受け取って取り違えを防ぐ。
+        var inner = await page.EvaluateAsync<double[]>(
+            "() => [document.documentElement.clientWidth, window.innerHeight]");
+        double innerWidth = inner[0];
+        double innerHeight = inner[1];
 
-        _scale    = clientPxW / inner.Iw;
-        _chromePx = clientPxH - _scale * inner.Ih;
+        _scale    = clientPxW / innerWidth;
+        _chromePx = clientPxH - _scale * innerHeight;
     }
 
     /// <summary>
