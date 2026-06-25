@@ -34,8 +34,10 @@ namespace JsCoverageReporter; // 本ソースが属する名前空間
 //        → ViewportFollower.ResetCalibration(page);  // 全ブラウザなら ResetAllCalibration();
 //
 // 【前提・注意】
-//   ・headed(Headless=false) 専用。headless で公開メソッドを呼ぶと InvalidOperationException を投げる
-//     （実ウィンドウ/クロムが無く、最大化/全画面は内部例外・サイズ追随も無意味になるため）。
+//   ・基本は headed(Headless=false) 用。headless では実ウィンドウ/クロムが無いため、クロム補正や
+//     最大化/全画面の状態操作は行わず、「現在のウィンドウサイズに viewport を合わせるだけ」に退化する
+//     （例外は投げない）。headless で MaximizeAndFollow/FullscreenAndFollow を呼んでも、状態変更は
+//     スキップして viewport をウィンドウサイズに合わせるだけになる。
 //   ・単位は DIP(=CSS px)。Chromium 系専用（Chrome / Edge / bundled Chromium で確認済み）。
 //   ・全ウィンドウが同一 DPI 前提（異なる DPI モニタ跨ぎは対象外）。
 //   ・クロム量(タブ/アドレスバー＋枠)はブラウザ×ウィンドウ種別×状態ごとに実測して共有キャッシュする。
@@ -66,11 +68,9 @@ public static class ViewportFollower
     /// </summary>
     public static async Task SetWindowSizeAndFollowAsync(IPage page, int width, int height)
     {
-        // headed 専用。headless なら明確な例外で弾く（ウィンドウ操作前に確認）
-        await EnsureHeadedAsync(page);
-        // まず外形サイズを変更する
+        // まず外形サイズを変更する（headless でもウィンドウサイズ自体は変更できる）
         await SetWindowSizeAsync(page, width, height);
-        // 変更後のサイズに viewport を追随させる
+        // 変更後のサイズに viewport を追随させる（headless は FollowAsync 内でサイズ一致のみ行う）
         await FollowAsync(page);
     } // SetWindowSizeAndFollowAsync ここまで
 
@@ -81,8 +81,15 @@ public static class ViewportFollower
     /// </summary>
     public static async Task MaximizeAndFollowAsync(IPage page)
     {
-        // headed 専用。headless なら明確な例外で弾く（ウィンドウ操作前に確認）
-        await EnsureHeadedAsync(page);
+        // headless では最大化に意味が無く、最大化状態だと viewport 設定が失敗するため、
+        // ウィンドウ操作はせず現在のサイズに viewport を合わせるだけにする
+        if (await IsHeadlessAsync(page))
+        {
+            // 現在のウィンドウサイズに viewport を合わせる
+            await FollowAsync(page);
+            // 最大化はスキップしたので終了する
+            return;
+        }
         // ウィンドウを最大化する
         await MaximizeAsync(page);
         // 最大化後の領域に viewport を追随させる
@@ -96,8 +103,15 @@ public static class ViewportFollower
     /// </summary>
     public static async Task FullscreenAndFollowAsync(IPage page)
     {
-        // headed 専用。headless なら明確な例外で弾く（ウィンドウ操作前に確認）
-        await EnsureHeadedAsync(page);
+        // headless では全画面に意味が無く、全画面状態だと viewport 設定が失敗するため、
+        // ウィンドウ操作はせず現在のサイズに viewport を合わせるだけにする
+        if (await IsHeadlessAsync(page))
+        {
+            // 現在のウィンドウサイズに viewport を合わせる
+            await FollowAsync(page);
+            // 全画面はスキップしたので終了する
+            return;
+        }
         // ウィンドウを全画面にする
         await FullscreenAsync(page);
         // 全画面後の領域に viewport を追随させる
@@ -111,11 +125,9 @@ public static class ViewportFollower
     /// </summary>
     public static async Task RestoreAndFollowAsync(IPage page)
     {
-        // headed 専用。headless なら明確な例外で弾く（ウィンドウ操作前に確認）
-        await EnsureHeadedAsync(page);
-        // ウィンドウを通常状態に戻す
+        // ウィンドウを通常状態に戻す（headless でも normal への遷移は可能）
         await RestoreAsync(page);
-        // 通常化後の領域に viewport を追随させる
+        // 通常化後の領域に viewport を追随させる（headless は FollowAsync 内でサイズ一致のみ行う）
         await FollowAsync(page);
     } // RestoreAndFollowAsync ここまで
 
@@ -126,11 +138,21 @@ public static class ViewportFollower
     /// 【どう】// 例: SetWindowPos(hwnd, ...); の直後など
     ///         await ViewportFollower.FollowAsync(page);
     /// 【補足】最小化中は何もしない。最大化/全画面/通常いずれの状態でも正しく埋める。
+    ///         headless では実ウィンドウ/クロムが無いので、現在のウィンドウサイズに viewport を合わせるだけ。
     /// </summary>
     public static async Task FollowAsync(IPage page)
     {
-        // headed 専用。headless なら明確な例外で弾く
-        await EnsureHeadedAsync(page);
+        // headless は実ウィンドウ/クロムが無いので、クロム計算も状態再適用もせず、
+        // 現在のウィンドウサイズ(=外形=内形)に viewport を合わせるだけにする
+        if (await IsHeadlessAsync(page))
+        {
+            // 現在のウィンドウ外形を取得する（headless では外形＝コンテンツ領域）
+            var (hw, hh) = await GetOuterAsync(page);
+            // viewport をウィンドウサイズに合わせる
+            await page.SetViewportSizeAsync(Math.Max(1, hw), Math.Max(1, hh));
+            // headless の処理はここで終了する
+            return;
+        }
         // 現在のウィンドウ状態を取得する
         string state = await GetWindowStateAsync(page);
         // 最小化中はサイズが意味を持たないので何もしない
@@ -216,29 +238,19 @@ public static class ViewportFollower
     } // ResetAllCalibration ここまで
 
     // =================================================================================
-    // 内部: 前提チェック
+    // 内部: 実行環境の判定
     // =================================================================================
 
     /// <summary>
-    /// headed(Headless=false)で動いているか確認し、headless なら明確な例外を投げる（内部用）。
-    /// headless には実ウィンドウ/クロムが無く、最大化/全画面は例外・サイズ追随も無意味になるため、
-    /// 各公開メソッドの冒頭でウィンドウ操作前に弾く。判定は navigator.userAgent の "Headless" 有無で行う。
+    /// headless で動いているかを返す（内部用）。判定は navigator.userAgent の "Headless" 有無で行う。
+    /// headless には実ウィンドウ/クロムが無いため、呼び出し側は「ウィンドウサイズに viewport を合わせるだけ」
+    /// の簡易動作に切り替える。※ context に独自 UserAgent を設定している場合はこの判定が効かないことがある。
     /// </summary>
-    private static async Task EnsureHeadedAsync(IPage page)
+    private static async Task<bool> IsHeadlessAsync(IPage page)
     {
-        // userAgent に "Headless"(HeadlessChrome) が含まれるかで headless を判定する
-        bool isHeadless = await page.EvaluateAsync<bool>("() => navigator.userAgent.includes('Headless')");
-        // headless の場合はこのクラスの前提を満たさないので明確に失敗させる
-        if (isHeadless)
-        {
-            // 原因と対処を明示した例外を投げる
-            throw new InvalidOperationException(
-                "ViewportFollower は headed(Headless=false) 専用です。" +
-                "headless では実ウィンドウ/クロムが無く、最大化/全画面は例外・サイズ追随も無意味になります。" +
-                "Headless=false で起動してください。" +
-                "（※ context に独自 UserAgent を設定している場合はこの判定が効かないことがあります）");
-        } // headless 検出時の処理ここまで
-    } // EnsureHeadedAsync ここまで
+        // userAgent に "Headless"(HeadlessChrome) が含まれるかで headless を判定して返す
+        return await page.EvaluateAsync<bool>("() => navigator.userAgent.includes('Headless')");
+    } // IsHeadlessAsync ここまで
 
     // =================================================================================
     // 内部: ウィンドウ操作（CDP）。公開はしない（FollowAsync / *AndFollowAsync から利用）。
